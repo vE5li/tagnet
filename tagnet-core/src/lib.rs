@@ -6,7 +6,8 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
 pub struct FileId(i64);
 
 impl From<FileId> for i64 {
@@ -33,7 +34,8 @@ impl FromSql for FileId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
 pub struct TagId(i64);
 
 impl From<TagId> for i64 {
@@ -60,7 +62,8 @@ impl FromSql for TagId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
 pub struct EntryId(i64);
 
 impl ToSql for EntryId {
@@ -108,12 +111,29 @@ pub enum SubtagRule {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct Tag {
+    id: TagId,
+    name: String,
+    color: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct File {
+    id: FileId,
+    path: OsString,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum DatabaseError {
     UnableToOpenOrCreate,
     FailedToExecuteCommand,
     NonUtf8FilePath,
     MissingFile,
     MissingTag,
+    InvalidTagName,
+    InvalidColor,
 }
 
 #[derive(Debug)]
@@ -139,7 +159,8 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
         .execute(
             "CREATE TABLE IF NOT EXISTS tags (
             id    INTEGER PRIMARY KEY,
-            name  TEXT NOT NULL UNIQUE
+            name  TEXT NOT NULL UNIQUE,
+            color TEXT NOT NULL
         )",
             (), // empty list of parameters.
         )
@@ -177,11 +198,29 @@ impl DatabaseHandle {
     }
 
     /// Add a new tag.
-    pub fn add_tag(&self, name: impl Into<String>) -> Result<TagId, DatabaseError> {
+    pub fn add_tag(
+        &self,
+        name: impl Into<String>,
+        color: impl Into<String>,
+    ) -> Result<TagId, DatabaseError> {
+        let name = name.into();
+        let color = color.into();
+
         // TODO: Check that the tag name is not only numbers.
+        if name.is_empty() {
+            return Err(DatabaseError::InvalidTagName);
+        }
+
+        // TODO: Check that the color is valid.
+        if color.is_empty() {
+            return Err(DatabaseError::InvalidColor);
+        }
 
         self.connection
-            .execute("INSERT INTO tags (name) VALUES (?1)", [&name.into()])
+            .execute(
+                "INSERT INTO tags (name, color) VALUES (?1, ?2)",
+                [&name, &color],
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(TagId(self.connection.last_insert_rowid()))
@@ -235,11 +274,11 @@ impl DatabaseHandle {
         Ok(())
     }
 
-    fn files_for_tag_inner(
+    fn file_ids_for_tag_inner(
         &self,
         tag_id: TagId,
         lookup_cache: &mut BTreeSet<TagId>,
-        collected_tags: &mut BTreeSet<FileId>,
+        collected_tag_ids: &mut BTreeSet<FileId>,
         subtag_rule: SubtagRule,
     ) -> Result<(), DatabaseError> {
         enum Entry {
@@ -275,11 +314,16 @@ impl DatabaseHandle {
         for entry in iterator {
             match entry {
                 Entry::File { file_id } => {
-                    collected_tags.insert(file_id);
+                    collected_tag_ids.insert(file_id);
                 }
                 Entry::Tag { tag_id } => {
                     if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
-                        self.files_for_tag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?
+                        self.file_ids_for_tag_inner(
+                            tag_id,
+                            lookup_cache,
+                            collected_tag_ids,
+                            subtag_rule,
+                        )?
                     }
                 }
             }
@@ -289,17 +333,17 @@ impl DatabaseHandle {
     }
 
     /// Get all files that are tagged with the provided tag.
-    pub fn files_for_tag(
+    pub fn file_ids_for_tag(
         &self,
         tag_id: TagId,
         subtag_rule: SubtagRule,
     ) -> Result<impl IntoIterator<Item = FileId>, DatabaseError> {
-        let mut files = BTreeSet::new();
+        let mut file_ids = BTreeSet::new();
         let mut lookup_cache = BTreeSet::new();
 
-        self.files_for_tag_inner(tag_id, &mut lookup_cache, &mut files, subtag_rule)?;
+        self.file_ids_for_tag_inner(tag_id, &mut lookup_cache, &mut file_ids, subtag_rule)?;
 
-        Ok(files)
+        Ok(file_ids)
     }
 
     fn tags_for_tag_inner(
@@ -333,7 +377,7 @@ impl DatabaseHandle {
     }
 
     /// Get all tags that are tagged with the provided tag.
-    pub fn tags_for_tag(
+    pub fn tag_ids_for_tag(
         &self,
         tag_id: TagId,
         subtag_rule: SubtagRule,
@@ -347,14 +391,20 @@ impl DatabaseHandle {
     }
 
     /// Get all tags.
-    pub fn all_tags(&self) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+    pub fn all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM tags")
+            .prepare("SELECT id, name, color FROM tags")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag_list = statement
-            .query_map([], |row| row.get::<_, TagId>(0))
+            .query_map([], |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                })
+            })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .map(|entry| entry.unwrap())
             .collect::<Vec<_>>();
@@ -363,20 +413,48 @@ impl DatabaseHandle {
     }
 
     /// Get the path of a file by the ID.
-    pub fn file_path_from_id(&self, file_id: FileId) -> Result<OsString, DatabaseError> {
+    pub fn file_from_id(&self, file_id: FileId) -> Result<File, DatabaseError> {
         let mut statement = self
             .connection
             .prepare("SELECT path FROM files WHERE id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        let file_path = statement
-            .query_map([file_id], |row| row.get::<_, String>(0))
+        let file = statement
+            .query_map([file_id], |row| {
+                Ok(File {
+                    id: file_id,
+                    path: row.get::<_, String>(0)?.into(),
+                })
+            })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|path| path.unwrap())
+            .map(|file| file.unwrap())
             .next()
             .ok_or(DatabaseError::MissingFile)?;
 
-        Ok(file_path.into())
+        Ok(file)
+    }
+
+    /// Get the name of a tag by the ID.
+    pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT name, color FROM tags WHERE id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag = statement
+            .query_map([tag_id], |row| {
+                Ok(Tag {
+                    id: tag_id,
+                    name: row.get(0)?,
+                    color: row.get(1)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|tag| tag.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingTag)?;
+
+        Ok(tag)
     }
 
     /// Get the ID of a file by the path.
@@ -404,23 +482,6 @@ impl DatabaseHandle {
         Ok(file_id)
     }
 
-    /// Get the name of a tag by the ID.
-    pub fn tag_name_from_id(&self, tag_id: TagId) -> Result<String, DatabaseError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT name FROM tags WHERE id = ?1")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let tag_name = statement
-            .query_map([tag_id], |row| row.get::<_, String>(0))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|name| name.unwrap())
-            .next()
-            .ok_or(DatabaseError::MissingTag)?;
-
-        Ok(tag_name)
-    }
-
     /// Get the ID of a tag by the name.
     pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
         let mut statement = self
@@ -437,18 +498,49 @@ impl DatabaseHandle {
 
         Ok(tag_id)
     }
+
+    pub fn update_tag_name(
+        &self,
+        tag_id: TagId,
+        name: impl Into<String>,
+    ) -> Result<(), DatabaseError> {
+        let name = name.into();
+
+        // TODO: Check that the tag name is not only numbers.
+        if name.is_empty() {
+            return Err(DatabaseError::InvalidTagName);
+        }
+
+        self.connection
+            .execute("UPDATE tags SET name = ?2 WHERE id = ?1", (tag_id, name))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn update_tag_color(
+        &self,
+        tag_id: TagId,
+        color: impl Into<String>,
+    ) -> Result<(), DatabaseError> {
+        let color = color.into();
+
+        // TODO: Check that the tag name is not only numbers.
+        if color.is_empty() {
+            return Err(DatabaseError::InvalidColor);
+        }
+
+        self.connection
+            .execute("UPDATE tags SET color = ?2 WHERE id = ?1", (tag_id, color))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
 }
 
 impl DatabaseHandle {
     // TODO: Temporary function to debug.
     pub fn show_files(&self) -> Result<(), DatabaseError> {
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct File {
-            id: FileId,
-            path: String,
-        }
-
         let mut statement = self
             .connection
             .prepare("SELECT id, path FROM files")
@@ -458,7 +550,7 @@ impl DatabaseHandle {
             .query_map([], |row| {
                 Ok(File {
                     id: row.get(0)?,
-                    path: row.get(1)?,
+                    path: row.get::<_, String>(1)?.into(),
                 })
             })
             .unwrap();
@@ -471,16 +563,9 @@ impl DatabaseHandle {
     }
     // TODO: Temporary function to debug.
     pub fn show_tags(&self) -> Result<(), DatabaseError> {
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct Tag {
-            id: TagId,
-            name: String,
-        }
-
         let mut statement = self
             .connection
-            .prepare("SELECT id, name FROM tags")
+            .prepare("SELECT id, name, color FROM tags")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -488,6 +573,7 @@ impl DatabaseHandle {
                 Ok(Tag {
                     id: row.get(0)?,
                     name: row.get(1)?,
+                    color: row.get(2)?,
                 })
             })
             .unwrap();

@@ -2,11 +2,22 @@
   import { invoke } from "@tauri-apps/api/core";
 
   let name = $state("");
+  let color = $state("#8f008f");
 
+  let focusedTag = $state(null);
   let tags = $state([]);
 
   let tag = $state("");
   let items = $state([]);
+
+  let editTagName = $state("");
+  let editTagColor = $state("");
+
+  async function focusTag(tag) {
+    focusedTag = tag;
+    editTagName = tag.name;
+    editTagColor = tag.color;
+  }
 
   async function loadInitial() {
     tags = await invoke("all_tags", { });
@@ -16,7 +27,15 @@
 
   async function addTag(event: Event) {
     event.preventDefault();
-    await invoke("add_tag", { name });
+    await invoke("add_tag", { name, color });
+    tags = await invoke("all_tags", { });
+    name = "";
+  }
+
+  async function updateTag(event: Event) {
+    event.preventDefault();
+    await invoke("update_tag", { tagId: focusedTag.id, name: editTagName, color: editTagColor });
+    // TODO: Don't fetch all tags
     tags = await invoke("all_tags", { });
   }
 
@@ -26,48 +45,55 @@
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<main class="main-window">
 
-  <div class="row">
-    <a href="https://vitejs.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://kit.svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
+  <div style="column: 1; row: 1;">
+    <div class="tag-window">
+      <h1>TAG MANAGMENT</h1>
+      <form onsubmit={addTag}>
+        <!-- FIX THIS width -->
+        <input id="new-tag-name" placeholder="Tag name" style="width: calc(100% - 3em);" bind:value={name} />
+      </form>
+
+      <div class="tag-field">
+        {#each tags as tag}
+          <button class="tag" style="background-color: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
+        {/each}
+        <button class="tag" style="background-color: #888888" onclick={addTag}>+</button>
+      </div>
+    </div>
+
+    {#if focusedTag}
+      <div class="edit-tag-window">
+        <h1>EDIT TAG</h1>
+        <form onsubmit={updateTag}>
+          <!-- FIX THIS width -->
+          <input id="new-tag-name" placeholder="Tag name" style="width: calc(100% - 3em);" bind:value={editTagName} />
+          <!-- FIX THIS width -->
+          <input id="new-tag-color" placeholder="Tag color" style="width: calc(100% - 3em);" bind:value={editTagColor} />
+          <button type="submit">Update tag</button>
+        </form>
+      </div>
+    {/if}
   </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
 
-  <form class="row" onsubmit={addTag}>
-    <input id="new-tag-name" placeholder="Tag name" bind:value={name} />
-    <button type="submit">Add new tag</button>
-  </form>
-  {#each tags as tag}
-    <h1>{tag}</h1>
-  {/each}
+  <div style="column: 2; row: 1;">
+  <div class="file-window">
+    <h1>FILE MANAGMENT</h1>
+    <form onsubmit={testme}>
+      <!-- FIX THIS width -->
+      <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={tag} />
+      <button type="submit">Get files</button>
+    </form>
 
-  <form class="row" onsubmit={testme}>
-    <input id="test-input" placeholder="Tag Id" bind:value={tag} />
-    <button type="submit">Get files</button>
-  </form>
-
-  {#each items as item}
-    <h1>{item}</h1>
-  {/each}
+    {#each items as item}
+      <h1>{item}</h1>
+    {/each}
+  </div>
+  </div>
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
 
 :root {
   font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
@@ -85,43 +111,34 @@
   -webkit-text-size-adjust: 100%;
 }
 
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
+.main-window {
+  display: grid;
+  grid-template-columns: 1fr 3fr;
+  grid-gap: 0.4vh;
+  padding: 0.4vh;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+.edit-tag-window {
+  padding: 0.5vh;
 }
 
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
+.tag-window {
+  padding: 0.5vh;
 }
 
-.row {
-  display: flex;
-  justify-content: center;
+.tag-field {
+  padding: 0.5vh;
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+.tag {
+  font-size: 3rem;
+  border-radius: 0.6vh;
+  padding: 0.2vh 1vh 0.2vh 1vh;
+  margin: 0.3vh 0.2vh 0px 0.2vh;
 }
 
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
+.file-window {
+  padding: 0.5vh;
 }
 
 input,
@@ -136,6 +153,10 @@ button {
   background-color: #ffffff;
   transition: border-color 0.25s;
   box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+}
+
+h1 {
+  margin-bottom: 1.5vh;
 }
 
 button {
@@ -155,18 +176,10 @@ button {
   outline: none;
 }
 
-#greet-input {
-  margin-right: 5px;
-}
-
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
     background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
   }
 
   input,
@@ -174,6 +187,7 @@ button {
     color: #ffffff;
     background-color: #0f0f0f98;
   }
+
   button:active {
     background-color: #0f0f0f69;
   }

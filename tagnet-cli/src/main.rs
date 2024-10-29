@@ -96,21 +96,21 @@ fn main() {
             }
         }
         Commands::FilesForTag { tag_id, subtags } => {
-            let file_ids = handle.files_for_tag(tag_id.into(), subtags.into()).unwrap();
+            let file_ids = handle.file_ids_for_tag(tag_id.into(), subtags.into()).unwrap();
 
             file_ids
                 .into_iter()
-                .map(|file_id| handle.file_path_from_id(file_id).unwrap())
+                .map(|file_id| handle.file_from_id(file_id).unwrap())
                 .for_each(|file_path| println!("> {file_path:?}"));
         }
         Commands::TagsForTag { tag_id, subtags } => {
             let tag_ids = handle
-                .tags_for_tag(tag_id.into(), subtags.into())
+                .tag_ids_for_tag(tag_id.into(), subtags.into())
                 .unwrap();
 
             tag_ids
                 .into_iter()
-                .map(|tag_id| handle.tag_name_from_id(tag_id).unwrap())
+                .map(|tag_id| handle.tag_from_id(tag_id).unwrap())
                 .for_each(|tag_name| println!("> {tag_name:?}"));
         }
     }
