@@ -13,6 +13,10 @@ impl FileId {
     pub fn from_raw(id: i64) -> Self {
         Self(id)
     }
+
+    pub fn into_raw(self) -> i64 {
+        self.0
+    }
 }
 
 impl ToSql for FileId {
@@ -140,7 +144,8 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
             id          INTEGER PRIMARY KEY,
             tag_id      INTEGER NOT NULL,
             target_id   INTEGER NOT NULL,
-            type        INTEGER
+            type        INTEGER,
+            UNIQUE (tag_id, target_id, type)
         )",
             (), // empty list of parameters.
         )
@@ -186,21 +191,46 @@ impl DatabaseHandle {
     }
 
     /// Tag a tag with the provided tag.
-    pub fn tag_tag(&self, tag_id: TagId, other_tag_id: TagId) -> Result<EntryId, DatabaseError> {
+    pub fn tag_tag(&self, tag_id: TagId, subtag_id: TagId) -> Result<EntryId, DatabaseError> {
         self.connection
             .execute(
                 "INSERT INTO entries (tag_id, target_id, type) VALUES (?1, ?2, ?3)",
-                (&tag_id, &other_tag_id, EntryType::Tag),
+                (&tag_id, &subtag_id, EntryType::Tag),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(EntryId(self.connection.last_insert_rowid()))
     }
 
+    /// Remove a tag from a file.
+    pub fn untag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM entries WHERE tag_id = ?1 AND target_id = ?2 AND type = 0",
+                (&tag_id, &file_id),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Remove a tag from a tag.
+    pub fn untag_tag(&self, tag_id: TagId, subtag_id: TagId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM entries WHERE tag_id = ?1 AND target_id = ?2 AND type = 1",
+                (&tag_id, &subtag_id),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
     fn files_for_tag_inner(
         &self,
         tag_id: TagId,
-        files: &mut BTreeSet<FileId>,
+        lookup_cache: &mut BTreeSet<TagId>,
+        collected_tags: &mut BTreeSet<FileId>,
         subtag_rule: SubtagRule,
     ) -> Result<(), DatabaseError> {
         enum Entry {
@@ -231,14 +261,16 @@ impl DatabaseHandle {
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .map(|entry| entry.unwrap());
 
+        lookup_cache.insert(tag_id);
+
         for entry in iterator {
             match entry {
                 Entry::File { file_id } => {
-                    files.insert(file_id);
+                    collected_tags.insert(file_id);
                 }
                 Entry::Tag { tag_id } => {
-                    if subtag_rule == SubtagRule::Include {
-                        self.files_for_tag_inner(tag_id, files, subtag_rule)?
+                    if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
+                        self.files_for_tag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?
                     }
                 }
             }
@@ -254,14 +286,18 @@ impl DatabaseHandle {
         subtag_rule: SubtagRule,
     ) -> Result<impl IntoIterator<Item = FileId>, DatabaseError> {
         let mut files = BTreeSet::new();
-        self.files_for_tag_inner(tag_id, &mut files, subtag_rule)?;
+        let mut lookup_cache = BTreeSet::new();
+
+        self.files_for_tag_inner(tag_id, &mut lookup_cache, &mut files, subtag_rule)?;
+
         Ok(files)
     }
 
     fn tags_for_tag_inner(
         &self,
         tag_id: TagId,
-        tags: &mut BTreeSet<TagId>,
+        lookup_cache: &mut BTreeSet<TagId>,
+        collected_tags: &mut BTreeSet<TagId>,
         subtag_rule: SubtagRule,
     ) -> Result<(), DatabaseError> {
         let mut statement = self
@@ -274,11 +310,13 @@ impl DatabaseHandle {
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .map(|entry| entry.unwrap());
 
-        for tag_id in iterator {
-            tags.insert(tag_id);
+        lookup_cache.insert(tag_id);
 
-            if subtag_rule == SubtagRule::Include {
-                self.tags_for_tag_inner(tag_id, tags, subtag_rule)?;
+        for tag_id in iterator {
+            collected_tags.insert(tag_id);
+
+            if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
+                self.tags_for_tag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?;
             }
         }
 
@@ -292,7 +330,10 @@ impl DatabaseHandle {
         subtag_rule: SubtagRule,
     ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
         let mut tags = BTreeSet::new();
-        self.tags_for_tag_inner(tag_id, &mut tags, subtag_rule)?;
+        let mut lookup_cache = BTreeSet::new();
+
+        self.tags_for_tag_inner(tag_id, &mut lookup_cache, &mut tags, subtag_rule)?;
+
         Ok(tags)
     }
 

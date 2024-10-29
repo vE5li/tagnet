@@ -42,6 +42,9 @@
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
             PKG_CONFIG_PATH = "${pkgs.glib.dev}/lib/pkgconfig:${pkgs.libsoup_3.dev}/lib/pkgconfig:${pkgs.webkitgtk_4_1.dev}/lib/pkgconfig:${pkgs.at-spi2-atk.dev}/lib/pkgconfig:${pkgs.gtk3.dev}/lib/pkgconfig:${pkgs.gdk-pixbuf.dev}/lib/pkgconfig:${pkgs.cairo.dev}/lib/pkgconfig:${pkgs.pango.dev}/lib/pkgconfig:${pkgs.harfbuzz.dev}/lib/pkgconfig";
 
+            # https://github.com/tauri-apps/tauri/issues/5143#issuecomment-1311815517
+            WEBKIT_DISABLE_COMPOSITING_MODE = 1;
+
             # shellHook =
             #   ''
             #     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${

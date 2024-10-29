@@ -42,7 +42,15 @@ enum Commands {
         tag_id: i64,
     },
     TagTag {
-        other_tag_id: i64,
+        subtag_id: i64,
+        tag_id: i64,
+    },
+    UntagFile {
+        file_id: i64,
+        tag_id: i64,
+    },
+    UntagTag {
+        subtag_id: i64,
         tag_id: i64,
     },
     FilesForTag {
@@ -68,17 +76,30 @@ fn main() {
             println!("Created tag with ID {tag_id:?}");
         }
         Commands::TagFile { tag_id, file_id } => {
-            handle
-                .tag_file(TagId::from_raw(tag_id), FileId::from_raw(file_id))
-                .unwrap();
+            if let Err(error) = handle.tag_file(TagId::from_raw(tag_id), FileId::from_raw(file_id))
+            {
+                println!("Invalid action: {error:?}");
+            }
         }
-        Commands::TagTag {
-            tag_id,
-            other_tag_id,
-        } => {
-            handle
-                .tag_tag(TagId::from_raw(tag_id), TagId::from_raw(other_tag_id))
-                .unwrap();
+        Commands::TagTag { tag_id, subtag_id } => {
+            if let Err(error) = handle.tag_tag(TagId::from_raw(tag_id), TagId::from_raw(subtag_id))
+            {
+                println!("Invalid action: {error:?}");
+            }
+        }
+        Commands::UntagFile { tag_id, file_id } => {
+            if let Err(error) =
+                handle.untag_file(TagId::from_raw(tag_id), FileId::from_raw(file_id))
+            {
+                println!("Invalid action: {error:?}");
+            }
+        }
+        Commands::UntagTag { tag_id, subtag_id } => {
+            if let Err(error) =
+                handle.untag_tag(TagId::from_raw(tag_id), TagId::from_raw(subtag_id))
+            {
+                println!("Invalid action: {error:?}");
+            }
         }
         Commands::FilesForTag { tag_id, subtags } => {
             let file_ids = handle
@@ -102,11 +123,11 @@ fn main() {
         }
     }
 
-    // handle.add_file("some_test/more.rs");
-    // handle.add_file("some_test/secods.rs");
-    // handle.add_file("some_test/ree.rs");
-    // handle.add_file("foobar.rs");
-    // handle.add_file("other.rs");
+    handle.add_file("some_test/more.rs");
+    handle.add_file("some_test/secods.rs");
+    handle.add_file("some_test/ree.rs");
+    handle.add_file("foobar.rs");
+    handle.add_file("other.rs");
 
     println!("\n\n-- DEBUG --");
     handle.show_files().unwrap();

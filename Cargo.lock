@@ -3176,6 +3176,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tagnet-core",
  "tauri",
  "tauri-build",
  "tauri-plugin-shell",

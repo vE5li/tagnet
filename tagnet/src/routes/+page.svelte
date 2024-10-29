@@ -4,10 +4,18 @@
   let name = $state("");
   let greetMsg = $state("");
 
+  let tagId = $state("");
+  let items = $state([]);
+
   async function greet(event: Event) {
     event.preventDefault();
     // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
     greetMsg = await invoke("greet", { name });
+  }
+
+  async function testme(event: Event) {
+    event.preventDefault();
+    items = await invoke("get_files_for_tag", { tagId: Number(tagId) });
   }
 </script>
 
@@ -32,6 +40,15 @@
     <button type="submit">Greet</button>
   </form>
   <p>{greetMsg}</p>
+
+  <form class="row" onsubmit={testme}>
+    <input id="test-input" placeholder="Tag Id" bind:value={tagId} />
+    <button type="submit">Get files</button>
+  </form>
+
+  {#each items as item}
+    <h1>{item}</h1>
+  {/each}
 </main>
 
 <style>
