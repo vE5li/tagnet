@@ -1,0 +1,25 @@
+# Rust
+target/
+**/*.rs.bk
+
+# cargo-mobile
+.cargo/
+/gen
+
+# macOS
+.DS_Store
+
+# Nix
+.direnv/
+
+# Flutter / Dart build outputs
+app/build/
+app/.dart_tool/
+app/linux/flutter/ephemeral/
+
+# Compiled native libraries (built from Rust, regenerated on build)
+**/jniLibs/**/*.so
+
+# Android / Gradle build outputs
+app/android/build/
+app/android/.gradle/

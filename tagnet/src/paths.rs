@@ -1,0 +1,97 @@
+//! Central place for resolving on-disk locations under the tagnet data
+//! directory. Keeping this in one struct avoids re-building paths by hand in
+//! every call site.
+//!
+//! Historically these were free functions that read `TAGNET_DATA_DIR` /
+//! `TAGNET_PRIVATE_KEY_FILE` from the environment and `expect()`ed them. That
+//! is fine for a shell-launched daemon but wrong for other frontends (e.g.
+//! Android, where there is no shell environment and a panic crashes the app).
+//!
+//! The environment is therefore no longer consulted here. Each frontend
+//! constructs a [`Paths`] value explicitly:
+//!
+//! - the desktop binary reads the environment (see `main.rs`),
+//! - Android would pass `getFilesDir()` through the bridge.
+
+use std::path::{Path, PathBuf};
+
+/// Resolved on-disk locations for a single tagnet instance.
+///
+/// `data_dir` holds the databases (`main.db`, per-sync-directory `*.db`).
+/// `identity_file` is the path to this machine's long-lived identity key; it
+/// is kept separate rather than derived from `data_dir` so existing
+/// deployments that point it elsewhere keep working.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    data_dir: PathBuf,
+    identity_file: PathBuf,
+}
+
+impl Paths {
+    /// Build a `Paths` from an explicit data directory and identity-file path.
+    pub fn new(data_dir: impl Into<PathBuf>, identity_file: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            identity_file: identity_file.into(),
+        }
+    }
+
+    /// The tagnet data directory holding the databases.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// This machine's long-lived identity key.
+    pub fn identity_path(&self) -> &Path {
+        &self.identity_file
+    }
+
+    /// The main `FileDatabase` shared across the daemon.
+    pub fn main_db_path(&self) -> PathBuf {
+        self.data_dir.join("main.db")
+    }
+
+    /// The per-sync-directory `SyncDirectoryDatabase`, named after the
+    /// directory it tracks (e.g. a directory `testcloud` maps to
+    /// `testcloud.db`).
+    pub fn sync_directory_db_path(&self, sync_directory: &Path) -> PathBuf {
+        let name = sync_directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unnamed".to_owned());
+        self.data_dir.join(format!("{name}.db"))
+    }
+}
+
+/// The daemon's local control socket (portability plan section 7).
+///
+/// This is a **fixed, well-known absolute path**, deliberately with **no
+/// environment-variable resolution and no fallback**. The daemon and every
+/// client (the CLI, later the desktop UI) must agree on the exact same address,
+/// and a fallback chain is precisely what lets them silently disagree: an
+/// earlier design resolved `$XDG_RUNTIME_DIR/tagnet.sock` with a `/tmp`
+/// fallback, so a systemd *system* service (which has no `XDG_RUNTIME_DIR`)
+/// happily bound `/tmp/tagnet.sock` while an interactive CLI looked in
+/// `/run/user/1000/tagnet.sock` and failed. One constant removes that whole
+/// class of bug.
+///
+/// The directory `/run/tagnet` is owned and secured by systemd via
+/// `RuntimeDirectory=tagnet` in the unit (see `module.nix`): it is created
+/// `0700` and owned by the service user on start and removed on stop. That
+/// filesystem permission is the entire security model for local control —
+/// nothing is exposed on any network interface, so no auth handshake is needed
+/// here.
+///
+/// Callers that genuinely need a different location (tests, a non-systemd
+/// launch) pass an explicit path to [`serve_control`](crate::control::serve_control)
+/// / [`IpcClientBackend::connect`](crate::control::IpcClientBackend::connect)
+/// and the CLI `--socket` flag, rather than relying on discovery here.
+pub const CONTROL_SOCKET_PATH: &str = "/run/tagnet/tagnet.sock";
+
+/// Path to the daemon's local control socket (portability plan section 7).
+///
+/// Returns the fixed [`CONTROL_SOCKET_PATH`]. See its docs for why there is no
+/// environment lookup or fallback.
+pub fn control_socket_path() -> PathBuf {
+    PathBuf::from(CONTROL_SOCKET_PATH)
+}

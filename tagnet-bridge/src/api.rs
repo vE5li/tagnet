@@ -1,0 +1,286 @@
+//! Dart-facing API surface (portability plan sections 5, 6, 8).
+//!
+//! This is the thin layer `flutter_rust_bridge` generates Dart bindings for. It
+//! deliberately adds **no** business logic: it owns a [`RuntimeHandle`] and
+//! forwards every call to the section-6 [`Backend`], which forwards to the
+//! section-5 [`Api`](tagnet::api::Api). The Dart UI holds one [`TagnetApp`] and
+//! never learns which transport backs it.
+//!
+//! The `#[flutter_rust_bridge::frb]` annotations are applied only when the
+//! `flutter_rust_bridge` feature is enabled (via `cfg_attr`), so the crate
+//! still compiles — and `cargo check` still passes — without the generator's
+//! dependency present.
+
+use tokio::sync::Mutex;
+
+use tagnet::transport::{Backend, EventStream, TransportBackend};
+
+// Re-exported (not just `use`d) so the types appearing in this module's
+// `#[frb]`-annotated signatures are reachable via `crate::api::*` — which is
+// exactly how `flutter_rust_bridge_codegen` references them in the generated
+// `frb_generated.rs`. A plain private `use` would not be visible through that
+// glob and the generated code fails to compile.
+pub use tagnet::{
+    api::{ApiError, ApiEvent},
+    database::{SubtagRule, Tag},
+};
+pub use tagnet_core::{FileId, FileInfo, TagId};
+
+use crate::runtime::{BridgePaths, StartError};
+
+/// A file flattened into primitive fields for the Dart UI.
+///
+/// The core [`FileInfo`] is crossed to Dart as an *opaque* handle (frb cannot
+/// see inside external-crate structs), so its fields are unreadable from Dart.
+/// This DTO — defined in the bridge crate with plain `String`/`i64` fields —
+/// is generated as a real Dart class the UI can display directly. Ids are
+/// rendered as their UUID strings.
+pub struct FileEntry {
+    pub file_id: String,
+    pub path: String,
+    pub content_hash: String,
+    pub version_number: i64,
+}
+
+impl From<FileInfo> for FileEntry {
+    fn from(info: FileInfo) -> Self {
+        Self {
+            file_id: info.file_id.to_string(),
+            path: info.logical_path.into_string(),
+            content_hash: info.content_hash,
+            version_number: info.version_number,
+        }
+    }
+}
+
+/// A tag flattened into primitive fields for the Dart UI (see [`FileEntry`]).
+pub struct TagEntry {
+    pub tag_id: String,
+    pub name: String,
+    pub color: String,
+}
+
+impl From<Tag> for TagEntry {
+    fn from(tag: Tag) -> Self {
+        Self {
+            tag_id: tag.id.to_string(),
+            name: tag.name,
+            color: tag.color,
+        }
+    }
+}
+
+/// The handle the Dart UI holds while it is open.
+///
+/// It does **not** own the runtime. The runtime is a process-global owned by
+/// the Android foreground service (see [`crate::service`]) so it survives the
+/// UI closing. This handle just reads/writes through that global's
+/// [`Backend`]; dropping it (UI closed) leaves the runtime running.
+#[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(opaque))]
+pub struct TagnetApp {
+    _private: (),
+}
+
+impl TagnetApp {
+    /// Attach to the sync runtime, starting it if it is not already running.
+    ///
+    /// Normally the foreground service has already started the process-global
+    /// runtime (over JNI) by the time the UI opens, in which case this just
+    /// attaches. If it is not running yet (e.g. the service is slow, or during
+    /// development), this starts it. Either way the runtime keeps running after
+    /// this handle is dropped.
+    ///
+    /// Parses `configuration_json` with
+    /// [`Configuration::from_str`](tagnet::configuration::Configuration::from_str)
+    /// and initialises log routing (logcat on Android). Blocks only until the
+    /// engine is ready or startup fails.
+    #[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(sync))]
+    pub fn start(
+        configuration_json: String,
+        data_dir: String,
+        identity_file: String,
+    ) -> Result<TagnetApp, StartError> {
+        crate::service::start(
+            &configuration_json,
+            BridgePaths {
+                data_dir: data_dir.into(),
+                identity_file: identity_file.into(),
+            },
+        )?;
+
+        Ok(TagnetApp { _private: () })
+    }
+
+    /// Attach to an already-running tagnet daemon over IPC (Linux desktop
+    /// topology, plan sections 6-7).
+    ///
+    /// Unlike [`start`](TagnetApp::start), this process does **not** own the
+    /// sync engine or the database — the systemd daemon does. This opens a
+    /// connection to the daemon's control socket (`/run/tagnet/tagnet.sock`)
+    /// and returns a handle that reads/writes through the daemon. No
+    /// configuration, data directory, or identity is needed here: they all
+    /// belong to the daemon.
+    ///
+    /// Fails with a transport error if the daemon is not running (the control
+    /// socket is absent or refuses the connection).
+    pub async fn attach() -> Result<TagnetApp, StartError> {
+        crate::service::attach().await?;
+        Ok(TagnetApp { _private: () })
+    }
+
+    /// The backend of the process-global runtime.
+    ///
+    /// Panics only if the runtime was stopped out from under an open UI, which
+    /// should not happen (the service outlives the UI). Callers surface a
+    /// transport error instead of unwrapping in that unlikely race.
+    fn try_backend(&self) -> Result<Backend, ApiError> {
+        crate::service::backend()
+            .ok_or_else(|| ApiError::Transport("sync runtime is not running".to_owned()))
+    }
+
+    /// This device's base64 ed25519 public key.
+    ///
+    /// The value a peer must add to its own config to pair with this device.
+    /// Synchronous: it is known as soon as the runtime has started. Empty if
+    /// the runtime is somehow not running.
+    #[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(sync))]
+    pub fn public_key(&self) -> String {
+        crate::service::public_key().unwrap_or_default()
+    }
+
+    // --- Read API (plan 5.3) -------------------------------------------------
+
+    /// List all tags.
+    pub async fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
+        self.try_backend()?.list_tags().await
+    }
+
+    /// List every currently-known file with its latest version info.
+    pub async fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
+        self.try_backend()?.list_files().await
+    }
+
+    /// List every file as a Dart-readable [`FileEntry`] (flat fields).
+    pub async fn list_file_entries(&self) -> Result<Vec<FileEntry>, ApiError> {
+        Ok(self
+            .try_backend()?
+            .list_files()
+            .await?
+            .into_iter()
+            .map(FileEntry::from)
+            .collect())
+    }
+
+    /// List every tag as a Dart-readable [`TagEntry`] (flat fields).
+    pub async fn list_tag_entries(&self) -> Result<Vec<TagEntry>, ApiError> {
+        Ok(self
+            .try_backend()?
+            .list_tags()
+            .await?
+            .into_iter()
+            .map(TagEntry::from)
+            .collect())
+    }
+
+    /// List the tags applied to `file_id`.
+    pub async fn tags_for_file(
+        &self,
+        file_id: FileId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        self.try_backend()?
+            .tags_for_file(file_id, subtag_rule)
+            .await
+    }
+
+    /// List the files carrying `tag_id` (the v1 single-tag "search").
+    pub async fn files_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<FileId>, ApiError> {
+        self.try_backend()?.files_for_tag(tag_id, subtag_rule).await
+    }
+
+    // --- Write API (plan 5.4) ------------------------------------------------
+
+    /// Create a tag; returns the freshly-minted id.
+    pub async fn create_tag(&self, name: String, color: String) -> Result<TagId, ApiError> {
+        self.try_backend()?.create_tag(name, color).await
+    }
+
+    /// Delete a tag.
+    pub async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
+        self.try_backend()?.delete_tag(tag_id).await
+    }
+
+    /// Upload a file (in-memory `Vec<u8>` in v1); returns the freshly-minted id.
+    pub async fn upload_file(
+        &self,
+        path_name: String,
+        content: Vec<u8>,
+        tags: Vec<TagId>,
+    ) -> Result<FileId, ApiError> {
+        self.try_backend()?
+            .upload_file(path_name, content, tags)
+            .await
+    }
+
+    /// Delete a file.
+    pub async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
+        self.try_backend()?.delete_file(file_id).await
+    }
+
+    /// Apply `tag_id` to `file_id`.
+    pub async fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
+        self.try_backend()?.tag_file(tag_id, file_id).await
+    }
+
+    /// Remove `tag_id` from `file_id`.
+    pub async fn untag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
+        self.try_backend()?.untag_file(tag_id, file_id).await
+    }
+
+    // --- Event stream (plan 5.5) ---------------------------------------------
+
+    /// Subscribe to the live change stream.
+    ///
+    /// Returns an [`EventSubscription`] the UI polls with
+    /// [`EventSubscription::next`]. Each item is an [`ApiEvent`]; a `None`
+    /// means the stream is unavailable (runtime not running) or closed.
+    pub fn subscribe(&self) -> EventSubscription {
+        EventSubscription {
+            stream: self
+                .try_backend()
+                .ok()
+                .map(|backend| Mutex::new(backend.subscribe())),
+        }
+    }
+}
+
+/// A live subscription to the change stream (plan 5.5).
+///
+/// `flutter_rust_bridge` maps [`EventSubscription::next`] onto a Dart
+/// `Future<ApiEvent?>` the UI awaits in a loop; on `null` the stream is done.
+/// The [`EventStream`] is held behind a [`Mutex`] because the generated Dart
+/// binding shares the opaque handle across await points.
+#[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(opaque))]
+pub struct EventSubscription {
+    /// `None` if the runtime was not running when the subscription was made.
+    stream: Option<Mutex<EventStream>>,
+}
+
+impl EventSubscription {
+    /// Await the next event, or `None` once the stream is permanently closed
+    /// (or was never available).
+    pub async fn next(&self) -> Option<ApiEvent> {
+        // `EventStream::recv` borrows the receiver mutably. A `tokio` mutex
+        // (rather than `std`) keeps the resulting future `Send` so
+        // `flutter_rust_bridge` can drive it on its multi-thread runtime; the
+        // UI drives one `next` at a time per subscription, so contention is
+        // nil.
+        let stream = self.stream.as_ref()?;
+        let mut guard = stream.lock().await;
+        guard.recv().await
+    }
+}
