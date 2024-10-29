@@ -88,28 +88,12 @@ impl FromSql for EntryType {
         }
     }
 }
-
-// TODO: This might be useless.
-#[derive(Debug)]
-struct File {
-    id: FileId,
-    path: String,
-}
-
-// TODO: This might be useless.
-#[derive(Debug)]
-struct Tag {
-    id: TagId,
-    name: String,
-}
-
-// TODO: This might be useless.
-#[derive(Debug)]
-struct Entry {
-    id: EntryId,
-    tag_id: TagId,
-    target_id: i64,
-    r#type: EntryType,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtagRule {
+    Include,
+    Exclude,
+    // TODO: Maybe?
+    // Depth { depth: usize },
 }
 
 #[derive(Debug)]
@@ -118,6 +102,7 @@ pub enum DatabaseError {
     FailedToExecuteCommand,
     NonUtf8FilePath,
     MissingFile,
+    MissingTag,
 }
 
 #[derive(Debug)]
@@ -165,6 +150,7 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
 }
 
 impl DatabaseHandle {
+    /// Add a new file.
     pub fn add_file(&self, file_path: impl AsRef<Path>) -> Result<FileId, DatabaseError> {
         let file_name = file_path
             .as_ref()
@@ -178,6 +164,7 @@ impl DatabaseHandle {
         Ok(FileId(self.connection.last_insert_rowid()))
     }
 
+    /// Add a new tag.
     pub fn add_tag(&self, name: impl Into<String>) -> Result<TagId, DatabaseError> {
         self.connection
             .execute("INSERT INTO tags (name) VALUES (?1)", [&name.into()])
@@ -186,6 +173,7 @@ impl DatabaseHandle {
         Ok(TagId(self.connection.last_insert_rowid()))
     }
 
+    /// Tag a file with the provided tag.
     pub fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<EntryId, DatabaseError> {
         self.connection
             .execute(
@@ -197,6 +185,7 @@ impl DatabaseHandle {
         Ok(EntryId(self.connection.last_insert_rowid()))
     }
 
+    /// Tag a tag with the provided tag.
     pub fn tag_tag(&self, tag_id: TagId, other_tag_id: TagId) -> Result<EntryId, DatabaseError> {
         self.connection
             .execute(
@@ -212,8 +201,9 @@ impl DatabaseHandle {
         &self,
         tag_id: TagId,
         files: &mut BTreeSet<FileId>,
+        subtag_rule: SubtagRule,
     ) -> Result<(), DatabaseError> {
-        enum EntryHelper {
+        enum Entry {
             File { file_id: FileId },
             Tag { tag_id: TagId },
         }
@@ -228,10 +218,10 @@ impl DatabaseHandle {
                 let r#type: EntryType = row.get(1)?;
 
                 let entry = match r#type {
-                    EntryType::File => EntryHelper::File {
+                    EntryType::File => Entry::File {
                         file_id: row.get(0)?,
                     },
-                    EntryType::Tag => EntryHelper::Tag {
+                    EntryType::Tag => Entry::Tag {
                         tag_id: row.get(0)?,
                     },
                 };
@@ -243,22 +233,70 @@ impl DatabaseHandle {
 
         for entry in iterator {
             match entry {
-                EntryHelper::File { file_id } => {
+                Entry::File { file_id } => {
                     files.insert(file_id);
                 }
-                EntryHelper::Tag { tag_id } => self.files_for_tag_inner(tag_id, files)?,
+                Entry::Tag { tag_id } => {
+                    if subtag_rule == SubtagRule::Include {
+                        self.files_for_tag_inner(tag_id, files, subtag_rule)?
+                    }
+                }
             }
         }
 
         Ok(())
     }
 
-    pub fn files_for_tag(&self, tag_id: TagId) -> Result<BTreeSet<FileId>, DatabaseError> {
+    /// Get all files that are tagged with the provided tag.
+    pub fn files_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = FileId>, DatabaseError> {
         let mut files = BTreeSet::new();
-        self.files_for_tag_inner(tag_id, &mut files)?;
+        self.files_for_tag_inner(tag_id, &mut files, subtag_rule)?;
         Ok(files)
     }
 
+    fn tags_for_tag_inner(
+        &self,
+        tag_id: TagId,
+        tags: &mut BTreeSet<TagId>,
+        subtag_rule: SubtagRule,
+    ) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT target_id FROM entries WHERE tag_id = ?1 AND type = 1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([tag_id], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap());
+
+        for tag_id in iterator {
+            tags.insert(tag_id);
+
+            if subtag_rule == SubtagRule::Include {
+                self.tags_for_tag_inner(tag_id, tags, subtag_rule)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all tags that are tagged with the provided tag.
+    pub fn tags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        let mut tags = BTreeSet::new();
+        self.tags_for_tag_inner(tag_id, &mut tags, subtag_rule)?;
+        Ok(tags)
+    }
+
+    /// Get the path of a file by the ID.
     pub fn file_path(&self, file_id: FileId) -> Result<OsString, DatabaseError> {
         let mut statement = self
             .connection
@@ -268,15 +306,41 @@ impl DatabaseHandle {
         let file_path = statement
             .query_map([file_id], |row| row.get::<_, String>(0))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|file| file.unwrap())
+            .map(|path| path.unwrap())
             .next()
             .ok_or(DatabaseError::MissingFile)?;
 
         Ok(file_path.into())
     }
 
+    /// Get the name of a tag by the ID.
+    pub fn tag_name(&self, tag_id: TagId) -> Result<String, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT name FROM tags WHERE id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag_name = statement
+            .query_map([tag_id], |row| row.get::<_, String>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|name| name.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingTag)?;
+
+        Ok(tag_name)
+    }
+}
+
+impl DatabaseHandle {
     // TODO: Temporary function to debug.
     pub fn show_files(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct File {
+            id: FileId,
+            path: String,
+        }
+
         let mut statement = self
             .connection
             .prepare("SELECT id, path FROM files")
@@ -299,6 +363,13 @@ impl DatabaseHandle {
     }
     // TODO: Temporary function to debug.
     pub fn show_tags(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Tag {
+            id: TagId,
+            name: String,
+        }
+
         let mut statement = self
             .connection
             .prepare("SELECT id, name FROM tags")
@@ -322,6 +393,15 @@ impl DatabaseHandle {
 
     // TODO: Temporary function to debug.
     pub fn show_entries(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Entry {
+            id: EntryId,
+            tag_id: TagId,
+            target_id: i64,
+            r#type: EntryType,
+        }
+
         let mut statement = self
             .connection
             .prepare("SELECT id, tag_id, target_id, type FROM entries")
