@@ -1,11 +1,11 @@
-use std::{ffi::OsString, path::Path};
+use std::{collections::BTreeSet, ffi::OsString, path::Path};
 
 use rusqlite::{
     types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
     Connection, ToSql,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(i64);
 
 impl FileId {
@@ -27,7 +27,7 @@ impl FromSql for FileId {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TagId(i64);
 
 impl TagId {
@@ -49,7 +49,7 @@ impl FromSql for TagId {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntryId(i64);
 
 impl ToSql for EntryId {
@@ -64,7 +64,7 @@ impl FromSql for EntryId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryType {
     File,
     Tag,
@@ -208,18 +208,54 @@ impl DatabaseHandle {
         Ok(EntryId(self.connection.last_insert_rowid()))
     }
 
-    pub fn files_for_tag(&self, tag_id: TagId) -> Result<Vec<FileId>, DatabaseError> {
+    fn files_for_tag_inner(
+        &self,
+        tag_id: TagId,
+        files: &mut BTreeSet<FileId>,
+    ) -> Result<(), DatabaseError> {
+        enum EntryHelper {
+            File { file_id: FileId },
+            Tag { tag_id: TagId },
+        }
+
         let mut statement = self
             .connection
-            .prepare("SELECT target_id FROM entries WHERE tag_id = ?1")
+            .prepare("SELECT target_id, type FROM entries WHERE tag_id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        let files = statement
-            .query_map([tag_id], |row| row.get::<_, FileId>(0))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|tag_id| tag_id.unwrap())
-            .collect();
+        let iterator = statement
+            .query_map([tag_id], |row| {
+                let r#type: EntryType = row.get(1)?;
 
+                let entry = match r#type {
+                    EntryType::File => EntryHelper::File {
+                        file_id: row.get(0)?,
+                    },
+                    EntryType::Tag => EntryHelper::Tag {
+                        tag_id: row.get(0)?,
+                    },
+                };
+
+                Ok(entry)
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap());
+
+        for entry in iterator {
+            match entry {
+                EntryHelper::File { file_id } => {
+                    files.insert(file_id);
+                }
+                EntryHelper::Tag { tag_id } => self.files_for_tag_inner(tag_id, files)?,
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn files_for_tag(&self, tag_id: TagId) -> Result<BTreeSet<FileId>, DatabaseError> {
+        let mut files = BTreeSet::new();
+        self.files_for_tag_inner(tag_id, &mut files)?;
         Ok(files)
     }
 
