@@ -1,0 +1,311 @@
+use std::{ffi::OsString, path::Path};
+
+use rusqlite::{
+    types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
+    Connection, ToSql,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct FileId(i64);
+
+impl FileId {
+    // FIX: May be temporary.
+    pub fn from_raw(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl ToSql for FileId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.0.into())
+    }
+}
+
+impl FromSql for FileId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Ok(Self(value.as_i64()?))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TagId(i64);
+
+impl TagId {
+    // FIX: May be temporary.
+    pub fn from_raw(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl ToSql for TagId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.0.into())
+    }
+}
+
+impl FromSql for TagId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Ok(Self(value.as_i64()?))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EntryId(i64);
+
+impl ToSql for EntryId {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.0.into())
+    }
+}
+
+impl FromSql for EntryId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Ok(Self(value.as_i64()?))
+    }
+}
+
+#[derive(Debug)]
+pub enum EntryType {
+    File,
+    Tag,
+}
+
+impl ToSql for EntryType {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            EntryType::File => Ok(0.into()),
+            EntryType::Tag => Ok(1.into()),
+        }
+    }
+}
+
+impl FromSql for EntryType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_i64()? {
+            0 => Ok(Self::File),
+            1 => Ok(Self::Tag),
+            invalid => panic!("invalid entry type {}", invalid),
+        }
+    }
+}
+
+// TODO: This might be useless.
+#[derive(Debug)]
+struct File {
+    id: FileId,
+    path: String,
+}
+
+// TODO: This might be useless.
+#[derive(Debug)]
+struct Tag {
+    id: TagId,
+    name: String,
+}
+
+// TODO: This might be useless.
+#[derive(Debug)]
+struct Entry {
+    id: EntryId,
+    tag_id: TagId,
+    target_id: i64,
+    r#type: EntryType,
+}
+
+#[derive(Debug)]
+pub enum DatabaseError {
+    UnableToOpenOrCreate,
+    FailedToExecuteCommand,
+    NonUtf8FilePath,
+    MissingFile,
+}
+
+#[derive(Debug)]
+pub struct DatabaseHandle {
+    connection: Connection,
+}
+
+pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, DatabaseError> {
+    let connection =
+        Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS files (
+            id    INTEGER PRIMARY KEY,
+            path  TEXT NOT NULL UNIQUE
+        )",
+            (), // empty list of parameters.
+        )
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS tags (
+            id    INTEGER PRIMARY KEY,
+            name  TEXT NOT NULL UNIQUE
+        )",
+            (), // empty list of parameters.
+        )
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS entries (
+            id          INTEGER PRIMARY KEY,
+            tag_id      INTEGER NOT NULL,
+            target_id   INTEGER NOT NULL,
+            type        INTEGER
+        )",
+            (), // empty list of parameters.
+        )
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+    Ok(DatabaseHandle { connection })
+}
+
+impl DatabaseHandle {
+    pub fn add_file(&self, file_path: impl AsRef<Path>) -> Result<FileId, DatabaseError> {
+        let file_name = file_path
+            .as_ref()
+            .to_str()
+            .ok_or(DatabaseError::NonUtf8FilePath)?;
+
+        self.connection
+            .execute("INSERT INTO files (path) VALUES (?1)", [&file_name])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(FileId(self.connection.last_insert_rowid()))
+    }
+
+    pub fn add_tag(&self, name: impl Into<String>) -> Result<TagId, DatabaseError> {
+        self.connection
+            .execute("INSERT INTO tags (name) VALUES (?1)", [&name.into()])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(TagId(self.connection.last_insert_rowid()))
+    }
+
+    pub fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<EntryId, DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO entries (tag_id, target_id, type) VALUES (?1, ?2, ?3)",
+                (&tag_id, &file_id, EntryType::File),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(EntryId(self.connection.last_insert_rowid()))
+    }
+
+    pub fn tag_tag(&self, tag_id: TagId, other_tag_id: TagId) -> Result<EntryId, DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO entries (tag_id, target_id, type) VALUES (?1, ?2, ?3)",
+                (&tag_id, &other_tag_id, EntryType::Tag),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(EntryId(self.connection.last_insert_rowid()))
+    }
+
+    pub fn files_for_tag(&self, tag_id: TagId) -> Result<Vec<FileId>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT target_id FROM entries WHERE tag_id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let files = statement
+            .query_map([tag_id], |row| row.get::<_, FileId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|tag_id| tag_id.unwrap())
+            .collect();
+
+        Ok(files)
+    }
+
+    pub fn file_path(&self, file_id: FileId) -> Result<OsString, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM files WHERE id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let file_path = statement
+            .query_map([file_id], |row| row.get::<_, String>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(file_path.into())
+    }
+
+    // TODO: Temporary function to debug.
+    pub fn show_files(&self) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                })
+            })
+            .unwrap();
+
+        for file in iterator {
+            println!("{:?}", file.unwrap());
+        }
+
+        Ok(())
+    }
+    // TODO: Temporary function to debug.
+    pub fn show_tags(&self) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name FROM tags")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })
+            .unwrap();
+
+        for tag in iterator {
+            println!("{:?}", tag.unwrap());
+        }
+
+        Ok(())
+    }
+
+    // TODO: Temporary function to debug.
+    pub fn show_entries(&self) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, tag_id, target_id, type FROM entries")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(Entry {
+                    id: row.get(0)?,
+                    tag_id: row.get(1)?,
+                    target_id: row.get(2)?,
+                    r#type: row.get(3)?,
+                })
+            })
+            .unwrap();
+
+        for entry in iterator {
+            println!("{:?}", entry.unwrap());
+        }
+
+        Ok(())
+    }
+}

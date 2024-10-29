@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["tagnet-core", "tagnet-cli", "tagnet/src-tauri"]
+
+[workspace.dependencies]
+tagnet-core = { path = "tagnet-core" }
