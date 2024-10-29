@@ -76,58 +76,50 @@ fn main() {
             println!("Created tag with ID {tag_id:?}");
         }
         Commands::TagFile { tag_id, file_id } => {
-            if let Err(error) = handle.tag_file(TagId::from_raw(tag_id), FileId::from_raw(file_id))
-            {
+            if let Err(error) = handle.tag_file(tag_id.into(), file_id.into()) {
                 println!("Invalid action: {error:?}");
             }
         }
         Commands::TagTag { tag_id, subtag_id } => {
-            if let Err(error) = handle.tag_tag(TagId::from_raw(tag_id), TagId::from_raw(subtag_id))
-            {
+            if let Err(error) = handle.tag_tag(tag_id.into(), subtag_id.into()) {
                 println!("Invalid action: {error:?}");
             }
         }
         Commands::UntagFile { tag_id, file_id } => {
-            if let Err(error) =
-                handle.untag_file(TagId::from_raw(tag_id), FileId::from_raw(file_id))
-            {
+            if let Err(error) = handle.untag_file(tag_id.into(), file_id.into()) {
                 println!("Invalid action: {error:?}");
             }
         }
         Commands::UntagTag { tag_id, subtag_id } => {
-            if let Err(error) =
-                handle.untag_tag(TagId::from_raw(tag_id), TagId::from_raw(subtag_id))
-            {
+            if let Err(error) = handle.untag_tag(tag_id.into(), subtag_id.into()) {
                 println!("Invalid action: {error:?}");
             }
         }
         Commands::FilesForTag { tag_id, subtags } => {
-            let file_ids = handle
-                .files_for_tag(TagId::from_raw(tag_id), subtags.into())
-                .unwrap();
+            let file_ids = handle.files_for_tag(tag_id.into(), subtags.into()).unwrap();
 
             file_ids
                 .into_iter()
-                .map(|file_id| handle.file_path(file_id).unwrap())
+                .map(|file_id| handle.file_path_from_id(file_id).unwrap())
                 .for_each(|file_path| println!("> {file_path:?}"));
         }
         Commands::TagsForTag { tag_id, subtags } => {
             let tag_ids = handle
-                .tags_for_tag(TagId::from_raw(tag_id), subtags.into())
+                .tags_for_tag(tag_id.into(), subtags.into())
                 .unwrap();
 
             tag_ids
                 .into_iter()
-                .map(|tag_id| handle.tag_name(tag_id).unwrap())
+                .map(|tag_id| handle.tag_name_from_id(tag_id).unwrap())
                 .for_each(|tag_name| println!("> {tag_name:?}"));
         }
     }
 
-    handle.add_file("some_test/more.rs");
-    handle.add_file("some_test/secods.rs");
-    handle.add_file("some_test/ree.rs");
-    handle.add_file("foobar.rs");
-    handle.add_file("other.rs");
+    // handle.add_file("some_test/more.rs");
+    // handle.add_file("some_test/secods.rs");
+    // handle.add_file("some_test/ree.rs");
+    // handle.add_file("foobar.rs");
+    // handle.add_file("other.rs");
 
     println!("\n\n-- DEBUG --");
     handle.show_files().unwrap();

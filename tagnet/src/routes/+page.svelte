@@ -2,20 +2,27 @@
   import { invoke } from "@tauri-apps/api/core";
 
   let name = $state("");
-  let greetMsg = $state("");
 
-  let tagId = $state("");
+  let tags = $state([]);
+
+  let tag = $state("");
   let items = $state([]);
 
-  async function greet(event: Event) {
+  async function loadInitial() {
+    tags = await invoke("all_tags", { });
+  }
+
+  setTimeout(loadInitial, 10);
+
+  async function addTag(event: Event) {
     event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+    await invoke("add_tag", { name });
+    tags = await invoke("all_tags", { });
   }
 
   async function testme(event: Event) {
     event.preventDefault();
-    items = await invoke("get_files_for_tag", { tagId: Number(tagId) });
+    items = await invoke("files_for_tag", { tag });
   }
 </script>
 
@@ -35,14 +42,16 @@
   </div>
   <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
+  <form class="row" onsubmit={addTag}>
+    <input id="new-tag-name" placeholder="Tag name" bind:value={name} />
+    <button type="submit">Add new tag</button>
   </form>
-  <p>{greetMsg}</p>
+  {#each tags as tag}
+    <h1>{tag}</h1>
+  {/each}
 
   <form class="row" onsubmit={testme}>
-    <input id="test-input" placeholder="Tag Id" bind:value={tagId} />
+    <input id="test-input" placeholder="Tag Id" bind:value={tag} />
     <button type="submit">Get files</button>
   </form>
 

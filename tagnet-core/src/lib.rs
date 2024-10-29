@@ -4,18 +4,20 @@ use rusqlite::{
     types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
     Connection, ToSql,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(i64);
 
-impl FileId {
-    // FIX: May be temporary.
-    pub fn from_raw(id: i64) -> Self {
-        Self(id)
+impl From<FileId> for i64 {
+    fn from(value: FileId) -> Self {
+        value.0
     }
+}
 
-    pub fn into_raw(self) -> i64 {
-        self.0
+impl From<i64> for FileId {
+    fn from(value: i64) -> Self {
+        Self(value)
     }
 }
 
@@ -34,10 +36,15 @@ impl FromSql for FileId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TagId(i64);
 
-impl TagId {
-    // FIX: May be temporary.
-    pub fn from_raw(id: i64) -> Self {
-        Self(id)
+impl From<TagId> for i64 {
+    fn from(value: TagId) -> Self {
+        value.0
+    }
+}
+
+impl From<i64> for TagId {
+    fn from(value: i64) -> Self {
+        Self(value)
     }
 }
 
@@ -100,7 +107,7 @@ pub enum SubtagRule {
     // Depth { depth: usize },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum DatabaseError {
     UnableToOpenOrCreate,
     FailedToExecuteCommand,
@@ -157,13 +164,13 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
 impl DatabaseHandle {
     /// Add a new file.
     pub fn add_file(&self, file_path: impl AsRef<Path>) -> Result<FileId, DatabaseError> {
-        let file_name = file_path
+        let file_path = file_path
             .as_ref()
             .to_str()
             .ok_or(DatabaseError::NonUtf8FilePath)?;
 
         self.connection
-            .execute("INSERT INTO files (path) VALUES (?1)", [&file_name])
+            .execute("INSERT INTO files (path) VALUES (?1)", [&file_path])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(FileId(self.connection.last_insert_rowid()))
@@ -171,6 +178,8 @@ impl DatabaseHandle {
 
     /// Add a new tag.
     pub fn add_tag(&self, name: impl Into<String>) -> Result<TagId, DatabaseError> {
+        // TODO: Check that the tag name is not only numbers.
+
         self.connection
             .execute("INSERT INTO tags (name) VALUES (?1)", [&name.into()])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -337,8 +346,24 @@ impl DatabaseHandle {
         Ok(tags)
     }
 
+    /// Get all tags.
+    pub fn all_tags(&self) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM tags")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag_list = statement
+            .query_map([], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+
+        Ok(tag_list)
+    }
+
     /// Get the path of a file by the ID.
-    pub fn file_path(&self, file_id: FileId) -> Result<OsString, DatabaseError> {
+    pub fn file_path_from_id(&self, file_id: FileId) -> Result<OsString, DatabaseError> {
         let mut statement = self
             .connection
             .prepare("SELECT path FROM files WHERE id = ?1")
@@ -354,8 +379,33 @@ impl DatabaseHandle {
         Ok(file_path.into())
     }
 
+    /// Get the ID of a file by the path.
+    pub fn file_id_from_path(
+        &self,
+        file_path: impl AsRef<OsString>,
+    ) -> Result<FileId, DatabaseError> {
+        let file_path = file_path
+            .as_ref()
+            .to_str()
+            .ok_or(DatabaseError::NonUtf8FilePath)?;
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM files WHERE path = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let file_id = statement
+            .query_map([file_path], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|id| id.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(file_id)
+    }
+
     /// Get the name of a tag by the ID.
-    pub fn tag_name(&self, tag_id: TagId) -> Result<String, DatabaseError> {
+    pub fn tag_name_from_id(&self, tag_id: TagId) -> Result<String, DatabaseError> {
         let mut statement = self
             .connection
             .prepare("SELECT name FROM tags WHERE id = ?1")
@@ -369,6 +419,23 @@ impl DatabaseHandle {
             .ok_or(DatabaseError::MissingTag)?;
 
         Ok(tag_name)
+    }
+
+    /// Get the ID of a tag by the name.
+    pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM tags WHERE name = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag_id = statement
+            .query_map([name], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|id| id.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingTag)?;
+
+        Ok(tag_id)
     }
 }
 

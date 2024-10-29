@@ -1,26 +1,52 @@
 use std::sync::Mutex;
 
-use tagnet_core::{initialize, DatabaseHandle, SubtagRule, TagId};
+use tagnet_core::{initialize, DatabaseError, DatabaseHandle, SubtagRule};
 
 struct GlobalState(Mutex<DatabaseHandle>);
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn all_tags(state: tauri::State<GlobalState>) -> Result<Vec<String>, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    handle
+        .all_tags()?
+        .into_iter()
+        .map(|tag_id| handle.tag_name_from_id(tag_id))
+        .collect()
 }
 
 #[tauri::command]
-fn get_files_for_tag(state: tauri::State<GlobalState>, tag_id: i64) -> Vec<i64> {
-    state
-        .inner()
-        .0
-        .lock()
-        .unwrap()
-        .files_for_tag(TagId::from_raw(tag_id), SubtagRule::Include)
-        .unwrap()
+fn add_tag(state: tauri::State<GlobalState>, name: &str) -> Result<i64, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    let tag_id = handle.add_tag(name)?;
+
+    Ok(tag_id.into())
+}
+
+#[tauri::command]
+fn files_for_tag(
+    state: tauri::State<GlobalState>,
+    tag: &str,
+) -> Result<Vec<String>, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    let tag_id = tag
+        .parse::<i64>()
+        .map(Into::into)
+        .or_else(|_| handle.tag_id_from_name(tag))?;
+
+    let file_ids = handle.files_for_tag(tag_id, SubtagRule::Include)?;
+
+    file_ids
         .into_iter()
-        .map(|file_id| file_id.into_raw())
+        .map(|file_id| {
+            Ok(handle
+                .file_path_from_id(file_id)?
+                .to_str()
+                .unwrap()
+                .to_owned())
+        })
         .collect()
 }
 
@@ -32,7 +58,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(GlobalState(connection))
-        .invoke_handler(tauri::generate_handler![greet, get_files_for_tag])
+        .invoke_handler(tauri::generate_handler![all_tags, files_for_tag, add_tag])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
