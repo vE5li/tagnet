@@ -12,18 +12,46 @@
 
   let editTagName = $state("");
   let editTagColor = $state("");
-
-  async function focusTag(tag) {
-    focusedTag = tag;
-    editTagName = tag.name;
-    editTagColor = tag.color;
-  }
+  let editTags = $state([]);
+  let editSubtags = $state([]);
+  let editAddingTag = $state(null);
 
   async function loadInitial() {
     tags = await invoke("all_tags", { });
   }
 
   setTimeout(loadInitial, 10);
+
+  async function focusTag(tag) {
+    // TODO: Make this an enum.
+    if (editAddingTag == "tags") {
+      await invoke("tag_tag", { tagId: tag.id, subtagId: focusedTag.id });
+      editTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
+      editAddingTag = null;
+      return;
+    } else if (editAddingTag == "subtags") {
+      await invoke("tag_tag", { tagId: focusedTag.id, subtagId: tag.id });
+      editSubtags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
+      editAddingTag = null;
+      return;
+    }
+
+    focusedTag = tag;
+    editTagName = tag.name;
+    editTagColor = tag.color;
+    editSubtags = await invoke("subtags_for_tag", { tagId: tag.id });
+    editTags = await invoke("tags_for_subtag", { subtagId: tag.id });
+  }
+
+  async function untagTag(tag) {
+    await invoke("untag_tag", { tagId: tag.id, subtagId: focusedTag.id });
+    editTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
+  }
+
+  async function untagSubtag(tag) {
+    await invoke("untag_tag", { tagId: focusedTag.id, subtagId: tag.id });
+    editSubtags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
+  }
 
   async function addTag(event: Event) {
     event.preventDefault();
@@ -57,7 +85,7 @@
 
       <div class="tag-field">
         {#each tags as tag}
-          <button class="tag" style="background-color: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
+          <button class="tag" style="background: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
         {/each}
         <button class="tag" style="background-color: #888888" onclick={addTag}>+</button>
       </div>
@@ -73,23 +101,39 @@
           <input id="new-tag-color" placeholder="Tag color" style="width: calc(100% - 3em);" bind:value={editTagColor} />
           <button type="submit">Update tag</button>
         </form>
+        <h1>TAGS</h1>
+        {#each editTags as tag}
+          <button class="edit-tag" style="background: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
+          <button class="remove-tag" style="background: #888888" onclick={function() { untagTag(tag) }}>-</button>
+        {/each}
+        <button class="tag" style="background-color: #888888" onclick={editAddingTag = "tags"}>+</button>
+        <h1>SUBTAGS</h1>
+        {#each editSubtags as tag}
+          <button class="edit-tag" style="background: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
+          <button class="remove-tag" style="background: #888888" onclick={function() { untagSubtag(tag) }}>-</button>
+        {/each}
+        <button class="tag" style="background-color: #888888" onclick={editAddingTag = "subtags"}>+</button>
       </div>
+      {#if editAddingTag}
+        <h1>Adding {editAddingTag}</h1>
+        <button class="tag" style="background-color: #888888" onclick={editAddingTag = null}>Cancel</button>
+      {/if}
     {/if}
   </div>
 
   <div style="column: 2; row: 1;">
-  <div class="file-window">
-    <h1>FILE MANAGMENT</h1>
-    <form onsubmit={testme}>
-      <!-- FIX THIS width -->
-      <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={tag} />
-      <button type="submit">Get files</button>
-    </form>
+    <div class="file-window">
+      <h1>FILE MANAGMENT</h1>
+      <form onsubmit={testme}>
+        <!-- FIX THIS width -->
+        <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={tag} />
+        <button type="submit">Get files</button>
+      </form>
 
-    {#each items as item}
-      <h1>{item}</h1>
-    {/each}
-  </div>
+      {#each items as item}
+        <h1>{item}</h1>
+      {/each}
+    </div>
   </div>
 </main>
 
@@ -134,7 +178,21 @@
   font-size: 3rem;
   border-radius: 0.6vh;
   padding: 0.2vh 1vh 0.2vh 1vh;
-  margin: 0.3vh 0.2vh 0px 0.2vh;
+  margin: 0.3vh 0.3vh 0.3vh 0.3vh;
+}
+
+.edit-tag {
+  font-size: 3rem;
+  border-radius: 0.6vh 0 0 0.6vh;
+  padding: 0.2vh 1vh 0.2vh 1vh;
+  margin: 0.3vh 0 0.3vh 0.3vh;
+}
+
+.remove-tag {
+  font-size: 3rem;
+  border-radius: 0 0.6vh 0.6vh 0;
+  padding: 0.2vh 0.8vh 0.2vh 0.5vh;
+  margin: 0.3vh 0.3vh 0.3vh 0;
 }
 
 .file-window {

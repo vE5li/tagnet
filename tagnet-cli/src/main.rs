@@ -72,7 +72,7 @@ fn main() {
 
     match arguments.command {
         Commands::AddTag { name } => {
-            let tag_id = handle.add_tag(name).unwrap();
+            let tag_id = handle.add_tag(name, "#ff00ff").unwrap();
             println!("Created tag with ID {tag_id:?}");
         }
         Commands::TagFile { tag_id, file_id } => {
@@ -105,7 +105,7 @@ fn main() {
         }
         Commands::TagsForTag { tag_id, subtags } => {
             let tag_ids = handle
-                .tag_ids_for_tag(tag_id.into(), subtags.into())
+                .subtag_ids_for_tag(tag_id.into(), subtags.into())
                 .unwrap();
 
             tag_ids

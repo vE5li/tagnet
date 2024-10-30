@@ -134,6 +134,7 @@ pub enum DatabaseError {
     MissingTag,
     InvalidTagName,
     InvalidColor,
+    CantTagItself,
 }
 
 #[derive(Debug)]
@@ -240,6 +241,10 @@ impl DatabaseHandle {
 
     /// Tag a tag with the provided tag.
     pub fn tag_tag(&self, tag_id: TagId, subtag_id: TagId) -> Result<EntryId, DatabaseError> {
+        if tag_id == subtag_id {
+            return Err(DatabaseError::CantTagItself);
+        }
+
         self.connection
             .execute(
                 "INSERT INTO entries (tag_id, target_id, type) VALUES (?1, ?2, ?3)",
@@ -346,7 +351,7 @@ impl DatabaseHandle {
         Ok(file_ids)
     }
 
-    fn tags_for_tag_inner(
+    fn subtag_ids_for_tag_inner(
         &self,
         tag_id: TagId,
         lookup_cache: &mut BTreeSet<TagId>,
@@ -369,15 +374,15 @@ impl DatabaseHandle {
             collected_tags.insert(tag_id);
 
             if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
-                self.tags_for_tag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?;
+                self.subtag_ids_for_tag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?;
             }
         }
 
         Ok(())
     }
 
-    /// Get all tags that are tagged with the provided tag.
-    pub fn tag_ids_for_tag(
+    /// Get all subtags tagged with the provided tag.
+    pub fn subtag_ids_for_tag(
         &self,
         tag_id: TagId,
         subtag_rule: SubtagRule,
@@ -385,7 +390,51 @@ impl DatabaseHandle {
         let mut tags = BTreeSet::new();
         let mut lookup_cache = BTreeSet::new();
 
-        self.tags_for_tag_inner(tag_id, &mut lookup_cache, &mut tags, subtag_rule)?;
+        self.subtag_ids_for_tag_inner(tag_id, &mut lookup_cache, &mut tags, subtag_rule)?;
+
+        Ok(tags)
+    }
+
+    fn tag_ids_for_subtag_inner(
+        &self,
+        subtag_id: TagId,
+        lookup_cache: &mut BTreeSet<TagId>,
+        collected_tags: &mut BTreeSet<TagId>,
+        subtag_rule: SubtagRule,
+    ) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([subtag_id], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap());
+
+        lookup_cache.insert(subtag_id);
+
+        for tag_id in iterator {
+            collected_tags.insert(tag_id);
+
+            if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
+                self.tag_ids_for_subtag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all tags that tag the provided tag.
+    pub fn tag_ids_for_subtag(
+        &self,
+        subtag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        let mut tags = BTreeSet::new();
+        let mut lookup_cache = BTreeSet::new();
+
+        self.tag_ids_for_subtag_inner(subtag_id, &mut lookup_cache, &mut tags, subtag_rule)?;
 
         Ok(tags)
     }

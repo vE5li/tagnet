@@ -12,7 +12,11 @@ fn all_tags(state: tauri::State<GlobalState>) -> Result<Vec<Tag>, DatabaseError>
 }
 
 #[tauri::command]
-fn add_tag(state: tauri::State<GlobalState>, name: &str, color: &str) -> Result<i64, DatabaseError> {
+fn add_tag(
+    state: tauri::State<GlobalState>,
+    name: &str,
+    color: &str,
+) -> Result<i64, DatabaseError> {
     let handle = state.inner().0.lock().unwrap();
 
     let tag_id = handle.add_tag(name, color)?;
@@ -33,7 +37,7 @@ fn files_for_tag(state: tauri::State<GlobalState>, tag: &str) -> Result<Vec<File
 
     file_ids
         .into_iter()
-        .map(|file_id| Ok(handle.file_from_id(file_id)?))
+        .map(|file_id| handle.file_from_id(file_id))
         .collect()
 }
 
@@ -45,11 +49,72 @@ fn tag_from_id(state: tauri::State<GlobalState>, tag_id: i64) -> Result<Tag, Dat
 }
 
 #[tauri::command]
-fn update_tag(state: tauri::State<GlobalState>, tag_id: i64, name: &str, color: &str) -> Result<(), DatabaseError> {
+fn subtags_for_tag(
+    state: tauri::State<GlobalState>,
+    tag_id: i64,
+) -> Result<Vec<Tag>, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    let tag_ids = handle.subtag_ids_for_tag(tag_id.into(), SubtagRule::Exclude)?;
+
+    tag_ids
+        .into_iter()
+        .map(|tag_id| handle.tag_from_id(tag_id))
+        .collect()
+}
+
+#[tauri::command]
+fn tags_for_subtag(
+    state: tauri::State<GlobalState>,
+    subtag_id: i64,
+) -> Result<Vec<Tag>, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    let tag_ids = handle.tag_ids_for_subtag(subtag_id.into(), SubtagRule::Exclude)?;
+
+    tag_ids
+        .into_iter()
+        .map(|tag_id| handle.tag_from_id(tag_id))
+        .collect()
+}
+
+#[tauri::command]
+fn update_tag(
+    state: tauri::State<GlobalState>,
+    tag_id: i64,
+    name: &str,
+    color: &str,
+) -> Result<(), DatabaseError> {
     let handle = state.inner().0.lock().unwrap();
 
     handle.update_tag_name(tag_id.into(), name)?;
     handle.update_tag_color(tag_id.into(), color)?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn tag_tag(
+    state: tauri::State<GlobalState>,
+    tag_id: i64,
+    subtag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    handle.tag_tag(tag_id.into(), subtag_id.into())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn untag_tag(
+    state: tauri::State<GlobalState>,
+    tag_id: i64,
+    subtag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    handle.untag_tag(tag_id.into(), subtag_id.into())?;
 
     Ok(())
 }
@@ -62,7 +127,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(GlobalState(connection))
-        .invoke_handler(tauri::generate_handler![all_tags, files_for_tag, add_tag, tag_from_id, update_tag])
+        .invoke_handler(tauri::generate_handler![
+            all_tags,
+            files_for_tag,
+            add_tag,
+            tag_from_id,
+            update_tag,
+            subtags_for_tag,
+            tags_for_subtag,
+            tag_tag,
+            untag_tag,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
