@@ -122,7 +122,7 @@ pub struct Tag {
 #[allow(dead_code)]
 pub struct File {
     id: FileId,
-    path: OsString,
+    path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

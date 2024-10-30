@@ -1,5 +1,5 @@
 use clap::{command, Parser, Subcommand, ValueEnum};
-use tagnet_core::{initialize, FileId, SubtagRule, TagId};
+use tagnet_core::{initialize, SubtagRule};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Subtags {
@@ -96,7 +96,9 @@ fn main() {
             }
         }
         Commands::FilesForTag { tag_id, subtags } => {
-            let file_ids = handle.file_ids_for_tag(tag_id.into(), subtags.into()).unwrap();
+            let file_ids = handle
+                .file_ids_for_tag(tag_id.into(), subtags.into())
+                .unwrap();
 
             file_ids
                 .into_iter()

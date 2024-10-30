@@ -114,10 +114,13 @@
         {/each}
         <button class="tag" style="background-color: #888888" onclick={editAddingTag = "subtags"}>+</button>
       </div>
+
       {#if editAddingTag}
         <h1>Adding {editAddingTag}</h1>
-        <button class="tag" style="background-color: #888888" onclick={editAddingTag = null}>Cancel</button>
+        <button onclick={editAddingTag = null}>Cancel</button>
       {/if}
+
+      <button onclick={null}>Delete Tag</button>
     {/if}
   </div>
 
@@ -131,7 +134,7 @@
       </form>
 
       {#each items as item}
-        <h1>{item}</h1>
+        <h1>{item.path}</h1>
       {/each}
     </div>
   </div>
