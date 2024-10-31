@@ -25,6 +25,16 @@ fn add_tag(
 }
 
 #[tauri::command]
+fn remove_tag(
+    state: tauri::State<GlobalState>,
+    tag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    handle.remove_tag(tag_id.into())
+}
+
+#[tauri::command]
 fn files_for_tag(state: tauri::State<GlobalState>, tag: &str) -> Result<Vec<File>, DatabaseError> {
     let handle = state.inner().0.lock().unwrap();
 
@@ -131,6 +141,7 @@ pub fn run() {
             all_tags,
             files_for_tag,
             add_tag,
+            remove_tag,
             tag_from_id,
             update_tag,
             subtags_for_tag,

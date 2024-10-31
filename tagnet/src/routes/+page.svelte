@@ -60,6 +60,12 @@
     name = "";
   }
 
+  async function removeTag(tag) {
+    await invoke("remove_tag", { tagId: tag.id });
+    focusedTag = null;
+    tags = await invoke("all_tags", { });
+  }
+
   async function updateTag(event: Event) {
     event.preventDefault();
     await invoke("update_tag", { tagId: focusedTag.id, name: editTagName, color: editTagColor });
@@ -120,7 +126,8 @@
         <button onclick={editAddingTag = null}>Cancel</button>
       {/if}
 
-      <button onclick={null}>Delete Tag</button>
+      <h1>DANGER ZONE</h1>
+      <button onclick={function() { removeTag(focusedTag) }} style="background-color: red">Remove Tag</button>
     {/if}
   </div>
 

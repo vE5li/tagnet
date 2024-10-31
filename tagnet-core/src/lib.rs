@@ -227,6 +227,24 @@ impl DatabaseHandle {
         Ok(TagId(self.connection.last_insert_rowid()))
     }
 
+    pub fn remove_tag(&self, tag_id: TagId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM tags WHERE id = ?1",
+                [&tag_id],
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        self.connection
+            .execute(
+                "DELETE FROM entries WHERE tag_id = ?1 OR (target_id = ?1 AND type = 1)",
+                [&tag_id],
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
     /// Tag a file with the provided tag.
     pub fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<EntryId, DatabaseError> {
         self.connection
