@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 tagnet-core = { workspace = true }
 clap = { version = "4.5.20", features = ["derive"] }
+
+[features]
+nextcloud = ["tagnet-core/nextcloud"]

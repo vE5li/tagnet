@@ -12,6 +12,13 @@ fn all_tags(state: tauri::State<GlobalState>) -> Result<Vec<Tag>, DatabaseError>
 }
 
 #[tauri::command]
+fn all_files(state: tauri::State<GlobalState>) -> Result<Vec<File>, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    Ok(handle.all_files()?.into_iter().collect())
+}
+
+#[tauri::command]
 fn add_tag(
     state: tauri::State<GlobalState>,
     name: &str,
@@ -48,6 +55,18 @@ fn files_for_tag(state: tauri::State<GlobalState>, tag: &str) -> Result<Vec<File
     file_ids
         .into_iter()
         .map(|file_id| handle.file_from_id(file_id))
+        .collect()
+}
+
+#[tauri::command]
+fn tags_for_file(state: tauri::State<GlobalState>, file_id: i64) -> Result<Vec<Tag>, DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    let tag_ids = handle.tag_ids_for_file(file_id.into())?;
+
+    tag_ids
+        .into_iter()
+        .map(|file_id| handle.tag_from_id(file_id))
         .collect()
 }
 
@@ -117,6 +136,32 @@ fn tag_tag(
 }
 
 #[tauri::command]
+fn tag_file(
+    state: tauri::State<GlobalState>,
+    file_id: i64,
+    tag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    handle.tag_file(tag_id.into(), file_id.into())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn untag_file(
+    state: tauri::State<GlobalState>,
+    file_id: i64,
+    tag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    handle.untag_file(tag_id.into(), file_id.into())?;
+
+    Ok(())
+}
+
+#[tauri::command]
 fn untag_tag(
     state: tauri::State<GlobalState>,
     tag_id: i64,
@@ -138,6 +183,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(GlobalState(connection))
         .invoke_handler(tauri::generate_handler![
+            all_files,
             all_tags,
             files_for_tag,
             add_tag,
@@ -146,7 +192,10 @@ pub fn run() {
             update_tag,
             subtags_for_tag,
             tags_for_subtag,
+            tags_for_file,
+            tag_file,
             tag_tag,
+            untag_file,
             untag_tag,
         ])
         .run(tauri::generate_context!())

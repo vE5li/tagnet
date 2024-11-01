@@ -1,5 +1,8 @@
 use std::{collections::BTreeSet, ffi::OsString, path::Path};
 
+#[cfg(feature = "nextcloud")]
+pub mod nextcloud;
+
 use rusqlite::{
     types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
     Connection, ToSql,
@@ -229,10 +232,7 @@ impl DatabaseHandle {
 
     pub fn remove_tag(&self, tag_id: TagId) -> Result<(), DatabaseError> {
         self.connection
-            .execute(
-                "DELETE FROM tags WHERE id = ?1",
-                [&tag_id],
-            )
+            .execute("DELETE FROM tags WHERE id = ?1", [&tag_id])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         self.connection
@@ -369,6 +369,26 @@ impl DatabaseHandle {
         Ok(file_ids)
     }
 
+    /// Get all files that are tagged with the provided tag.
+    pub fn tag_ids_for_file(
+        &self,
+        file_id: FileId,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 0")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag_ids = statement
+            .query_map([file_id], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|tag_id| tag_id.unwrap())
+            .collect::<Vec<_>>();
+
+        Ok(tag_ids)
+    }
+
     fn subtag_ids_for_tag_inner(
         &self,
         tag_id: TagId,
@@ -457,6 +477,27 @@ impl DatabaseHandle {
         Ok(tags)
     }
 
+    /// Get all files.
+    pub fn all_files(&self) -> Result<impl IntoIterator<Item = File>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let file_list = statement
+            .query_map([], |row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .collect::<Vec<_>>();
+
+        Ok(file_list)
+    }
+
     /// Get all tags.
     pub fn all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
         let mut statement = self
@@ -473,7 +514,7 @@ impl DatabaseHandle {
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|entry| entry.unwrap())
+            .map(|tag| tag.unwrap())
             .collect::<Vec<_>>();
 
         Ok(tag_list)

@@ -4,19 +4,25 @@
   let name = $state("");
   let color = $state("#8f008f");
 
-  let focusedTag = $state(null);
+  let files = $state([]);
   let tags = $state([]);
 
-  let tag = $state("");
-  let items = $state([]);
+  let focusedFile = $state(null);
+  let focusedTag = $state(null);
+
+  let searchBar = $state("");
 
   let editTagName = $state("");
   let editTagColor = $state("");
-  let editTags = $state([]);
-  let editSubtags = $state([]);
-  let editAddingTag = $state(null);
+  let editTagTags = $state([]);
+  let editTagSubags = $state([]);
+
+  let editFileTags = $state([]);
+
+  let editAdding = $state(null);
 
   async function loadInitial() {
+    files = await invoke("all_files", { });
     tags = await invoke("all_tags", { });
   }
 
@@ -24,33 +30,48 @@
 
   async function focusTag(tag) {
     // TODO: Make this an enum.
-    if (editAddingTag == "tags") {
+    if (editAdding == "tags") {
       await invoke("tag_tag", { tagId: tag.id, subtagId: focusedTag.id });
-      editTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
-      editAddingTag = null;
+      editTagTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
+      editAdding = null;
       return;
-    } else if (editAddingTag == "subtags") {
+    } else if (editAdding == "subtags") {
       await invoke("tag_tag", { tagId: focusedTag.id, subtagId: tag.id });
-      editSubtags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
-      editAddingTag = null;
+      editTagSubags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
+      editAdding = null;
+      return;
+    } else if (editAdding == "file_tags") {
+      await invoke("tag_file", { fileId: focusedFile.id, tagId: tag.id });
+      editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
+      editAdding = null;
       return;
     }
 
     focusedTag = tag;
     editTagName = tag.name;
     editTagColor = tag.color;
-    editSubtags = await invoke("subtags_for_tag", { tagId: tag.id });
-    editTags = await invoke("tags_for_subtag", { subtagId: tag.id });
+    editTagTags = await invoke("tags_for_subtag", { subtagId: tag.id });
+    editTagSubags = await invoke("subtags_for_tag", { tagId: tag.id });
+  }
+
+  async function focusFile(file) {
+    focusedFile = file;
+    editFileTags = await invoke("tags_for_file", { fileId: file.id });
+  }
+
+  async function untagFile(tag) {
+    await invoke("untag_file", { fileId: focusedFile.id, tagId: tag.id });
+    editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
   }
 
   async function untagTag(tag) {
     await invoke("untag_tag", { tagId: tag.id, subtagId: focusedTag.id });
-    editTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
+    editTagTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
   }
 
   async function untagSubtag(tag) {
     await invoke("untag_tag", { tagId: focusedTag.id, subtagId: tag.id });
-    editSubtags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
+    editTagSubags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
   }
 
   async function addTag(event: Event) {
@@ -73,9 +94,15 @@
     tags = await invoke("all_tags", { });
   }
 
+  // TODO: Remove function
   async function testme(event: Event) {
     event.preventDefault();
-    items = await invoke("files_for_tag", { tag });
+
+    if (searchBar.length == 0) {
+        files = await invoke("all_files", { });
+    } else {
+        files = await invoke("files_for_tag", { tag: searchBar });
+    }
   }
 </script>
 
@@ -91,7 +118,7 @@
 
       <div class="tag-field">
         {#each tags as tag}
-          <button class="tag" style="background: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
+          <button class="tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
         {/each}
         <button class="tag" style="background-color: #888888" onclick={addTag}>+</button>
       </div>
@@ -108,26 +135,39 @@
           <button type="submit">Update tag</button>
         </form>
         <h1>TAGS</h1>
-        {#each editTags as tag}
-          <button class="edit-tag" style="background: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
-          <button class="remove-tag" style="background: #888888" onclick={function() { untagTag(tag) }}>-</button>
+        {#each editTagTags as tag}
+          <button class="edit-tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
+          <button class="remove-tag" style="background: #888888" onclick={() => untagTag(tag)}>-</button>
         {/each}
-        <button class="tag" style="background-color: #888888" onclick={editAddingTag = "tags"}>+</button>
+        <button class="tag" style="background-color: #888888" onclick={editAdding = "tags"}>+</button>
         <h1>SUBTAGS</h1>
-        {#each editSubtags as tag}
-          <button class="edit-tag" style="background: {tag.color}" onclick={function() { focusTag(tag) }}>{tag.name}</button>
-          <button class="remove-tag" style="background: #888888" onclick={function() { untagSubtag(tag) }}>-</button>
+        {#each editTagSubags as tag}
+          <button class="edit-tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
+          <button class="remove-tag" style="background: #888888" onclick={() => untagSubtag(tag)}>-</button>
         {/each}
-        <button class="tag" style="background-color: #888888" onclick={editAddingTag = "subtags"}>+</button>
+        <button class="tag" style="background-color: #888888" onclick={editAdding = "subtags"}>+</button>
+
+        <h1>DANGER ZONE</h1>
+        <button onclick={() => removeTag(focusedTag)} style="background-color: red">Remove Tag</button>
       </div>
+    {/if}
 
-      {#if editAddingTag}
-        <h1>Adding {editAddingTag}</h1>
-        <button onclick={editAddingTag = null}>Cancel</button>
-      {/if}
+    {#if focusedFile}
+      <div class="edit-file-window">
+        <h1>EDIT FILE</h1>
+        <h1>Focusing file: {focusedFile.path}</h1>
+        <h1>TAGS</h1>
+        {#each editFileTags as tag}
+          <button class="edit-tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
+          <button class="remove-tag" style="background: #888888" onclick={() => untagFile(tag)}>-</button>
+        {/each}
+        <button class="tag" style="background-color: #888888" onclick={() => editAdding = "file_tags"}>+</button>
+      </div>
+    {/if}
 
-      <h1>DANGER ZONE</h1>
-      <button onclick={function() { removeTag(focusedTag) }} style="background-color: red">Remove Tag</button>
+    {#if editAdding}
+      <h1>Adding {editAdding}</h1>
+      <button onclick={editAdding = null}>Cancel</button>
     {/if}
   </div>
 
@@ -136,12 +176,12 @@
       <h1>FILE MANAGMENT</h1>
       <form onsubmit={testme}>
         <!-- FIX THIS width -->
-        <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={tag} />
+        <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={searchBar} />
         <button type="submit">Get files</button>
       </form>
 
-      {#each items as item}
-        <h1>{item.path}</h1>
+      {#each files as file}
+        <div class="file-entry" onclick={() => focusFile(file)}>{file.path}</div>
       {/each}
     </div>
   </div>
@@ -176,6 +216,10 @@
   padding: 0.5vh;
 }
 
+.edit-file-window {
+  padding: 0.5vh;
+}
+
 .tag-window {
   padding: 0.5vh;
 }
@@ -207,6 +251,11 @@
 
 .file-window {
   padding: 0.5vh;
+}
+
+.file-entry {
+  padding: 0.5vh;
+  font-size: 4rem;
 }
 
 input,

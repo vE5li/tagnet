@@ -117,11 +117,8 @@ fn main() {
         }
     }
 
-    // handle.add_file("some_test/more.rs");
-    // handle.add_file("some_test/secods.rs");
-    // handle.add_file("some_test/ree.rs");
-    // handle.add_file("foobar.rs");
-    // handle.add_file("other.rs");
+    // FIX: Remove obviously
+    tagnet_core::nextcloud::sync(&handle);
 
     println!("\n\n-- DEBUG --");
     handle.show_files().unwrap();
