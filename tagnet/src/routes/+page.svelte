@@ -29,7 +29,7 @@
   setTimeout(loadInitial, 10);
 
   async function focusTag(tag) {
-    // TODO: Make this an enum.
+    // TODO: Make this an union of literals.
     if (editAdding == "tags") {
       await invoke("tag_tag", { tagId: tag.id, subtagId: focusedTag.id });
       editTagTags = await invoke("tags_for_subtag", { subtagId: focusedTag.id });
@@ -107,26 +107,25 @@
 </script>
 
 <main class="main-window">
-
-  <div style="column: 1; row: 1;">
-    <div class="tag-window">
-      <h1>TAG MANAGMENT</h1>
+  <div style="width: 30%;">
+    <div class="sub-window">
+      <h4>TAG MANAGMENT</h4>
       <form onsubmit={addTag}>
         <!-- FIX THIS width -->
         <input id="new-tag-name" placeholder="Tag name" style="width: calc(100% - 3em);" bind:value={name} />
       </form>
 
-      <div class="tag-field">
+      <div>
         {#each tags as tag}
-          <button class="tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
+          <div class="tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</div>
         {/each}
-        <button class="tag" style="background-color: #888888" onclick={addTag}>+</button>
+        <div class="tag" style="background-color: #888888" onclick={addTag}>+</div>
       </div>
     </div>
 
     {#if focusedTag}
-      <div class="edit-tag-window">
-        <h1>EDIT TAG</h1>
+      <div class="sub-window">
+        <h4>EDIT TAG</h4>
         <form onsubmit={updateTag}>
           <!-- FIX THIS width -->
           <input id="new-tag-name" placeholder="Tag name" style="width: calc(100% - 3em);" bind:value={editTagName} />
@@ -134,46 +133,58 @@
           <input id="new-tag-color" placeholder="Tag color" style="width: calc(100% - 3em);" bind:value={editTagColor} />
           <button type="submit">Update tag</button>
         </form>
-        <h1>TAGS</h1>
+        <h5>TAGS</h5>
         {#each editTagTags as tag}
-          <button class="edit-tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
-          <button class="remove-tag" style="background: #888888" onclick={() => untagTag(tag)}>-</button>
+          <div class="edit-tag" style="background: {tag.color}">
+            <div class="edit-tag-text" onclick={() => focusTag(tag)}>
+              {tag.name}
+            </div>
+            <div class="remove-tag" onclick={() => untagTag(tag)}>-</div>
+          </div>
         {/each}
-        <button class="tag" style="background-color: #888888" onclick={editAdding = "tags"}>+</button>
-        <h1>SUBTAGS</h1>
+        <div class="tag" style="background-color: #888888" onclick={editAdding = "tags"}>+</div>
+        <h5>SUBTAGS</h5>
         {#each editTagSubags as tag}
-          <button class="edit-tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
-          <button class="remove-tag" style="background: #888888" onclick={() => untagSubtag(tag)}>-</button>
+          <div class="edit-tag" style="background: {tag.color}">
+            <div class="edit-tag-text" onclick={() => focusTag(tag)}>
+              {tag.name}
+            </div>
+            <div class="remove-tag" onclick={() => untagSubtag(tag)}>-</div>
+          </div>
         {/each}
-        <button class="tag" style="background-color: #888888" onclick={editAdding = "subtags"}>+</button>
+        <div class="tag" style="background-color: #888888" onclick={editAdding = "subtags"}>+</div>
 
-        <h1>DANGER ZONE</h1>
+        <h5>DANGER ZONE</h5>
         <button onclick={() => removeTag(focusedTag)} style="background-color: red">Remove Tag</button>
       </div>
     {/if}
 
     {#if focusedFile}
-      <div class="edit-file-window">
-        <h1>EDIT FILE</h1>
-        <h1>Focusing file: {focusedFile.path}</h1>
-        <h1>TAGS</h1>
+      <div class="sub-window">
+        <h4>EDIT FILE</h4>
+        <h5>Focusing file: {focusedFile.path}</h5>
+        <h5>TAGS</h5>
         {#each editFileTags as tag}
-          <button class="edit-tag" style="background: {tag.color}" onclick={() => focusTag(tag)}>{tag.name}</button>
-          <button class="remove-tag" style="background: #888888" onclick={() => untagFile(tag)}>-</button>
+          <div class="edit-tag" style="background: {tag.color}">
+            <div class="edit-tag-text" onclick={() => focusTag(tag)}>
+              {tag.name}
+            </div>
+            <div class="remove-tag" onclick={() => untagFile(tag)}>-</div>
+          </div>
         {/each}
-        <button class="tag" style="background-color: #888888" onclick={() => editAdding = "file_tags"}>+</button>
+        <div class="tag" style="background-color: #888888" onclick={() => editAdding = "file_tags"}>+</div>
       </div>
     {/if}
 
     {#if editAdding}
-      <h1>Adding {editAdding}</h1>
+      <h4>Adding {editAdding}</h4>
       <button onclick={editAdding = null}>Cancel</button>
     {/if}
   </div>
 
-  <div style="column: 2; row: 1;">
-    <div class="file-window">
-      <h1>FILE MANAGMENT</h1>
+  <div style="flex-grow: 1; margin-left: 1rem;">
+    <div>
+      <h4>FILE MANAGMENT</h4>
       <form onsubmit={testme}>
         <!-- FIX THIS width -->
         <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={searchBar} />
@@ -191,7 +202,7 @@
 
 :root {
   font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
+  font-size: 12px;
   line-height: 24px;
   font-weight: 400;
 
@@ -206,56 +217,68 @@
 }
 
 .main-window {
-  display: grid;
-  grid-template-columns: 1fr 3fr;
-  grid-gap: 0.4vh;
-  padding: 0.4vh;
+  display: flex;
+  flex-direction: row;
+  padding: 0.4rem;
 }
 
-.edit-tag-window {
-  padding: 0.5vh;
-}
-
-.edit-file-window {
-  padding: 0.5vh;
-}
-
-.tag-window {
-  padding: 0.5vh;
-}
-
-.tag-field {
-  padding: 0.5vh;
+.sub-window {
+  background-color: #444444;
+  border-radius: 0.5rem;
+  padding: 0.5rem;
+  margin-bottom: 1rem;
 }
 
 .tag {
-  font-size: 3rem;
-  border-radius: 0.6vh;
-  padding: 0.2vh 1vh 0.2vh 1vh;
-  margin: 0.3vh 0.3vh 0.3vh 0.3vh;
+  display: inline-block;
+  cursor: zoom-in;
+  font-size: 1rem;
+  border-radius: 0.5rem;
+  padding: 0 0.8rem;
+  margin: 0.2rem;
 }
 
 .edit-tag {
-  font-size: 3rem;
-  border-radius: 0.6vh 0 0 0.6vh;
-  padding: 0.2vh 1vh 0.2vh 1vh;
-  margin: 0.3vh 0 0.3vh 0.3vh;
+  display: inline-block;
+  margin: 0.2rem;
+  border-radius: 0.5rem;
+}
+
+.edit-tag-text {
+  display: inline-block;
+  cursor: zoom-in;
+  font-size: 1rem;
+  height: 100%;
+  padding: 0 0.8rem;
 }
 
 .remove-tag {
-  font-size: 3rem;
-  border-radius: 0 0.6vh 0.6vh 0;
-  padding: 0.2vh 0.8vh 0.2vh 0.5vh;
-  margin: 0.3vh 0.3vh 0.3vh 0;
-}
-
-.file-window {
-  padding: 0.5vh;
+  display: inline-block;
+  cursor: pointer;
+  background-color: rgba(0, 0, 0, 0.2);
+  border-radius: 0.5rem;
+  font-size: 1rem;
+  padding: 0 0.8rem;
 }
 
 .file-entry {
-  padding: 0.5vh;
-  font-size: 4rem;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+h4 {
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+h5 {
+  margin-top: 0.2rem;
+  margin-bottom: 0;
+  color: #bbbbbb;
+}
+
+input {
+  margin-bottom: 0.5rem;
 }
 
 input,
@@ -270,10 +293,6 @@ button {
   background-color: #ffffff;
   transition: border-color 0.25s;
   box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-h1 {
-  margin-bottom: 1.5vh;
 }
 
 button {

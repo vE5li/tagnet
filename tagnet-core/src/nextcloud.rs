@@ -76,6 +76,7 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
         // Extract <d:href>
         if let Some(href) = response.as_element().unwrap().get_child("href") {
             let file_name = href.get_text().unwrap().as_ref().to_owned();
+            let file_name = file_name.strip_prefix(&format!("/remote.php/dav/files/{}/", USERNAME)).unwrap();
             println!("Adding file: {:?}", file_name);
             database_handle.add_file(file_name);
         }
