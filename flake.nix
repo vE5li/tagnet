@@ -45,16 +45,8 @@
             # https://github.com/tauri-apps/tauri/issues/5143#issuecomment-1311815517
             WEBKIT_DISABLE_COMPOSITING_MODE = 1;
 
-            # shellHook =
-            #   ''
-            #     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${
-            #       pkgs.lib.strings.makeLibraryPath
-            #       [
-            #         pkgs.wayland
-            #         pkgs.vulkan-loader
-            #         pkgs.libxkbcommon
-            #       ]};
-            #   '';
+            # https://github.com/tauri-apps/tauri/issues/7354
+            GDK_BACKEND = "x11";
           };
       }
     );
