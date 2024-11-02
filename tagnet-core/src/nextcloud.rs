@@ -99,15 +99,21 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
             panic!("no modified");
         };
 
-        let content_length = prop
+        let Some(content_length) = prop
             .get_child("getcontentlength")
             .and_then(|element| element.get_text())
-            .unwrap_or(Cow::Borrowed("<?>"));
+        else {
+            // This is a directory.
+            continue;
+        };
 
-        let content_type = prop
+        let Some(content_type) = prop
             .get_child("getcontenttype")
             .and_then(|element| element.get_text())
-            .unwrap_or(Cow::Borrowed("<?>"));
+        else {
+            // This is a directory.
+            continue;
+        };
 
         let Some(file_name) = href.get_text() else {
             panic!();

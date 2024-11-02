@@ -109,10 +109,10 @@
 <main class="main-window">
   <div style="width: 30%; min-width: 30%">
     <div class="sub-window">
-      <h4>TAG MANAGMENT</h4>
+      <h4>Tags</h4>
       <form onsubmit={addTag}>
         <!-- FIX THIS width -->
-        <input id="new-tag-name" placeholder="Tag name" style="width: calc(100% - 3em);" bind:value={name} />
+        <input id="new-tag-name" placeholder="Tag Name" style="width: calc(100% - 3em);" bind:value={name} />
       </form>
 
       <div>
@@ -125,56 +125,56 @@
 
     {#if focusedTag}
       <div class="sub-window">
-        <h4>EDIT TAG</h4>
+        <h4>Edit Tag</h4>
         <form onsubmit={updateTag}>
           <!-- FIX THIS width -->
-          <input id="new-tag-name" placeholder="Tag name" style="width: calc(100% - 3em);" bind:value={editTagName} />
+          <input id="new-tag-name" placeholder="Tag Name" style="width: calc(100% - 3em);" bind:value={editTagName} />
           <!-- FIX THIS width -->
-          <input id="new-tag-color" placeholder="Tag color" style="width: calc(100% - 3em);" bind:value={editTagColor} />
-          <button type="submit">Update tag</button>
+          <input id="new-tag-color" placeholder="Tag Color" style="width: calc(100% - 3em);" bind:value={editTagColor} />
+          <!-- <button type="submit">Update tag</button> -->
         </form>
-        <h5>TAGS</h5>
+        <h5>Tags</h5>
         {#each editTagTags as tag}
           <div class="edit-tag" style="background: {tag.color}">
             <div class="edit-tag-text" onclick={() => focusTag(tag)}>
               {tag.name}
             </div>
-            <div class="remove-tag" onclick={() => untagTag(tag)}>-</div>
+            <div class="untag-button" onclick={() => untagTag(tag)}>-</div>
           </div>
         {/each}
         <div class="tag" style="background-color: #888888" onclick={editAdding = "tags"}>+</div>
-        <h5>SUBTAGS</h5>
+        <h5>Subtags</h5>
         {#each editTagSubags as tag}
           <div class="edit-tag" style="background: {tag.color}">
             <div class="edit-tag-text" onclick={() => focusTag(tag)}>
               {tag.name}
             </div>
-            <div class="remove-tag" onclick={() => untagSubtag(tag)}>-</div>
+            <div class="untag-button" onclick={() => untagSubtag(tag)}>-</div>
           </div>
         {/each}
         <div class="tag" style="background-color: #888888" onclick={editAdding = "subtags"}>+</div>
 
-        <h5>DANGER ZONE</h5>
-        <button onclick={() => removeTag(focusedTag)} style="background-color: red">Remove Tag</button>
+        <h5>Danger Zone</h5>
+        <div class="remove-tag-button" onclick={() => removeTag(focusedTag)}>Remove Tag</div>
       </div>
     {/if}
 
     {#if focusedFile}
       <div class="sub-window">
-        <h4>EDIT FILE</h4>
+        <h4>Edit File</h4>
 
         <h5>Path: {focusedFile.path}</h5>
         <h5>Modified: {focusedFile.last_modified}</h5>
         <h5>Size: {focusedFile.content_length}</h5>
         <h5>Type: {focusedFile.content_type}</h5>
 
-        <h5>TAGS</h5>
+        <h5>Tags</h5>
         {#each editFileTags as tag}
           <div class="edit-tag" style="background: {tag.color}">
             <div class="edit-tag-text" onclick={() => focusTag(tag)}>
               {tag.name}
             </div>
-            <div class="remove-tag" onclick={() => untagFile(tag)}>-</div>
+            <div class="untag-button" onclick={() => untagFile(tag)}>-</div>
           </div>
         {/each}
         <div class="tag" style="background-color: #888888" onclick={() => editAdding = "file_tags"}>+</div>
@@ -189,16 +189,18 @@
 
   <div style="flex-grow: 1; margin-left: 1rem;">
     <div class="sub-window">
-      <h4>FILE MANAGMENT</h4>
+      <h4>Files</h4>
       <form onsubmit={testme}>
         <!-- FIX THIS width -->
-        <input id="test-input" placeholder="Tag Id" style="width: calc(100% - 3em);" bind:value={searchBar} />
-        <button type="submit">Get files</button>
+        <input id="test-input" placeholder="Tag ID" style="width: calc(100% - 3em);" bind:value={searchBar} />
+        <!-- <button type="submit">Get Files</button> -->
       </form>
 
-      {#each files as file}
-        <div class="file-entry" onclick={() => focusFile(file)}>{file.display_name}</div>
-      {/each}
+      <div style="overflow-y: scroll; max-height: calc(100vh - 106px);">
+        {#each files as file}
+          <div class="file-entry" onclick={() => focusFile(file)}>{file.display_name}</div>
+        {/each}
+      </div>
     </div>
   </div>
 </main>
@@ -213,6 +215,9 @@
 
   color: #0f0f0f;
   background-color: #f6f6f6;
+
+  height: 100%;
+  overflow: hidden;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -257,13 +262,21 @@
   padding: 0 0.8rem;
 }
 
-.remove-tag {
+.untag-button {
   display: inline-block;
   cursor: pointer;
   background-color: rgba(0, 0, 0, 0.2);
   border-radius: 0.5rem;
   font-size: 1rem;
   padding: 0 0.8rem;
+}
+
+.remove-tag-button {
+  background-color: red;
+  font-size: 1rem;
+  border-radius: 0.5rem;
+  padding: 0 0.8rem;
+  margin: 0.2rem;
 }
 
 .file-entry {
@@ -281,7 +294,9 @@
 }
 
 h4 {
-  margin-top: 0.5rem;
+  text-align: center;
+  font-size: 1.2rem;
+  margin-top: 0;
   margin-bottom: 0.5rem;
 }
 
@@ -335,6 +350,9 @@ button {
     font-size: 12px;
     line-height: 24px;
     font-weight: 400;
+
+    height: 100%;
+    overflow: hidden;
 
     font-synthesis: none;
     text-rendering: optimizeLegibility;
