@@ -75,10 +75,22 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
     {
         // Extract <d:href>
         if let Some(href) = response.as_element().unwrap().get_child("href") {
-            let file_name = href.get_text().unwrap().as_ref().to_owned();
-            let file_name = file_name.strip_prefix(&format!("/remote.php/dav/files/{}/", USERNAME)).unwrap();
+            let Some(file_name) = href.get_text() else {
+                panic!();
+            };
+
+            let file_name = file_name
+                .as_ref()
+                .strip_prefix(&format!("/remote.php/dav/files/{}/", USERNAME))
+                .unwrap();
+
+            // Files from nextcloud should always be UTF8.
+            let file_name = percent_encoding::percent_decode_str(file_name)
+                .decode_utf8()
+                .unwrap().into_owned();
+
             println!("Adding file: {:?}", file_name);
-            database_handle.add_file(file_name);
+            database_handle.add_file(&file_name);
         }
 
         // Extract properties within <d:propstat>
@@ -141,14 +153,12 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
 }
 
 pub fn sync(database_handle: &DatabaseHandle) -> Result<(), Box<dyn Error>> {
-    let runtime = tokio::runtime::Runtime::new()
-        .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
 
     runtime.block_on(async {
         let file_list = list_files().await.unwrap();
         parse_xml(database_handle, &file_list);
     });
-
 
     // let activity_updates = get_activity(None).await?;
     // println!("{activity_updates:#?}");

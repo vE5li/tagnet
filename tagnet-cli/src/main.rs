@@ -63,6 +63,7 @@ enum Commands {
         #[arg(short, long, default_value_t=Subtags::Include)]
         subtags: Subtags,
     },
+    Sync,
 }
 
 fn main() {
@@ -115,10 +116,10 @@ fn main() {
                 .map(|tag_id| handle.tag_from_id(tag_id).unwrap())
                 .for_each(|tag_name| println!("> {tag_name:?}"));
         }
+        Commands::Sync => {
+            tagnet_core::nextcloud::sync(&handle);
+        }
     }
-
-    // FIX: Remove obviously
-    tagnet_core::nextcloud::sync(&handle);
 
     println!("\n\n-- DEBUG --");
     handle.show_files().unwrap();
