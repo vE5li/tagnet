@@ -2,7 +2,9 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::error::Error;
+use std::path::Path;
 
 use crate::{DatabaseHandle, File};
 
@@ -74,81 +76,69 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
         .filter(|c| c.as_element().unwrap().name == "response")
     {
         // Extract <d:href>
-        if let Some(href) = response.as_element().unwrap().get_child("href") {
-            let Some(file_name) = href.get_text() else {
-                panic!();
-            };
-
-            let file_name = file_name
-                .as_ref()
-                .strip_prefix(&format!("/remote.php/dav/files/{}/", USERNAME))
-                .unwrap();
-
-            // Files from nextcloud should always be UTF8.
-            let file_name = percent_encoding::percent_decode_str(file_name)
-                .decode_utf8()
-                .unwrap().into_owned();
-
-            println!("Adding file: {:?}", file_name);
-            database_handle.add_file(&file_name);
-        }
+        let Some(href) = response.as_element().unwrap().get_child("href") else {
+            panic!("no href");
+        };
 
         // Extract properties within <d:propstat>
-        // for propstat in response.as_element().unwrap().children.iter().filter(|c| c.as_element().unwrap().name == "propstat") {
-        //     if let Some(prop) = propstat.as_element().unwrap().get_child("prop") {
-        //         // Extract <d:getlastmodified>
-        //         if let Some(last_modified) = prop.get_child("getlastmodified") {
-        //             println!(
-        //                 "Last Modified: {}",
-        //                 last_modified.get_text().as_deref().unwrap_or("")
-        //             );
-        //         }
-        //
-        //         // Extract <d:quota-used-bytes>
-        //         if let Some(quota_used) = prop.get_child("quota-used-bytes") {
-        //             println!(
-        //                 "Quota Used Bytes: {}",
-        //                 quota_used.get_text().as_deref().unwrap_or("")
-        //             );
-        //         }
-        //
-        //         // Extract <d:quota-available-bytes>
-        //         if let Some(quota_available) = prop.get_child("quota-available-bytes") {
-        //             println!(
-        //                 "Quota Available Bytes: {}",
-        //                 quota_available.get_text().as_deref().unwrap_or("")
-        //             );
-        //         }
-        //
-        //         // Extract <d:getetag>
-        //         if let Some(etag) = prop.get_child("getetag") {
-        //             println!("ETag: {}", etag.get_text().as_deref().unwrap_or(""));
-        //         }
-        //
-        //         // Extract <d:getcontentlength>
-        //         if let Some(content_length) = prop.get_child("getcontentlength") {
-        //             println!(
-        //                 "Content Length: {}",
-        //                 content_length.get_text().as_deref().unwrap_or("")
-        //             );
-        //         }
-        //
-        //         // Extract <d:getcontenttype>
-        //         if let Some(content_type) = prop.get_child("getcontenttype") {
-        //             println!(
-        //                 "Content Type: {}",
-        //                 content_type.get_text().as_deref().unwrap_or("")
-        //             );
-        //         }
-        //     }
-        //
-        //     // Extract <d:status>
-        //     if let Some(status) = propstat.as_element().unwrap().get_child("status") {
-        //         println!("Status: {}", status.get_text().as_deref().unwrap_or(""));
-        //     }
-        // }
+        let Some(propstat) = response
+            .as_element()
+            .unwrap()
+            .children
+            .iter()
+            .find(|c| c.as_element().unwrap().name == "propstat")
+        else {
+            panic!("no propstat");
+        };
 
-        // println!("---"); // Separator between responses
+        let Some(prop) = propstat.as_element().unwrap().get_child("prop") else {
+            panic!("no prop");
+        };
+
+        let Some(last_modified) = prop.get_child("getlastmodified") else {
+            panic!("no modified");
+        };
+
+        let content_length = prop
+            .get_child("getcontentlength")
+            .and_then(|element| element.get_text())
+            .unwrap_or(Cow::Borrowed("<?>"));
+
+        let content_type = prop
+            .get_child("getcontenttype")
+            .and_then(|element| element.get_text())
+            .unwrap_or(Cow::Borrowed("<?>"));
+
+        let Some(file_name) = href.get_text() else {
+            panic!();
+        };
+
+        let path = href.get_text().unwrap();
+        let path = path
+            .strip_prefix(&format!("/remote.php/dav/files/{}/", USERNAME))
+            .unwrap();
+
+        let path = percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            // Files from nextcloud should always be UTF8.
+            .unwrap()
+            .into_owned();
+
+        let path_2 = Path::new(&path);
+        // Files from nextcloud should always be UTF8.
+        let display_name = path_2
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .unwrap_or(path.as_str());
+        let last_modified = last_modified.get_text().unwrap();
+
+        database_handle.add_file(
+            path_2,
+            display_name,
+            last_modified,
+            content_length,
+            content_type,
+        );
     }
 }
 

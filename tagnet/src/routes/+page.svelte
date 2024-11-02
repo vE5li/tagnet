@@ -107,7 +107,7 @@
 </script>
 
 <main class="main-window">
-  <div style="width: 30%;">
+  <div style="width: 30%; min-width: 30%">
     <div class="sub-window">
       <h4>TAG MANAGMENT</h4>
       <form onsubmit={addTag}>
@@ -162,7 +162,12 @@
     {#if focusedFile}
       <div class="sub-window">
         <h4>EDIT FILE</h4>
-        <h5>Focusing file: {focusedFile.path}</h5>
+
+        <h5>Path: {focusedFile.path}</h5>
+        <h5>Modified: {focusedFile.last_modified}</h5>
+        <h5>Size: {focusedFile.content_length}</h5>
+        <h5>Type: {focusedFile.content_type}</h5>
+
         <h5>TAGS</h5>
         {#each editFileTags as tag}
           <div class="edit-tag" style="background: {tag.color}">
@@ -183,7 +188,7 @@
   </div>
 
   <div style="flex-grow: 1; margin-left: 1rem;">
-    <div>
+    <div class="sub-window">
       <h4>FILE MANAGMENT</h4>
       <form onsubmit={testme}>
         <!-- FIX THIS width -->
@@ -192,7 +197,7 @@
       </form>
 
       {#each files as file}
-        <div class="file-entry" onclick={() => focusFile(file)}>{file.path}</div>
+        <div class="file-entry" onclick={() => focusFile(file)}>{file.display_name}</div>
       {/each}
     </div>
   </div>
@@ -262,8 +267,17 @@
 }
 
 .file-entry {
+  display: inline-block;
+  background-color: black;
+  color: #aaaaaa;
+  border-radius: 1rem;
+  width: 100px;
+  height: 100px;
   font-size: 1rem;
   cursor: pointer;
+  padding: 10px;
+  margin: 2px;
+  overflow: clip;
 }
 
 h4 {

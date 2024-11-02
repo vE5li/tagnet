@@ -126,6 +126,10 @@ pub struct Tag {
 pub struct File {
     id: FileId,
     path: String,
+    display_name: String,
+    last_modified: String,
+    content_length: String,
+    content_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,8 +156,12 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
     connection
         .execute(
             "CREATE TABLE IF NOT EXISTS files (
-            id    INTEGER PRIMARY KEY,
-            path  TEXT NOT NULL UNIQUE
+            id              INTEGER PRIMARY KEY,
+            path            TEXT NOT NULL UNIQUE,
+            display_name    TEXT NOT NULL,
+            last_modified   TEXT NOT NULL,
+            content_length  TEXT NOT NULL,
+            content_type    TEXT NOT NULL
         )",
             (), // empty list of parameters.
         )
@@ -188,14 +196,27 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
 
 impl DatabaseHandle {
     /// Add a new file.
-    pub fn add_file(&self, file_path: impl AsRef<Path>) -> Result<FileId, DatabaseError> {
+    pub fn add_file(
+        &self,
+        file_path: impl AsRef<Path>,
+        display_name: impl AsRef<str>,
+        last_modified: impl AsRef<str>,
+        content_length: impl AsRef<str>,
+        content_type: impl AsRef<str>,
+    ) -> Result<FileId, DatabaseError> {
         let file_path = file_path
             .as_ref()
             .to_str()
             .ok_or(DatabaseError::NonUtf8FilePath)?;
 
         self.connection
-            .execute("INSERT INTO files (path) VALUES (?1)", [&file_path])
+            .execute("INSERT INTO files (path, display_name, last_modified, content_length, content_type) VALUES (?1, ?2, ?3, ?4, ?5)", [
+                &file_path,
+                display_name.as_ref(),
+                last_modified.as_ref(),
+                content_length.as_ref(),
+                content_type.as_ref(),
+            ])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(FileId(self.connection.last_insert_rowid()))
@@ -374,7 +395,6 @@ impl DatabaseHandle {
         &self,
         file_id: FileId,
     ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
-
         let mut statement = self
             .connection
             .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 0")
@@ -481,7 +501,7 @@ impl DatabaseHandle {
     pub fn all_files(&self) -> Result<impl IntoIterator<Item = File>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, path FROM files")
+            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file_list = statement
@@ -489,6 +509,10 @@ impl DatabaseHandle {
                 Ok(File {
                     id: row.get(0)?,
                     path: row.get(1)?,
+                    display_name: row.get(2)?,
+                    last_modified: row.get(3)?,
+                    content_length: row.get(4)?,
+                    content_type: row.get(5)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -524,14 +548,18 @@ impl DatabaseHandle {
     pub fn file_from_id(&self, file_id: FileId) -> Result<File, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT path FROM files WHERE id = ?1")
+            .prepare("SELECT path, display_name, last_modified, content_length, content_type FROM files WHERE id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file = statement
             .query_map([file_id], |row| {
                 Ok(File {
                     id: file_id,
-                    path: row.get::<_, String>(0)?.into(),
+                    path: row.get(0)?,
+                    display_name: row.get(1)?,
+                    last_modified: row.get(2)?,
+                    content_length: row.get(3)?,
+                    content_type: row.get(4)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -651,14 +679,18 @@ impl DatabaseHandle {
     pub fn show_files(&self) -> Result<(), DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, path FROM files")
+            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
             .query_map([], |row| {
                 Ok(File {
                     id: row.get(0)?,
-                    path: row.get::<_, String>(1)?.into(),
+                    path: row.get(1)?,
+                    display_name: row.get(2)?,
+                    last_modified: row.get(3)?,
+                    content_length: row.get(4)?,
+                    content_type: row.get(5)?,
                 })
             })
             .unwrap();
