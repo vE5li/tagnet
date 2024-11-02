@@ -107,7 +107,7 @@
 </script>
 
 <main class="main-window">
-  <div style="width: 30%; min-width: 30%">
+  <div style="width: clamp(200px, 30%, 400px); min-width: clamp(200px, 30%, 400px)">
     <div class="sub-window">
       <h4>Tags</h4>
       <form onsubmit={addTag}>
