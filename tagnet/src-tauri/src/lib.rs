@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{collections::HashSet, sync::Mutex};
 
 use tagnet_core::{initialize, DatabaseError, DatabaseHandle, File, SubtagRule, Tag};
 
@@ -32,10 +32,7 @@ fn add_tag(
 }
 
 #[tauri::command]
-fn remove_tag(
-    state: tauri::State<GlobalState>,
-    tag_id: i64,
-) -> Result<(), DatabaseError> {
+fn remove_tag(state: tauri::State<GlobalState>, tag_id: i64) -> Result<(), DatabaseError> {
     let handle = state.inner().0.lock().unwrap();
 
     handle.remove_tag(tag_id.into())
@@ -59,14 +56,51 @@ fn files_for_tag(state: tauri::State<GlobalState>, tag: &str) -> Result<Vec<File
 }
 
 #[tauri::command]
-fn tags_for_file(state: tauri::State<GlobalState>, file_id: i64) -> Result<Vec<Tag>, DatabaseError> {
+fn tags_for_file(
+    state: tauri::State<GlobalState>,
+    file_id: i64,
+) -> Result<Vec<Tag>, DatabaseError> {
     let handle = state.inner().0.lock().unwrap();
 
     let tag_ids = handle.tag_ids_for_file(file_id.into())?;
 
     tag_ids
         .into_iter()
-        .map(|file_id| handle.tag_from_id(file_id))
+        .map(|tag_id| handle.tag_from_id(tag_id))
+        .collect()
+}
+
+#[tauri::command]
+fn tags_for_selected(
+    state: tauri::State<GlobalState>,
+    selected_ids: Vec<i64>,
+) -> Result<Vec<Tag>, DatabaseError> {
+    let mut selected_ids = selected_ids.into_iter();
+
+    let Some(first_file) = selected_ids.next() else {
+        return Ok(Vec::new());
+    };
+
+    let handle = state.inner().0.lock().unwrap();
+
+    let mut common_tag_ids = handle
+        .tag_ids_for_file(first_file.into())?
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    for file_id in selected_ids {
+        // TODO: Collecting here is most likely not the best for performance.
+        let file_tag_ids = handle
+            .tag_ids_for_file(file_id.into())?
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        common_tag_ids.retain(|id| file_tag_ids.contains(id));
+    }
+
+    common_tag_ids
+        .into_iter()
+        .map(|tag_id| handle.tag_from_id(tag_id))
         .collect()
 }
 
@@ -149,6 +183,23 @@ fn tag_file(
 }
 
 #[tauri::command]
+fn tag_selected(
+    state: tauri::State<GlobalState>,
+    selected_ids: Vec<i64>,
+    tag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    selected_ids.into_iter().for_each(|file_id| {
+        // Since the operation might fail for some files (if the file already has the tag) we just
+        // discard the result in this case.
+        let _ = handle.tag_file(tag_id.into(), file_id.into());
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
 fn untag_file(
     state: tauri::State<GlobalState>,
     file_id: i64,
@@ -174,6 +225,23 @@ fn untag_tag(
     Ok(())
 }
 
+#[tauri::command]
+fn untag_selected(
+    state: tauri::State<GlobalState>,
+    selected_ids: Vec<i64>,
+    tag_id: i64,
+) -> Result<(), DatabaseError> {
+    let handle = state.inner().0.lock().unwrap();
+
+    selected_ids.into_iter().for_each(|file_id| {
+        // Since the operation might fail for some files (if the file doesn't have the tag) we just
+        // discard the result in this case.
+        let _ = handle.untag_file(tag_id.into(), file_id.into());
+    });
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let connection = initialize("../../test.db").unwrap();
@@ -193,10 +261,13 @@ pub fn run() {
             subtags_for_tag,
             tags_for_subtag,
             tags_for_file,
+            tags_for_selected,
             tag_file,
             tag_tag,
+            tag_selected,
             untag_file,
             untag_tag,
+            untag_selected,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -9,6 +9,7 @@
 
   let focusedFile = $state(null);
   let focusedTag = $state(null);
+  let selectedFiles = $state([]);
 
   let searchBar = $state("");
 
@@ -20,6 +21,8 @@
   let editFileTags = $state([]);
 
   let editAdding = $state(null);
+
+  let selectedTags = $state([]);
 
   async function loadInitial() {
     files = await invoke("all_files", { });
@@ -43,6 +46,21 @@
     } else if (editAdding == "file_tags") {
       await invoke("tag_file", { fileId: focusedFile.id, tagId: tag.id });
       editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
+
+      if (selectedFiles.length > 0) {
+        selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+      }
+
+      editAdding = null;
+      return;
+    } else if (editAdding == "selected_tags") {
+      await invoke("tag_selected", { selectedIds: selectedFiles, tagId: tag.id });
+      selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+
+      if (focusedFile) {
+        editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
+      }
+
       editAdding = null;
       return;
     }
@@ -54,7 +72,55 @@
     editTagSubags = await invoke("subtags_for_tag", { tagId: tag.id });
   }
 
-  async function focusFile(file) {
+  async function focusFile(event: Event, file) {
+    if (event.shiftKey) {
+      const lastId = selectedFiles.at(-1);
+
+      var started = false;
+      for (let fileId of files.map((file) => file.id)) {
+        if (started) {
+          if (!selectedFiles.includes(fileId)) {
+            selectedFiles.push(fileId);
+          }
+            console.log("fileId: " + fileId);
+
+          // We are at the end of our selection
+          if (fileId === lastId || fileId == file.id) {
+            break;
+          }
+        } else {
+          // We are at the sart of our selection
+          if (fileId === lastId || fileId == file.id) {
+            if (!selectedFiles.includes(fileId)) {
+              selectedFiles.push(fileId);
+            }
+
+            console.log("Started!");
+
+            started = true;
+          }
+        }
+      }
+
+
+      // TODO: This causes some flickering. Better to unbind the original handler.
+      document.getSelection().removeAllRanges();
+
+      selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+      return;
+    }
+
+    if (event.ctrlKey) {
+      if (selectedFiles.includes(file.id)) {
+        selectedFiles = selectedFiles.filter(id => id !== file.id);
+      } else {
+        selectedFiles.push(file.id);
+      }
+
+      selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+      return;
+    }
+
     focusedFile = file;
     editFileTags = await invoke("tags_for_file", { fileId: file.id });
   }
@@ -62,6 +128,10 @@
   async function untagFile(tag) {
     await invoke("untag_file", { fileId: focusedFile.id, tagId: tag.id });
     editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
+
+    if (selectedFiles.length > 0) {
+      selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+    }
   }
 
   async function untagTag(tag) {
@@ -72,6 +142,15 @@
   async function untagSubtag(tag) {
     await invoke("untag_tag", { tagId: focusedTag.id, subtagId: tag.id });
     editTagSubags = await invoke("subtags_for_tag", { tagId: focusedTag.id });
+  }
+
+  async function untagSelected(tag) {
+    await invoke("untag_selected", { selectedIds: selectedFiles, tagId: tag.id });
+    selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+
+    if (focusedFile) {
+      editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
+    }
   }
 
   async function addTag(event: Event) {
@@ -142,7 +221,7 @@
             <div class="untag-button" onclick={() => untagTag(tag)}>-</div>
           </div>
         {/each}
-        <div class="tag" style="background-color: #888888" onclick={editAdding = "tags"}>+</div>
+        <div class="tag" style="background-color: #888888" onclick={() => editAdding = "tags"}>+</div>
         <h5>Subtags</h5>
         {#each editTagSubags as tag}
           <div class="edit-tag" style="background: {tag.color}">
@@ -152,7 +231,7 @@
             <div class="untag-button" onclick={() => untagSubtag(tag)}>-</div>
           </div>
         {/each}
-        <div class="tag" style="background-color: #888888" onclick={editAdding = "subtags"}>+</div>
+        <div class="tag" style="background-color: #888888" onclick={() => editAdding = "subtags"}>+</div>
 
         <h5>Danger Zone</h5>
         <div class="remove-tag-button" onclick={() => removeTag(focusedTag)}>Remove Tag</div>
@@ -181,9 +260,31 @@
       </div>
     {/if}
 
+    {#if selectedFiles.length > 0}
+      <div class="sub-window">
+        <h4>Selected Files</h4>
+
+        <h5>Selected Files: {selectedFiles.length}</h5>
+
+        <h5>Tags</h5>
+        {#each selectedTags as tag}
+          <div class="edit-tag" style="background: {tag.color}">
+            <div class="edit-tag-text" onclick={() => focusTag(tag)}>
+              {tag.name}
+            </div>
+            <div class="untag-button" onclick={() => untagSelected(tag)}>-</div>
+          </div>
+        {/each}
+        <div class="tag" style="background-color: #888888" onclick={() => editAdding = "selected_tags"}>+</div>
+
+        <h5>Selection</h5>
+        <div class="remove-tag-button" onclick={() => selectedFiles = []}>Remove Selection</div>
+      </div>
+    {/if}
+
     {#if editAdding}
       <h4>Adding {editAdding}</h4>
-      <button onclick={editAdding = null}>Cancel</button>
+      <button onclick={() => editAdding = null}>Cancel</button>
     {/if}
   </div>
 
@@ -198,7 +299,12 @@
 
       <div style="overflow-y: scroll; max-height: calc(100vh - 106px);">
         {#each files as file}
-          <div class="file-entry" onclick={() => focusFile(file)}>{file.display_name}</div>
+          <!-- FIX: This is horrible for performance -->
+          {#if selectedFiles.length > 0 && selectedFiles.includes(file.id)}
+              <div class="file-entry" onclick={(event) => focusFile(event, file)} style="border-color: #38DBFF;">{file.display_name}</div>
+          {:else}
+              <div class="file-entry" onclick={(event) => focusFile(event, file)}>{file.display_name}</div>
+          {/if}
         {/each}
       </div>
     </div>
@@ -284,6 +390,8 @@
   background-color: black;
   color: #aaaaaa;
   border-radius: 1rem;
+  border: 2px solid;
+  border-color: black;
   width: 100px;
   height: 100px;
   font-size: 1rem;
