@@ -164,6 +164,14 @@
     await invoke("remove_tag", { tagId: tag.id });
     focusedTag = null;
     tags = await invoke("all_tags", { });
+
+    if (focusedFile) {
+      editFileTags = await invoke("tags_for_file", { fileId: focusedFile.id });
+    }
+
+    if (selectedFiles.length > 0) {
+      selectedTags = await invoke("tags_for_selected", { selectedIds: selectedFiles });
+    }
   }
 
   async function updateTag(event: Event) {
