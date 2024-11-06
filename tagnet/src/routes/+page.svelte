@@ -11,7 +11,9 @@
   let focusedTag = $state(null);
   let selectedFiles = $state([]);
 
+  let searchElement;
   let searchBar = $state("");
+  let searchBarColor = $state("#0f0f0f98");
 
   let editTagName = $state("");
   let editTagColor = $state("");
@@ -181,14 +183,26 @@
     tags = await invoke("all_tags", { });
   }
 
-  // TODO: Remove function
-  async function testme(event: Event) {
-    event.preventDefault();
+  // Search bar.
+  $effect(async () => {
+    invoke("filter_files", { searchBar }).then(newFiles => {
+      if (newFiles.length > 0) {
+        files = newFiles;
+        searchBarColor = "#0f0f0f98";
+      } else {
+        searchBarColor = "#D4313198";
+      }
+    });
+  });
 
-    if (searchBar.length == 0) {
-        files = await invoke("all_files", { });
-    } else {
-        files = await invoke("files_for_tag", { tag: searchBar });
+  function onKeyDown(event: Event) {
+    switch(event.keyCode) {
+      case 191:
+      console.log("Focus thign;");
+          searchElement.focus();
+          searchElement.select();
+          event.preventDefault();
+          break;
     }
   }
 </script>
@@ -299,11 +313,8 @@
   <div style="flex-grow: 1; margin-left: 1rem;">
     <div class="sub-window">
       <h4>Files</h4>
-      <form onsubmit={testme}>
-        <!-- FIX THIS width -->
-        <input id="test-input" placeholder="Tag ID" style="width: calc(100% - 3em);" bind:value={searchBar} />
-        <!-- <button type="submit">Get Files</button> -->
-      </form>
+      <!-- FIX THIS width -->
+      <input bind:this={searchElement} id="test-input" placeholder="Tag ID" style="width: calc(100% - 3em); background-color: {searchBarColor}" bind:value={searchBar} />
 
       <div style="overflow-y: scroll; max-height: calc(100vh - 106px);">
         {#each files as file}
@@ -318,6 +329,8 @@
     </div>
   </div>
 </main>
+
+<svelte:window on:keydown={onKeyDown}/>
 
 <style>
 

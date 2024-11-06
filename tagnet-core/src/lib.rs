@@ -116,20 +116,20 @@ pub enum SubtagRule {
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Tag {
-    id: TagId,
-    name: String,
-    color: String,
+    pub id: TagId,
+    pub name: String,
+    pub color: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct File {
-    id: FileId,
-    path: String,
-    display_name: String,
-    last_modified: String,
-    content_length: String,
-    content_type: String,
+    pub id: FileId,
+    pub path: String,
+    pub display_name: String,
+    pub last_modified: String,
+    pub content_length: String,
+    pub content_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

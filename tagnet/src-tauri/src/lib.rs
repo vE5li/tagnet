@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Mutex};
 
+use regex::Regex;
 use tagnet_core::{initialize, DatabaseError, DatabaseHandle, File, SubtagRule, Tag};
 
 struct GlobalState(Mutex<DatabaseHandle>);
@@ -242,6 +243,100 @@ fn untag_selected(
     Ok(())
 }
 
+/// - Separate rules are separated by a comma
+/// - The type of filter is specified by a single character before a `:`
+///   - Name filters are prefixed with `n:`
+///   - Tags are denoted with `t:`
+///   - Regex filters are prefixed with `r:`
+/// - Any filter without an explicit prefix is interpreted as a name
+/// - Any filter with less than 3 characters is discarded (To search for a single character
+/// file name `a` you can use `n:a`)
+///
+/// Examples:
+/// t:dog, t:meme, war
+/// t:dog, !t:meme, !war
+/// t:dog, !t:meme, !n:war
+#[tauri::command]
+fn filter_files(
+    state: tauri::State<GlobalState>,
+    search_bar: &str,
+) -> Result<Vec<File>, DatabaseError> {
+    // TODO: Disallow `,`, `!` and `:` from tag names to make this search work.
+
+    #[derive(Debug)]
+    enum Filter<'a> {
+        Tag { text: &'a str, inverted: bool },
+        Regex { text: &'a str, inverted: bool },
+        Name { text: &'a str, inverted: bool },
+    }
+
+    let filters = search_bar.split(",");
+    let filters = filters
+        .into_iter()
+        .map(|filter| filter.trim())
+        .filter_map(|filter| {
+            let (filter, inverted) = match filter.strip_prefix("!") {
+                Some(remaining) => (remaining.trim(), true),
+                None => (filter, false),
+            };
+
+            // Not enough characters, discard.
+            if filter.len() < 3 {
+                return None;
+            }
+
+            let (filter_type, text) = filter.split_at(2);
+            let text = text.trim();
+
+            Some(match filter_type {
+                "t:" => Filter::Tag { text, inverted },
+                "r:" => Filter::Regex { text, inverted },
+                "n:" => Filter::Name { text, inverted },
+                _ => Filter::Name {
+                    text: filter,
+                    inverted,
+                },
+            })
+        });
+
+    let handle = state.inner().0.lock().unwrap();
+
+    let mut files: Vec<File> = handle.all_files()?.into_iter().collect();
+
+    for filter in filters {
+        match filter {
+            Filter::Tag { text, inverted } => {
+                let Ok(tag_id) = handle.tag_id_from_name(text) else {
+                    println!("Invalid tag: {text}");
+                    return Ok(Vec::new());
+                };
+
+                files.retain(|file| {
+                    let Ok(file_tag_ids) = handle.tag_ids_for_file(file.id) else {
+                        println!("Failed to get tags for file: {}", file.path);
+                        return true;
+                    };
+
+                    file_tag_ids.into_iter().find(|id| *id == tag_id).is_some() ^ inverted
+                });
+            }
+            Filter::Regex { text, inverted } => {
+                let Ok(regex) = Regex::new(text) else {
+                    println!("Invalid regex: {text}");
+                    return Ok(Vec::new());
+                };
+
+                files.retain(|file| regex.is_match(&file.display_name) ^ inverted);
+            }
+            Filter::Name { text, inverted } => {
+                files.retain(|file| file.display_name.find(text).is_some() ^ inverted);
+            }
+        }
+    }
+
+    Ok(files)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let connection = initialize("../../test.db").unwrap();
@@ -268,6 +363,7 @@ pub fn run() {
             untag_file,
             untag_tag,
             untag_selected,
+            filter_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
