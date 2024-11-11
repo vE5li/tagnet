@@ -320,9 +320,15 @@
         {#each files as file}
           <!-- FIX: This is horrible for performance -->
           {#if selectedFiles.length > 0 && selectedFiles.includes(file.id)}
-              <div class="file-entry" onclick={(event) => focusFile(event, file)} style="border-color: #38DBFF;">{file.display_name}</div>
+              <div class="file-entry" onclick={(event) => focusFile(event, file)} style="border-color: #38DBFF;">
+                <img src={file.preview}/>
+                {file.display_name}
+              </div>
           {:else}
-              <div class="file-entry" onclick={(event) => focusFile(event, file)}>{file.display_name}</div>
+              <div class="file-entry" onclick={(event) => focusFile(event, file)}>
+                <img src={file.preview}/>
+                <!-- {file.display_name} -->
+              </div>
           {/if}
         {/each}
       </div>
@@ -417,9 +423,14 @@
   height: 100px;
   font-size: 1rem;
   cursor: pointer;
-  padding: 10px;
   margin: 2px;
   overflow: clip;
+}
+
+.file-entry > img {
+  width: 100px;
+  height: 100px;
+  object-fit: cover;
 }
 
 h4 {

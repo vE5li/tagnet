@@ -1,9 +1,11 @@
+use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::error::Error;
+use std::io::Read;
 use std::path::Path;
 
 use crate::{DatabaseHandle, File};
@@ -63,11 +65,24 @@ struct Element {
     previews: Option<Value>, // TODO: Fix type
 }
 
-fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
+use base64::encode;
+
+fn image_to_data_url(image: DynamicImage) -> String {
+    let mut buffer = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Jpeg)
+        .unwrap();
+    let base64_string = encode(&buffer);
+
+    format!("data:image/jpeg;base64,{}", base64_string)
+}
+
+async fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
     use xmltree::Element;
 
     // Parse XML to an Element tree
     let root = Element::parse(xml.as_bytes()).unwrap();
+    let mut index = 0;
 
     // Iterate over each <d:response> element
     for response in root
@@ -119,8 +134,8 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
             panic!();
         };
 
-        let path = href.get_text().unwrap();
-        let path = path
+        let original_path = href.get_text().unwrap();
+        let path = original_path
             .strip_prefix(&format!("/remote.php/dav/files/{}/", USERNAME))
             .unwrap();
 
@@ -138,12 +153,23 @@ fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
             .unwrap_or(path.as_str());
         let last_modified = last_modified.get_text().unwrap();
 
+        let preview = get_preview(database_handle, &original_path)
+            .await
+            .ok()
+            .map(image_to_data_url);
+
+        println!(
+            "Adding file: {display_name}. Preview File: {:?}",
+            preview
+        );
+
         database_handle.add_file(
             path_2,
             display_name,
             last_modified,
             content_length,
             content_type,
+            preview,
         );
     }
 }
@@ -153,13 +179,45 @@ pub fn sync(database_handle: &DatabaseHandle) -> Result<(), Box<dyn Error>> {
 
     runtime.block_on(async {
         let file_list = list_files().await.unwrap();
-        parse_xml(database_handle, &file_list);
+        parse_xml(database_handle, &file_list).await;
     });
 
     // let activity_updates = get_activity(None).await?;
     // println!("{activity_updates:#?}");
 
     Ok(())
+}
+
+pub async fn get_preview(
+    database_handle: &DatabaseHandle,
+    file: &str,
+) -> Result<DynamicImage, Box<dyn Error>> {
+    let client = Client::new();
+    // let url = format!(
+    //     "{}/remote.php/dav/files/{}/{}",
+    //     NEXTCLOUD_BASE_URL, USERNAME, file
+    // );
+    let url = format!("{}{}", NEXTCLOUD_BASE_URL, file);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, basic_auth_header());
+
+    let response = client.get(&url).headers(headers).send().await?;
+
+    if response.status().is_success() {
+        let bytes = response.bytes().await?;
+        let image =
+            ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Jpeg).decode()?;
+
+        let thumbnail = image.thumbnail(100, 100);
+        Ok(thumbnail)
+    } else {
+        panic!("Failed: {}", response.status());
+        // Err(Box::new(reqwest::Error::new(
+        //     response.status(),
+        //     "Failed to list files",
+        // )))
+    }
 }
 
 // Function to list all files using WebDAV

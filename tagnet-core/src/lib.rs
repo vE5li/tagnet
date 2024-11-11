@@ -130,6 +130,7 @@ pub struct File {
     pub last_modified: String,
     pub content_length: String,
     pub content_type: String,
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,7 +162,8 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
             display_name    TEXT NOT NULL,
             last_modified   TEXT NOT NULL,
             content_length  TEXT NOT NULL,
-            content_type    TEXT NOT NULL
+            content_type    TEXT NOT NULL,
+            preview         BLOB
         )",
             (), // empty list of parameters.
         )
@@ -203,6 +205,7 @@ impl DatabaseHandle {
         last_modified: impl AsRef<str>,
         content_length: impl AsRef<str>,
         content_type: impl AsRef<str>,
+        preview: Option<String>,
     ) -> Result<FileId, DatabaseError> {
         let file_path = file_path
             .as_ref()
@@ -210,13 +213,14 @@ impl DatabaseHandle {
             .ok_or(DatabaseError::NonUtf8FilePath)?;
 
         self.connection
-            .execute("INSERT INTO files (path, display_name, last_modified, content_length, content_type) VALUES (?1, ?2, ?3, ?4, ?5)", [
+            .execute("INSERT INTO files (path, display_name, last_modified, content_length, content_type, preview) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", (
                 &file_path,
                 display_name.as_ref(),
                 last_modified.as_ref(),
                 content_length.as_ref(),
                 content_type.as_ref(),
-            ])
+                preview
+            ))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(FileId(self.connection.last_insert_rowid()))
@@ -501,7 +505,7 @@ impl DatabaseHandle {
     pub fn all_files(&self) -> Result<impl IntoIterator<Item = File>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type FROM files")
+            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, preview FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file_list = statement
@@ -513,6 +517,7 @@ impl DatabaseHandle {
                     last_modified: row.get(3)?,
                     content_length: row.get(4)?,
                     content_type: row.get(5)?,
+                    preview: row.get(6)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -548,7 +553,7 @@ impl DatabaseHandle {
     pub fn file_from_id(&self, file_id: FileId) -> Result<File, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT path, display_name, last_modified, content_length, content_type FROM files WHERE id = ?1")
+            .prepare("SELECT path, display_name, last_modified, content_length, content_type, preview FROM files WHERE id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file = statement
@@ -560,6 +565,7 @@ impl DatabaseHandle {
                     last_modified: row.get(2)?,
                     content_length: row.get(3)?,
                     content_type: row.get(4)?,
+                    preview: row.get(5)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -679,7 +685,7 @@ impl DatabaseHandle {
     pub fn show_files(&self) -> Result<(), DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type FROM files")
+            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, preview FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -691,6 +697,7 @@ impl DatabaseHandle {
                     last_modified: row.get(3)?,
                     content_length: row.get(4)?,
                     content_type: row.get(5)?,
+                    preview: row.get(6)?,
                 })
             })
             .unwrap();
