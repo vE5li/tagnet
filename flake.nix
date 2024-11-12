@@ -10,6 +10,7 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = (import nixpkgs) { inherit system overlays; };
+        frontend = pkgs.writeShellScriptBin "frontend" "(cd tagnet && deno task tauri dev)";
       in
       {
         devShell = pkgs.mkShell
@@ -37,6 +38,7 @@
 
                 openssl
                 deno
+                frontend
               ];
 
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;

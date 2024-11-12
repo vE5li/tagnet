@@ -63,7 +63,7 @@ fn tags_for_file(
 ) -> Result<Vec<Tag>, DatabaseError> {
     let handle = state.inner().0.lock().unwrap();
 
-    let tag_ids = handle.tag_ids_for_file(file_id.into())?;
+    let tag_ids = handle.tag_ids_for_file(file_id.into(), SubtagRule::Exclude)?;
 
     tag_ids
         .into_iter()
@@ -85,14 +85,14 @@ fn tags_for_selected(
     let handle = state.inner().0.lock().unwrap();
 
     let mut common_tag_ids = handle
-        .tag_ids_for_file(first_file.into())?
+        .tag_ids_for_file(first_file.into(), SubtagRule::Exclude)?
         .into_iter()
         .collect::<Vec<_>>();
 
     for file_id in selected_ids {
         // TODO: Collecting here is most likely not the best for performance.
         let file_tag_ids = handle
-            .tag_ids_for_file(file_id.into())?
+            .tag_ids_for_file(file_id.into(), SubtagRule::Exclude)?
             .into_iter()
             .collect::<HashSet<_>>();
 
@@ -312,7 +312,7 @@ fn filter_files(
                 };
 
                 files.retain(|file| {
-                    let Ok(file_tag_ids) = handle.tag_ids_for_file(file.id) else {
+                    let Ok(file_tag_ids) = handle.tag_ids_for_file(file.id, SubtagRule::Include) else {
                         println!("Failed to get tags for file: {}", file.path);
                         return true;
                     };

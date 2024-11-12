@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, ffi::OsString, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    ffi::OsString,
+    path::Path,
+};
 
 #[cfg(feature = "nextcloud")]
 pub mod nextcloud;
@@ -398,17 +402,31 @@ impl DatabaseHandle {
     pub fn tag_ids_for_file(
         &self,
         file_id: FileId,
+        subtag_rule: SubtagRule,
     ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
         let mut statement = self
             .connection
             .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        let tag_ids = statement
+        let mut tag_ids = statement
             .query_map([file_id], |row| row.get::<_, TagId>(0))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .map(|tag_id| tag_id.unwrap())
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+
+        if subtag_rule == SubtagRule::Include {
+            let mut lookup_cache = BTreeSet::new();
+
+            for tag_id in tag_ids.clone() {
+                self.tag_ids_for_subtag_inner(
+                    tag_id,
+                    &mut lookup_cache,
+                    &mut tag_ids,
+                    subtag_rule,
+                )?;
+            }
+        }
 
         Ok(tag_ids)
     }

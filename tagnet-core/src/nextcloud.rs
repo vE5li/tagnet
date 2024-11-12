@@ -1,4 +1,4 @@
-use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -67,10 +67,10 @@ struct Element {
 
 use base64::encode;
 
-fn image_to_data_url(image: DynamicImage) -> String {
+fn image_to_data_url(image: DynamicImage, format: ImageFormat) -> String {
     let mut buffer = Vec::new();
     image
-        .write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Jpeg)
+        .write_to(&mut std::io::Cursor::new(&mut buffer), format)
         .unwrap();
     let base64_string = encode(&buffer);
 
@@ -78,11 +78,21 @@ fn image_to_data_url(image: DynamicImage) -> String {
 }
 
 async fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
+    use rayon::prelude::*;
     use xmltree::Element;
 
     // Parse XML to an Element tree
     let root = Element::parse(xml.as_bytes()).unwrap();
     let mut index = 0;
+
+    struct AddFile {
+        resource_path: String,
+        path: String,
+        display_name: String,
+        last_modified: String,
+        content_length: String,
+        content_type: String,
+    }
 
     // Iterate over each <d:response> element
     for response in root
@@ -153,22 +163,43 @@ async fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
             .unwrap_or(path.as_str());
         let last_modified = last_modified.get_text().unwrap();
 
-        let preview = get_preview(database_handle, &original_path)
-            .await
-            .ok()
-            .map(image_to_data_url);
+        let data = AddFile {
+            resource_path: original_path.to_string(),
+            path: path.to_owned(),
+            display_name: display_name.to_owned(),
+            last_modified: last_modified.to_string(),
+            content_length: content_length.to_string(),
+            content_type: content_type.to_string(),
+        };
 
-        println!(
-            "Adding file: {display_name}. Preview File: {:?}",
-            preview
-        );
+        let image = match data.content_type.as_str() {
+            string @ "image/jpeg" | string @ "image/png" => {
+                let format = match string {
+                    "image/jpeg" => ImageFormat::Jpeg,
+                    "image/png" => ImageFormat::Png,
+                    _ => unreachable!(),
+                };
+
+                get_preview(&data.resource_path, format)
+                    .await
+                    .ok()
+                    .map(|image| (image, format))
+            }
+            _ => None,
+        };
+
+        println!("Downloaded everything for {}", data.display_name);
+
+        let preview = image.map(|(image, format)| image_to_data_url(image, format));
+
+        println!("Done with {}", data.display_name);
 
         database_handle.add_file(
-            path_2,
-            display_name,
-            last_modified,
-            content_length,
-            content_type,
+            data.path,
+            data.display_name,
+            data.last_modified,
+            data.content_length,
+            data.content_type,
             preview,
         );
     }
@@ -178,7 +209,9 @@ pub fn sync(database_handle: &DatabaseHandle) -> Result<(), Box<dyn Error>> {
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     runtime.block_on(async {
+        println!("fetching file list...");
         let file_list = list_files().await.unwrap();
+        println!("parsing list...");
         parse_xml(database_handle, &file_list).await;
     });
 
@@ -188,10 +221,7 @@ pub fn sync(database_handle: &DatabaseHandle) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn get_preview(
-    database_handle: &DatabaseHandle,
-    file: &str,
-) -> Result<DynamicImage, Box<dyn Error>> {
+pub async fn get_preview(file: &str, format: ImageFormat) -> Result<DynamicImage, Box<dyn Error>> {
     let client = Client::new();
     // let url = format!(
     //     "{}/remote.php/dav/files/{}/{}",
@@ -206,10 +236,13 @@ pub async fn get_preview(
 
     if response.status().is_success() {
         let bytes = response.bytes().await?;
-        let image =
-            ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Jpeg).decode()?;
+        let mut decoder =
+            ImageReader::with_format(std::io::Cursor::new(bytes), format).into_decoder()?;
+        let orientation = decoder.orientation()?;
+        let mut image = DynamicImage::from_decoder(decoder)?;
+        image.apply_orientation(orientation);
 
-        let thumbnail = image.thumbnail(100, 100);
+        let thumbnail = image.thumbnail(400, 400);
         Ok(thumbnail)
     } else {
         panic!("Failed: {}", response.status());

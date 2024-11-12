@@ -232,7 +232,7 @@
           <input id="new-tag-name" placeholder="Tag Name" style="width: calc(100% - 3em);" bind:value={editTagName} />
           <!-- FIX THIS width -->
           <input id="new-tag-color" placeholder="Tag Color" style="width: calc(100% - 3em);" bind:value={editTagColor} />
-          <!-- <button type="submit">Update tag</button> -->
+          <button type="submit">Update tag</button>
         </form>
         <h5>Tags</h5>
         {#each editTagTags as tag}
@@ -345,6 +345,7 @@
   font-size: 12px;
   line-height: 24px;
   font-weight: 400;
+  cursor: crosshair;
 
   color: #0f0f0f;
   background-color: #f6f6f6;
@@ -490,6 +491,7 @@ button {
     font-size: 12px;
     line-height: 24px;
     font-weight: 400;
+    cursor: crosshair;
 
     height: 100%;
     overflow: hidden;
