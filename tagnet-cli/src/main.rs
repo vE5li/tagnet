@@ -125,4 +125,5 @@ fn main() {
     handle.show_files().unwrap();
     handle.show_tags().unwrap();
     handle.show_entries().unwrap();
+    handle.show_previews().unwrap();
 }

@@ -1,6 +1,10 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
 
+  const markdownURI = "data:image/jpeg;base64,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";
+
+  let currentlyGenerating = new Set<integer>;
+
   let name = $state("");
   let color = $state("#8f008f");
 
@@ -25,6 +29,17 @@
   let editAdding = $state(null);
 
   let selectedTags = $state([]);
+
+  let displaySize = $state("small");
+  let smallCache = $state({
+    0: markdownURI,
+  })
+  let mediumCache = $state({
+    0: markdownURI,
+  })
+  let bigCache = $state({
+    0: markdownURI,
+  })
 
   async function loadInitial() {
     files = await invoke("all_files", { });
@@ -198,11 +213,92 @@
   function onKeyDown(event: Event) {
     switch(event.keyCode) {
       case 191:
-      console.log("Focus thign;");
-          searchElement.focus();
-          searchElement.select();
-          event.preventDefault();
-          break;
+        console.log("Focus thign;");
+        searchElement.focus();
+        searchElement.select();
+        event.preventDefault();
+        break;
+    }
+  }
+
+  function getEntryClass() {
+    if (displaySize == "small") {
+      return "file-entry-small";
+    } else if (displaySize == "medium") {
+      return "file-entry-medium";
+    } else if (displaySize == "big") {
+      return "file-entry-big";
+    }
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function loadPreview(file, previewSize) {
+    while (true) {
+      const generatePreview = !file.preview_id;
+
+      console.log(file.preview_id + " -> " + generatePreview);
+
+      // If the file already has a preview, just fetch it.
+      if (generatePreview) {
+        if (currentlyGenerating.size > 3) {
+          // Wait and retry later
+          await delay(1000);
+          continue;
+        }
+
+        if (currentlyGenerating.has(file.id)) {
+          // Preview is already beeing generated at the moment.
+          await delay(1000);
+          continue;
+        }
+
+        // Proceed when fetching limit allows
+        currentlyGenerating.add(file.id);
+        console.log("Generating preview for " + file.display_name + " (size " + previewSize + ")");
+      }
+
+      try {
+        // Generate and cache preview
+        const result = await invoke("get_preview", { file, previewSize });
+        return result;
+      } catch (err) {
+        console.error(`Failed to load preview for ${file.id}:`, err);
+      } finally {
+        // Ensure cleanup happens even if an error occurs
+        currentlyGenerating.delete(file.id);
+      }
+
+      break; // Exit the loop after fetching or handling an error
+    }
+  }
+
+  function getPreview(file) {
+    if (file.has_preview) {
+      let currentCache;
+
+      if (displaySize == "small") {
+        currentCache = smallCache;
+      } else if (displaySize == "medium") {
+        currentCache = mediumCache;
+      } else if (displaySize == "big") {
+        currentCache = bigCache;
+      }
+
+      if (!file.preview_id || !currentCache[file.preview_id]) {
+        loadPreview(file, displaySize).then(([preview_id, preview]) => {
+          console.log("Setting preview for: " + preview_id);
+          // TODO: Maybe only conditionally.
+          file.preview_id = preview_id;
+          currentCache[file.preview_id] = preview;
+        });
+      }
+
+      return currentCache[file.preview_id];
+    } else {
+      return markdownURI;
     }
   }
 </script>
@@ -313,6 +409,32 @@
   <div style="flex-grow: 1; margin-left: 1rem;">
     <div class="sub-window">
       <h4>Files</h4>
+
+      <label>
+      <input
+      type="radio"
+      bind:group={displaySize}
+      value="small"
+      />
+      Small
+      </label>
+      <label>
+      <input
+      type="radio"
+      bind:group={displaySize}
+      value="medium"
+      />
+      Medium
+      </label>
+      <label>
+      <input
+      type="radio"
+      bind:group={displaySize}
+      value="big"
+      />
+      Big
+      </label>
+
       <!-- FIX THIS width -->
       <input bind:this={searchElement} id="test-input" placeholder="Tag ID" style="width: calc(100% - 3em); background-color: {searchBarColor}" bind:value={searchBar} />
 
@@ -320,13 +442,13 @@
         {#each files as file}
           <!-- FIX: This is horrible for performance -->
           {#if selectedFiles.length > 0 && selectedFiles.includes(file.id)}
-              <div class="file-entry" onclick={(event) => focusFile(event, file)} style="border-color: #38DBFF;">
-                <img src={file.preview}/>
-                {file.display_name}
+              <div class={getEntryClass()} onclick={(event) => focusFile(event, file)} style="border-color: #38DBFF;">
+                <img src={getPreview(file)}/>
+                <!-- {file.display_name} -->
               </div>
           {:else}
-              <div class="file-entry" onclick={(event) => focusFile(event, file)}>
-                <img src={file.preview}/>
+              <div class={getEntryClass()} onclick={(event) => focusFile(event, file)}>
+                <img src={getPreview(file)}/>
                 <!-- {file.display_name} -->
               </div>
           {/if}
@@ -413,7 +535,28 @@
   margin: 0.2rem;
 }
 
-.file-entry {
+.file-entry-small {
+  display: inline-block;
+  background-color: black;
+  color: #aaaaaa;
+  border-radius: 1rem;
+  border: 2px solid;
+  border-color: black;
+  width: 60px;
+  height: 60px;
+  font-size: 1rem;
+  cursor: pointer;
+  margin: 2px;
+  overflow: clip;
+}
+
+.file-entry-small > img {
+  width: 60px;
+  height: 60px;
+  object-fit: cover;
+}
+
+.file-entry-medium {
   display: inline-block;
   background-color: black;
   color: #aaaaaa;
@@ -428,9 +571,30 @@
   overflow: clip;
 }
 
-.file-entry > img {
+.file-entry-medium > img {
   width: 100px;
   height: 100px;
+  object-fit: cover;
+}
+
+.file-entry-big {
+  display: inline-block;
+  background-color: black;
+  color: #aaaaaa;
+  border-radius: 1rem;
+  border: 2px solid;
+  border-color: black;
+  width: 150px;
+  height: 150px;
+  font-size: 1rem;
+  cursor: pointer;
+  margin: 2px;
+  overflow: clip;
+}
+
+.file-entry-big > img {
+  width: 150px;
+  height: 150px;
   object-fit: cover;
 }
 

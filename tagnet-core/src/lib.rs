@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeSet, HashSet},
-    ffi::OsString,
-    path::Path,
-};
+use std::{collections::BTreeSet, ffi::OsString, path::Path};
 
 #[cfg(feature = "nextcloud")]
 pub mod nextcloud;
@@ -13,76 +9,49 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct FileId(i64);
+macro_rules! make_id_type {
+    ($name:ident) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(i64);
 
-impl From<FileId> for i64 {
-    fn from(value: FileId) -> Self {
-        value.0
-    }
+        impl From<$name> for i64 {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl From<i64> for $name {
+            fn from(value: i64) -> Self {
+                Self(value)
+            }
+        }
+
+        impl ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                Ok(self.0.into())
+            }
+        }
+
+        impl FromSql for $name {
+            fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+                Ok(Self(value.as_i64()?))
+            }
+        }
+    };
 }
 
-impl From<i64> for FileId {
-    fn from(value: i64) -> Self {
-        Self(value)
-    }
-}
+make_id_type!(FileId);
+make_id_type!(PreviewId);
+make_id_type!(TagId);
 
-impl ToSql for FileId {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(self.0.into())
-    }
-}
-
-impl FromSql for FileId {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self(value.as_i64()?))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct TagId(i64);
-
-impl From<TagId> for i64 {
-    fn from(value: TagId) -> Self {
-        value.0
-    }
-}
-
-impl From<i64> for TagId {
-    fn from(value: i64) -> Self {
-        Self(value)
-    }
-}
-
-impl ToSql for TagId {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(self.0.into())
-    }
-}
-
-impl FromSql for TagId {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self(value.as_i64()?))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct EntryId(i64);
-
-impl ToSql for EntryId {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(self.0.into())
-    }
-}
-
-impl FromSql for EntryId {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self(value.as_i64()?))
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewSize {
+    Small,
+    Medium,
+    Big,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +103,8 @@ pub struct File {
     pub last_modified: String,
     pub content_length: String,
     pub content_type: String,
-    pub preview: Option<String>,
+    pub has_preview: bool,
+    pub preview_id: Option<PreviewId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,7 +137,20 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
             last_modified   TEXT NOT NULL,
             content_length  TEXT NOT NULL,
             content_type    TEXT NOT NULL,
-            preview         BLOB
+            has_preview     INTEGER,
+            preview_id      INTEGER
+        )",
+            (), // empty list of parameters.
+        )
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS previews (
+            id              INTEGER PRIMARY KEY,
+            small           TEXT,
+            medium          TEXT,
+            big             TEXT
         )",
             (), // empty list of parameters.
         )
@@ -201,6 +184,17 @@ pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, Dat
 }
 
 impl DatabaseHandle {
+    // fn add_preview(&self) -> Result<PreviewId, DatabaseError> {
+    //     self.connection
+    //         .execute(
+    //             "INSERT INTO previews (small, medium, big) VALUES (?1, ?2, ?3)",
+    //             [const { Option::<String>::None }; 3],
+    //         )
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     Ok(PreviewId(self.connection.last_insert_rowid()))
+    // }
+
     /// Add a new file.
     pub fn add_file(
         &self,
@@ -209,21 +203,23 @@ impl DatabaseHandle {
         last_modified: impl AsRef<str>,
         content_length: impl AsRef<str>,
         content_type: impl AsRef<str>,
-        preview: Option<String>,
     ) -> Result<FileId, DatabaseError> {
         let file_path = file_path
             .as_ref()
             .to_str()
             .ok_or(DatabaseError::NonUtf8FilePath)?;
 
+        let has_preview = matches!(content_type.as_ref(), "image/jpeg" | "image/png");
+
         self.connection
-            .execute("INSERT INTO files (path, display_name, last_modified, content_length, content_type, preview) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", (
+            .execute("INSERT INTO files (path, display_name, last_modified, content_length, content_type, has_preview, preview_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", (
                 &file_path,
                 display_name.as_ref(),
                 last_modified.as_ref(),
                 content_length.as_ref(),
                 content_type.as_ref(),
-                preview
+                has_preview,
+                None::<String>
             ))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -275,7 +271,7 @@ impl DatabaseHandle {
     }
 
     /// Tag a file with the provided tag.
-    pub fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<EntryId, DatabaseError> {
+    pub fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), DatabaseError> {
         self.connection
             .execute(
                 "INSERT INTO entries (tag_id, target_id, type) VALUES (?1, ?2, ?3)",
@@ -283,11 +279,63 @@ impl DatabaseHandle {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(EntryId(self.connection.last_insert_rowid()))
+        Ok(())
+    }
+
+    pub fn get_preview(
+        &self,
+        preview_id: PreviewId,
+        preview_size: PreviewSize,
+        // TODO: Not a DatabaseError, might also be a client (Nextcloud) error.
+    ) -> Result<String, DatabaseError> {
+        let column = match preview_size {
+            PreviewSize::Small => "small",
+            PreviewSize::Medium => "medium",
+            PreviewSize::Big => "big",
+        };
+
+        let query = format!("SELECT {column} FROM previews WHERE id = ?1");
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let preview = statement
+            .query_map([preview_id], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|preview| preview.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(preview)
+    }
+
+    pub fn set_preview(
+        &self,
+        file_id: FileId,
+        previews: (String, String, String),
+    ) -> Result<PreviewId, DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO previews (small, medium, big) VALUES (?1, ?2, ?3)",
+                previews,
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let preview_id = PreviewId(self.connection.last_insert_rowid());
+
+        self.connection
+            .execute(
+                "UPDATE files SET preview_id = ?2 WHERE id = ?1",
+                (file_id, Some(preview_id)),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(preview_id)
     }
 
     /// Tag a tag with the provided tag.
-    pub fn tag_tag(&self, tag_id: TagId, subtag_id: TagId) -> Result<EntryId, DatabaseError> {
+    pub fn tag_tag(&self, tag_id: TagId, subtag_id: TagId) -> Result<(), DatabaseError> {
         if tag_id == subtag_id {
             return Err(DatabaseError::CantTagItself);
         }
@@ -299,7 +347,7 @@ impl DatabaseHandle {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(EntryId(self.connection.last_insert_rowid()))
+        Ok(())
     }
 
     /// Remove a tag from a file.
@@ -523,7 +571,7 @@ impl DatabaseHandle {
     pub fn all_files(&self) -> Result<impl IntoIterator<Item = File>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, preview FROM files")
+            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, has_preview, preview_id FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file_list = statement
@@ -535,7 +583,8 @@ impl DatabaseHandle {
                     last_modified: row.get(3)?,
                     content_length: row.get(4)?,
                     content_type: row.get(5)?,
-                    preview: row.get(6)?,
+                    has_preview: row.get(6)?,
+                    preview_id: row.get(7)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -567,11 +616,11 @@ impl DatabaseHandle {
         Ok(tag_list)
     }
 
-    /// Get the path of a file by the ID.
+    /// Get a file by its ID.
     pub fn file_from_id(&self, file_id: FileId) -> Result<File, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT path, display_name, last_modified, content_length, content_type, preview FROM files WHERE id = ?1")
+            .prepare("SELECT path, display_name, last_modified, content_length, content_type, has_preview, preview_id FROM files WHERE id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file = statement
@@ -583,7 +632,8 @@ impl DatabaseHandle {
                     last_modified: row.get(2)?,
                     content_length: row.get(3)?,
                     content_type: row.get(4)?,
-                    preview: row.get(5)?,
+                    has_preview: row.get(5)?,
+                    preview_id: row.get(6)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -593,6 +643,34 @@ impl DatabaseHandle {
 
         Ok(file)
     }
+
+    /// Get the a file by its preview ID.
+    // pub fn file_from_preview_id(&self, preview_id: PreviewId) -> Result<File, DatabaseError> {
+    //     let mut statement = self
+    //         .connection
+    //         .prepare("SELECT id, path, display_name, last_modified, content_length, content_type FROM files WHERE preview = ?1")
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     let file = statement
+    //         .query_map([Some(preview_id)], |row| {
+    //             Ok(File {
+    //                 id: row.get(0)?,
+    //                 path: row.get(1)?,
+    //                 display_name: row.get(2)?,
+    //                 last_modified: row.get(3)?,
+    //                 content_length: row.get(4)?,
+    //                 content_type: row.get(5)?,
+    //
+    //                 preview: Some(preview_id),
+    //             })
+    //         })
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+    //         .map(|file| file.unwrap())
+    //         .next()
+    //         .ok_or(DatabaseError::MissingFile)?;
+    //
+    //     Ok(file)
+    // }
 
     /// Get the name of a tag by the ID.
     pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
@@ -703,7 +781,7 @@ impl DatabaseHandle {
     pub fn show_files(&self) -> Result<(), DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, preview FROM files")
+            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, has_preview, preview_id FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -715,7 +793,8 @@ impl DatabaseHandle {
                     last_modified: row.get(3)?,
                     content_length: row.get(4)?,
                     content_type: row.get(5)?,
-                    preview: row.get(6)?,
+                    has_preview: row.get(6)?,
+                    preview_id: row.get(7)?,
                 })
             })
             .unwrap();
@@ -755,7 +834,6 @@ impl DatabaseHandle {
         #[derive(Debug)]
         #[allow(dead_code)]
         struct Entry {
-            id: EntryId,
             tag_id: TagId,
             target_id: i64,
             r#type: EntryType,
@@ -763,22 +841,55 @@ impl DatabaseHandle {
 
         let mut statement = self
             .connection
-            .prepare("SELECT id, tag_id, target_id, type FROM entries")
+            .prepare("SELECT tag_id, target_id, type FROM entries")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
             .query_map([], |row| {
                 Ok(Entry {
-                    id: row.get(0)?,
-                    tag_id: row.get(1)?,
-                    target_id: row.get(2)?,
-                    r#type: row.get(3)?,
+                    tag_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    r#type: row.get(2)?,
                 })
             })
             .unwrap();
 
         for entry in iterator {
             println!("{:?}", entry.unwrap());
+        }
+
+        Ok(())
+    }
+
+    // TODO: Temporary function to debug.
+    pub fn show_previews(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Preview {
+            id: PreviewId,
+            small: Option<String>,
+            medium: Option<String>,
+            big: Option<String>,
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, small, medium, big FROM previews")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(Preview {
+                    id: row.get(0)?,
+                    small: row.get(1)?,
+                    medium: row.get(2)?,
+                    big: row.get(3)?,
+                })
+            })
+            .unwrap();
+
+        for preview in iterator {
+            println!("{:?}", preview.unwrap());
         }
 
         Ok(())

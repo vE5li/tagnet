@@ -1,7 +1,9 @@
 use std::{collections::HashSet, sync::Mutex};
 
 use regex::Regex;
-use tagnet_core::{initialize, DatabaseError, DatabaseHandle, File, SubtagRule, Tag};
+use tagnet_core::{
+    initialize, nextcloud, DatabaseError, DatabaseHandle, File, PreviewId, SubtagRule, Tag,
+};
 
 struct GlobalState(Mutex<DatabaseHandle>);
 
@@ -312,7 +314,8 @@ fn filter_files(
                 };
 
                 files.retain(|file| {
-                    let Ok(file_tag_ids) = handle.tag_ids_for_file(file.id, SubtagRule::Include) else {
+                    let Ok(file_tag_ids) = handle.tag_ids_for_file(file.id, SubtagRule::Include)
+                    else {
                         println!("Failed to get tags for file: {}", file.path);
                         return true;
                     };
@@ -335,6 +338,45 @@ fn filter_files(
     }
 
     Ok(files)
+}
+
+#[tauri::command]
+async fn get_preview(
+    state: tauri::State<'_, GlobalState>,
+    file: File,
+    preview_size: &str,
+) -> Result<(PreviewId, String), DatabaseError> {
+    let preview_size = match preview_size {
+        "small" => tagnet_core::PreviewSize::Small,
+        "medium" => tagnet_core::PreviewSize::Small,
+        "big" => tagnet_core::PreviewSize::Big,
+        // FIX: Obviously not the correct error.
+        _ => return Err(DatabaseError::MissingTag),
+    };
+
+    if let Some(preview_id) = file.preview_id {
+        let handle = state.inner().0.lock().unwrap();
+
+        return handle
+            .get_preview(preview_id, preview_size)
+            .map(|preview| (preview_id, preview));
+    }
+
+    let previews = nextcloud::generate_preview(&file)
+        .await
+        .map_err(|_| DatabaseError::MissingTag)?;
+
+    let requested_preview = match preview_size {
+        tagnet_core::PreviewSize::Small => previews.0.clone(),
+        tagnet_core::PreviewSize::Medium => previews.1.clone(),
+        tagnet_core::PreviewSize::Big => previews.2.clone(),
+    };
+
+    let handle = state.inner().0.lock().unwrap();
+
+    let preview_id = handle.set_preview(file.id, previews)?;
+
+    Ok((preview_id, requested_preview))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -364,6 +406,7 @@ pub fn run() {
             untag_tag,
             untag_selected,
             filter_files,
+            get_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

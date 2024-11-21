@@ -1,11 +1,12 @@
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use percent_encoding::CONTROLS;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::error::Error;
-use std::io::Read;
 use std::path::Path;
 
 use crate::{DatabaseHandle, File};
@@ -65,34 +66,43 @@ struct Element {
     previews: Option<Value>, // TODO: Fix type
 }
 
-use base64::encode;
-
 fn image_to_data_url(image: DynamicImage, format: ImageFormat) -> String {
     let mut buffer = Vec::new();
     image
         .write_to(&mut std::io::Cursor::new(&mut buffer), format)
         .unwrap();
-    let base64_string = encode(&buffer);
+    let base64_string = BASE64_STANDARD.encode(&buffer);
 
     format!("data:image/jpeg;base64,{}", base64_string)
 }
 
-async fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
-    use rayon::prelude::*;
+pub async fn generate_preview(file: &File) -> Result<(String, String, String), Box<dyn Error>> {
+    let format = match file.content_type.as_str() {
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/png" => ImageFormat::Png,
+        _ => panic!("not implemented"),
+    };
+
+    let resource_path =
+        percent_encoding::percent_encode(file.path.as_bytes(), CONTROLS).to_string();
+    let image = get_preview_inner(&resource_path, format).await?;
+
+    let small_thumbnail = image.thumbnail(100, 100);
+    let medium_thumbnail = image.thumbnail(250, 250);
+    let big_thumbnail = image.thumbnail(400, 400);
+
+    let small_preview = image_to_data_url(small_thumbnail, format);
+    let medium_preview = image_to_data_url(medium_thumbnail, format);
+    let big_preview = image_to_data_url(big_thumbnail, format);
+
+    Ok((small_preview, medium_preview, big_preview))
+}
+
+fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
     use xmltree::Element;
 
     // Parse XML to an Element tree
     let root = Element::parse(xml.as_bytes()).unwrap();
-    let mut index = 0;
-
-    struct AddFile {
-        resource_path: String,
-        path: String,
-        display_name: String,
-        last_modified: String,
-        content_length: String,
-        content_type: String,
-    }
 
     // Iterate over each <d:response> element
     for response in root
@@ -140,9 +150,9 @@ async fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
             continue;
         };
 
-        let Some(file_name) = href.get_text() else {
-            panic!();
-        };
+        // let Some(file_name) = href.get_text() else {
+        //     panic!();
+        // };
 
         let original_path = href.get_text().unwrap();
         let path = original_path
@@ -163,44 +173,12 @@ async fn parse_xml(database_handle: &DatabaseHandle, xml: &str) {
             .unwrap_or(path.as_str());
         let last_modified = last_modified.get_text().unwrap();
 
-        let data = AddFile {
-            resource_path: original_path.to_string(),
-            path: path.to_owned(),
-            display_name: display_name.to_owned(),
-            last_modified: last_modified.to_string(),
-            content_length: content_length.to_string(),
-            content_type: content_type.to_string(),
-        };
-
-        let image = match data.content_type.as_str() {
-            string @ "image/jpeg" | string @ "image/png" => {
-                let format = match string {
-                    "image/jpeg" => ImageFormat::Jpeg,
-                    "image/png" => ImageFormat::Png,
-                    _ => unreachable!(),
-                };
-
-                get_preview(&data.resource_path, format)
-                    .await
-                    .ok()
-                    .map(|image| (image, format))
-            }
-            _ => None,
-        };
-
-        println!("Downloaded everything for {}", data.display_name);
-
-        let preview = image.map(|(image, format)| image_to_data_url(image, format));
-
-        println!("Done with {}", data.display_name);
-
         database_handle.add_file(
-            data.path,
-            data.display_name,
-            data.last_modified,
-            data.content_length,
-            data.content_type,
-            preview,
+            path_2,
+            display_name,
+            last_modified,
+            content_length,
+            content_type,
         );
     }
 }
@@ -212,7 +190,7 @@ pub fn sync(database_handle: &DatabaseHandle) -> Result<(), Box<dyn Error>> {
         println!("fetching file list...");
         let file_list = list_files().await.unwrap();
         println!("parsing list...");
-        parse_xml(database_handle, &file_list).await;
+        parse_xml(database_handle, &file_list);
     });
 
     // let activity_updates = get_activity(None).await?;
@@ -221,13 +199,15 @@ pub fn sync(database_handle: &DatabaseHandle) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn get_preview(file: &str, format: ImageFormat) -> Result<DynamicImage, Box<dyn Error>> {
+async fn get_preview_inner(
+    file: &str,
+    format: ImageFormat,
+) -> Result<DynamicImage, Box<dyn Error>> {
     let client = Client::new();
-    // let url = format!(
-    //     "{}/remote.php/dav/files/{}/{}",
-    //     NEXTCLOUD_BASE_URL, USERNAME, file
-    // );
-    let url = format!("{}{}", NEXTCLOUD_BASE_URL, file);
+    let url = format!(
+        "{}/remote.php/dav/files/{}/{}",
+        NEXTCLOUD_BASE_URL, USERNAME, file
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, basic_auth_header());
@@ -236,14 +216,14 @@ pub async fn get_preview(file: &str, format: ImageFormat) -> Result<DynamicImage
 
     if response.status().is_success() {
         let bytes = response.bytes().await?;
+
         let mut decoder =
             ImageReader::with_format(std::io::Cursor::new(bytes), format).into_decoder()?;
         let orientation = decoder.orientation()?;
         let mut image = DynamicImage::from_decoder(decoder)?;
         image.apply_orientation(orientation);
 
-        let thumbnail = image.thumbnail(400, 400);
-        Ok(thumbnail)
+        Ok(image)
     } else {
         panic!("Failed: {}", response.status());
         // Err(Box::new(reqwest::Error::new(
@@ -282,7 +262,7 @@ async fn list_files() -> Result<String, Box<dyn Error>> {
 }
 
 // Function to get activity updates from Activity API
-async fn get_activity(last_id: Option<u64>) -> Result<ActivityResponse, Box<dyn Error>> {
+/* async fn get_activity(_last_id: Option<u64>) -> Result<ActivityResponse, Box<dyn Error>> {
     let client = Client::new();
     let url = format!(
         "{}/ocs/v2.php/apps/activity/api/v2/activity",
@@ -298,7 +278,7 @@ async fn get_activity(last_id: Option<u64>) -> Result<ActivityResponse, Box<dyn 
     // - number of entries to return
     // - type of the object to include in the query
     // - id of the specific object we want to query
-    let mut query = vec![("sort", "asc")];
+    let query = vec![("sort", "asc")];
 
     let response = client
         .get(&url)
@@ -315,10 +295,10 @@ async fn get_activity(last_id: Option<u64>) -> Result<ActivityResponse, Box<dyn 
     } else {
         panic!("Failed: {}", response.status());
     }
-}
+} */
 
 // Basic Authorization Header Helper
 fn basic_auth_header() -> HeaderValue {
-    let auth = base64::encode(format!("{}:{}", USERNAME, PASSWORD));
+    let auth = BASE64_STANDARD.encode(format!("{}:{}", USERNAME, PASSWORD));
     HeaderValue::from_str(&format!("Basic {}", auth)).unwrap()
 }
