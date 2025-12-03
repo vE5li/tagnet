@@ -55,6 +55,9 @@ enum FooBarError {
     FailedToOpenFile,
     FailedToReadFile,
     MissingTrackedFile,
+    FailedAddingFile,
+    FailedUpdatingFile,
+    FailedRemovingFile,
 }
 
 async fn handle_connection(
@@ -258,14 +261,13 @@ impl SyncDirectoryManager {
         path: impl AsRef<Path>,
         content: Vec<u8>,
         content_hash: String,
-    ) {
+    ) -> Result<(), FooBarError> {
         let file_id = FileId::new();
 
-        // TODO: Don't unwrap.
         sync_directory
             .database
             .add_file(file_id, path.as_ref().to_string_lossy(), content_hash)
-            .unwrap();
+            .map_err(|_| FooBarError::FailedAddingFile)?;
 
         // FIX:Handle send error.
         let _ = self.sender.send(Change::FileAdded {
@@ -273,6 +275,8 @@ impl SyncDirectoryManager {
             path: path.as_ref().to_string_lossy().to_string(),
             content,
         });
+
+        Ok(())
     }
 
     fn get_file_content(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, String), FooBarError> {
@@ -295,15 +299,16 @@ impl SyncDirectoryManager {
         file_id: FileId,
         content: Vec<u8>,
         content_hash: String,
-    ) {
-        // TODO: Don't panic
+    ) -> Result<(), FooBarError> {
         sync_directory
             .database
             .update_file_content_hash(file_id, content_hash)
-            .expect("Failed to pudate file content");
+            .map_err(|_| FooBarError::FailedUpdatingFile)?;
 
         // FIX:Handle send error.
         let _ = self.sender.send(Change::FileChanged { file_id, content });
+
+        Ok(())
     }
 
     fn update_file_path(
@@ -311,26 +316,35 @@ impl SyncDirectoryManager {
         sync_directory: &RichSyncDirectory,
         file_id: FileId,
         path: impl AsRef<Path>,
-    ) {
-        // TODO: Don't panic
+    ) -> Result<(), FooBarError> {
         sync_directory
             .database
             .update_file_path(file_id, path.as_ref().to_string_lossy())
-            .expect("Failed to update file path");
+            .map_err(|_| FooBarError::FailedUpdatingFile)?;
 
         // FIX:Handle send error.
         let _ = self.sender.send(Change::FileMoved {
             file_id,
             path: path.as_ref().to_string_lossy().to_string(),
         });
+
+        Ok(())
     }
 
-    fn remove_file_by_id(&self, sync_directory: &RichSyncDirectory, file_id: FileId) {
-        // FIX: Don't unwrap.
-        sync_directory.database.remove_file_by_id(file_id).unwrap();
+    fn remove_file_by_id(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        file_id: FileId,
+    ) -> Result<(), FooBarError> {
+        sync_directory
+            .database
+            .remove_file_by_id(file_id)
+            .map_err(|_| FooBarError::FailedRemovingFile)?;
 
         // FIX:Handle send error.
         let _ = self.sender.send(Change::FileDeleted { file_id });
+
+        Ok(())
     }
 
     fn get_all_files(
@@ -401,7 +415,14 @@ impl SyncDirectoryManager {
                         full_path.to_string_lossy()
                     );
 
-                    self.remove_file_by_id(sync_directory, sync_file.file_id);
+                    if let Err(error) = self.remove_file_by_id(sync_directory, sync_file.file_id) {
+                        log::error!(
+                            "Failed to remove file {}: {:?}",
+                            full_path.to_string_lossy(),
+                            error
+                        );
+                    }
+
                     continue;
                 }
 
@@ -419,12 +440,18 @@ impl SyncDirectoryManager {
                         full_path.to_string_lossy()
                     );
 
-                    self.update_file_content(
+                    if let Err(error) = self.update_file_content(
                         sync_directory,
                         sync_file.file_id,
                         content,
                         content_hash,
-                    );
+                    ) {
+                        log::error!(
+                            "Failed to update file {}: {:?}",
+                            full_path.to_string_lossy(),
+                            error
+                        );
+                    }
                 }
             }
 
@@ -463,7 +490,15 @@ impl SyncDirectoryManager {
                             }
                         };
 
-                        self.add_file(sync_directory, relative_path, content, content_hash);
+                        if let Err(error) =
+                            self.add_file(sync_directory, relative_path, content, content_hash)
+                        {
+                            log::error!(
+                                "Failed to add file {}: {:?}",
+                                relative_path.to_string_lossy(),
+                                error
+                            );
+                        }
                     }
                     Err(error) => {
                         panic!("Database error: {:?}", error);
@@ -480,7 +515,7 @@ impl SyncDirectoryManager {
                 let (content, content_hash) = self.get_file_content(&file_name)?;
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
 
-                self.add_file(sync_directory, sync_relative_path, content, content_hash);
+                self.add_file(sync_directory, sync_relative_path, content, content_hash)?;
             }
             DebouncedEventKind::Move { from, to } => {
                 let any_path = from.as_ref().or(to.as_ref()).unwrap();
@@ -495,14 +530,14 @@ impl SyncDirectoryManager {
                     let relative_to = to.strip_prefix(&sync_directory.path).unwrap();
 
                     if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
-                        self.update_file_path(sync_directory, file_id, relative_to);
+                        self.update_file_path(sync_directory, file_id, relative_to)?;
                     } else {
                         for sync_file in self.get_all_files_at(sync_directory, relative_from)? {
                             let path = PathBuf::from(sync_file.path);
                             let relative_path = path.strip_prefix(relative_from).unwrap();
                             let new_path = relative_to.join(relative_path);
 
-                            self.update_file_path(sync_directory, sync_file.file_id, new_path);
+                            self.update_file_path(sync_directory, sync_file.file_id, new_path)?;
                         }
                     }
                 } else if let Some(from) = from {
@@ -511,10 +546,10 @@ impl SyncDirectoryManager {
                     let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
 
                     if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
-                        self.remove_file_by_id(sync_directory, file_id);
+                        self.remove_file_by_id(sync_directory, file_id)?;
                     } else {
                         for sync_file in self.get_all_files_at(sync_directory, relative_from)? {
-                            self.remove_file_by_id(sync_directory, sync_file.file_id);
+                            self.remove_file_by_id(sync_directory, sync_file.file_id)?;
                         }
                     }
                 } else if let Some(to) = to {
@@ -524,7 +559,7 @@ impl SyncDirectoryManager {
                         let (content, content_hash) = self.get_file_content(&to)?;
                         let sync_relative_path = to.strip_prefix(&sync_directory.path).unwrap();
 
-                        self.add_file(sync_directory, sync_relative_path, content, content_hash);
+                        self.add_file(sync_directory, sync_relative_path, content, content_hash)?;
                     } else if to.is_dir() {
                         for entry in WalkDir::new(&to)
                             .into_iter()
@@ -540,7 +575,7 @@ impl SyncDirectoryManager {
                                 sync_relative_path,
                                 content,
                                 content_hash,
-                            );
+                            )?;
                         }
                     } else {
                         log::warn!(
@@ -557,14 +592,14 @@ impl SyncDirectoryManager {
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
                 let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
 
-                self.update_file_content(sync_directory, file_id, content, content_hash);
+                self.update_file_content(sync_directory, file_id, content, content_hash)?;
             }
             DebouncedEventKind::Remove { file_name } => {
                 let sync_directory = self.sync_directory_for_path(&file_name)?;
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
                 let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
 
-                self.remove_file_by_id(sync_directory, file_id);
+                self.remove_file_by_id(sync_directory, file_id)?;
             }
         }
 
