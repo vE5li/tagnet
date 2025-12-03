@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fs::File, path::Path};
 
 use rusqlite::{
     Connection, ToSql,
@@ -42,19 +42,6 @@ pub struct Tag {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct File {
-    pub id: FileId,
-    pub path: String,
-    pub display_name: String,
-    // pub last_modified: String,
-    // pub content_length: String,
-    // pub content_type: String,
-    // pub has_preview: bool,
-    // pub preview_id: Option<PreviewId>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub enum DatabaseError {
     UnableToOpenOrCreate,
     FailedToExecuteCommand,
@@ -67,70 +54,78 @@ pub enum DatabaseError {
 }
 
 #[derive(Debug)]
-pub struct DatabaseHandle {
+pub struct FileDatabase {
     connection: Connection,
 }
 
-pub fn initialize(database_path: impl AsRef<Path>) -> Result<DatabaseHandle, DatabaseError> {
-    let connection =
-        Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
+impl FileDatabase {
+    pub fn initialize(database_path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        let connection =
+            Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
-    connection
-        .execute(
-            "CREATE TABLE IF NOT EXISTS files (
+        // TODO: Double check if it makes sense to store the display_name and the path separately.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS files (
             id              TEXT PRIMARY KEY,
             display_name    TEXT NOT NULL,
             path            TEXT
         )",
-            (), // empty list of parameters.
-        )
-        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-    connection
-        .execute(
-            "CREATE TABLE IF NOT EXISTS tags (
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS tags (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL UNIQUE,
             color       TEXT NOT NULL,
             metadata    TEXT
         )",
-            (), // empty list of parameters.
-        )
-        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-    connection
-        .execute(
-            "CREATE TABLE IF NOT EXISTS entries (
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS entries (
             id          TEXT PRIMARY KEY,
             tag_id      TEXT NOT NULL,
             target_id   TEXT NOT NULL,
             type        INTEGER,
             UNIQUE (tag_id, target_id, type)
         )",
-            (), // empty list of parameters.
-        )
-        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-    Ok(DatabaseHandle { connection })
-}
-
-impl DatabaseHandle {
-    /// Add a new file.
-    pub fn add_file(
-        &self,
-        display_name: String,
-        file_path: Option<String>,
-    ) -> Result<FileId, DatabaseError> {
-        let file_id = FileId::new();
-
-        self.connection
-            .execute(
-                "INSERT INTO files (id, display_name, path) VALUES (?1, ?2, ?3)",
-                (FileId::new(), display_name, file_path.unwrap_or_default()),
+                (), // empty list of parameters.
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(file_id)
+        Ok(Self { connection })
+    }
+
+    /// Add a new file.
+    pub fn add_file(
+        &self,
+        file_id: FileId,
+        display_name: String,
+        file_path: Option<String>,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO files (id, display_name, path) VALUES (?1, ?2, ?3)",
+                (file_id, display_name, file_path.unwrap_or_default()),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn remove_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
     }
 }
 
@@ -688,8 +683,16 @@ impl DatabaseHandle {
 */
 
 // TODO: Temporary functions to debug.
-impl DatabaseHandle {
+impl FileDatabase {
     pub fn show_files(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[allow(dead_code)]
+        pub struct File {
+            pub id: FileId,
+            pub path: String,
+            pub display_name: String,
+        }
+
         let mut statement = self
             .connection
             .prepare("SELECT id, path, display_name FROM files")
@@ -765,4 +768,152 @@ impl DatabaseHandle {
     //
     //     Ok(())
     // }
+}
+
+pub struct SyncDirectoryFile {
+    pub file_id: FileId,
+    pub path: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug)]
+pub struct SyncDirectoryDatabase {
+    connection: Connection,
+}
+
+impl SyncDirectoryDatabase {
+    pub fn initialize(database_path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        let connection =
+            Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
+
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS files (
+            id              TEXT PRIMARY KEY,
+            path            TEXT NOT NULL,
+            content_hash    TEXT
+        )",
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(Self { connection })
+    }
+
+    /// Add a new file.
+    pub fn add_file(
+        &self,
+        file_id: FileId,
+        path: &str,
+        content_hash: String,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO files (id, path, content_hash) VALUES (?1, ?2, ?3)",
+                (file_id, path, content_hash),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn update_file_content_hash(
+        &self,
+        file_id: FileId,
+        content_hash: String,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE files SET content_hash = ?2 WHERE id = ?1",
+                (file_id, content_hash),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn remove_file_by_id(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn remove_file_by_path(&self, path: &str) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM files WHERE path = ?1", [path])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn get_file_id(&self, path: &str) -> Result<FileId, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM files WHERE path = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let id = statement
+            .query_map([path], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|preview| preview.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(id)
+    }
+
+    pub fn get_all_files(&self) -> Result<Vec<SyncDirectoryFile>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path, content_hash FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(statement
+            .query_map([], |row| {
+                Ok(SyncDirectoryFile {
+                    file_id: row.get(0)?,
+                    path: row.get(1)?,
+                    content_hash: row.get(2)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .collect())
+    }
+}
+
+// TODO: Temporary functions to debug.
+impl SyncDirectoryDatabase {
+    pub fn show_files(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[allow(dead_code)]
+        pub struct File {
+            pub id: FileId,
+            pub path: String,
+            pub content_hash: String,
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path, content_hash FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    content_hash: row.get(2)?,
+                })
+            })
+            .unwrap();
+
+        for file in iterator {
+            println!("{:?}", file.unwrap());
+        }
+
+        Ok(())
+    }
 }

@@ -1,9 +1,25 @@
-use std::{io::Write, net::SocketAddr, path::PathBuf};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    io::{Read, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    time::Duration,
+};
 
+use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::StreamExt;
 
-use tagnet_core::state::Change;
+use notify::{RecursiveMode, Watcher};
+use rusqlite::Connection;
+use tagnet_core::{FileId, state::Change};
 use tokio::net::{TcpListener, TcpStream};
+use walkdir::WalkDir;
+
+use crate::{
+    configuration::{Configuration, SyncType},
+    database::{DatabaseError, FileDatabase, SyncDirectoryDatabase},
+    watcher::{DebouncedEventKind, create_dispatcher},
+};
 
 mod configuration;
 mod database;
@@ -34,13 +50,14 @@ async fn handle_connection(
     raw_stream: TcpStream,
     address: SocketAddr,
 ) {
-    println!("Incoming TCP connection from: {:?}", address);
+    log::debug!("Incoming TCP connection from: {:?}", address);
 
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
+    let Ok(ws_stream) = tokio_tungstenite::accept_async(raw_stream).await else {
+        log::error!("Error during the websocket handshake occurred");
+        return;
+    };
 
-    println!("WebSocket connection established: {:?}", address);
+    log::debug!("WebSocket connection established: {:?}", address);
 
     let (outgoing, mut incoming) = ws_stream.split();
 
@@ -54,13 +71,15 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    env_logger::init();
+
     let listener = TcpListener::bind("127.0.0.1:9001")
         .await
         .expect("Failed to bind");
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    tokio::spawn(configuration::setup(sender.clone()));
+    tokio::spawn(setup(sender.clone()));
 
     tokio::spawn(handle_changes(receiver));
 
@@ -72,7 +91,7 @@ async fn main() -> Result<(), std::io::Error> {
 }
 
 async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Change>) {
-    let handle = database::initialize("test.db").expect("Failed to open database file");
+    let database = FileDatabase::initialize("test.db").expect("Failed to open database file");
 
     while let Some(change) = receiver.recv().await {
         match change {
@@ -90,8 +109,8 @@ async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Chang
                 let mut file = std::fs::File::create(file_id.to_string()).unwrap();
                 file.write_all(&content).unwrap();
 
-                handle
-                    .add_file(display_name, file_path)
+                database
+                    .add_file(file_id, display_name, file_path)
                     .expect("Failed to add file to database");
             }
             Change::FileMoved {
@@ -99,8 +118,18 @@ async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Chang
                 display_name,
                 path,
             } => todo!(),
-            Change::FileChanged { file_id, content } => todo!(),
-            Change::FileDeleted { file_id } => todo!(),
+            Change::FileChanged { file_id, content } => {
+                // FIX: Don't unwrap.
+                let mut file = std::fs::File::create(file_id.to_string()).unwrap();
+                file.write_all(&content).unwrap();
+            }
+            Change::FileDeleted { file_id } => {
+                std::fs::remove_file(file_id.to_string()).expect("Failed to remove file");
+
+                database
+                    .remove_file(file_id)
+                    .expect("Failed to remove file");
+            }
             Change::TagAdded { tag_name, metadata } => todo!(),
             Change::TagRenamed { tag_id, tag_name } => todo!(),
             Change::TagChanged { tag_id, metadata } => todo!(),
@@ -129,10 +158,316 @@ async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Chang
             Change::TagUntagged { taggee_id, tag_id } => todo!(),
         }
 
-        println!("\n\n-- DEBUG --");
-        handle.show_files().unwrap();
+        println!("\n-- FILE DATABASE --");
+        database.show_files().unwrap();
         // handle.show_tags().unwrap();
         // handle.show_entries().unwrap();
         // handle.show_previews().unwrap();
+    }
+}
+
+struct RichSyncDirectory {
+    path: PathBuf,
+    sync_type: SyncType,
+    database: SyncDirectoryDatabase,
+}
+
+pub async fn setup(sender: tokio::sync::mpsc::UnboundedSender<Change>) {
+    let configuration = Configuration::new();
+
+    let (mut dispatcher, mut watcher_events) = create_dispatcher()
+        .await
+        .expect("Failed to set up debouncer");
+
+    let sync_directories = configuration
+        .sync_directories
+        .iter()
+        .filter_map(|sync_directory| {
+            let path = sync_directory.path.clone();
+
+            log::debug!(
+                "Setting up sync directory at {}",
+                sync_directory.path.to_string_lossy()
+            );
+
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                log::error!("Failed to create sync directory: {}", error);
+                return None;
+            }
+
+            if let Err(error) = dispatcher
+                .watcher()
+                .watch(path.as_ref(), RecursiveMode::Recursive)
+            {
+                log::error!("Failed to set up watcher for sync directory: {}", error);
+                return None;
+            }
+
+            // TODO: Improve the name selection.
+            let database_name = format!("{}.db", path.file_name().unwrap().to_string_lossy());
+
+            let database = match SyncDirectoryDatabase::initialize(database_name) {
+                Ok(database) => database,
+                Err(error) => {
+                    log::error!("Failed to set up sync directory database: {:?}", error);
+                    return None;
+                }
+            };
+
+            Some(RichSyncDirectory {
+                path,
+                sync_type: sync_directory.sync_type.clone(),
+                database,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for sync_directory in &sync_directories {
+        log::debug!(
+            "Checking for missed updates at {}",
+            sync_directory.path.to_string_lossy()
+        );
+
+        // TODO: Don't unwrap.
+        let files = sync_directory.database.get_all_files().unwrap();
+
+        for sync_file in files {
+            log::debug!("Checking file {}", sync_file.path);
+
+            let full_path = sync_directory.path.join(sync_file.path);
+
+            if !full_path.exists() {
+                log::info!("File was deleted without monitoring. Syncing deletion");
+
+                // FIX: Don't unwrap.
+                sync_directory
+                    .database
+                    .remove_file_by_id(sync_file.file_id)
+                    .unwrap();
+
+                // FIX:Don't unwrap.
+                // FIX:Handle send error.
+                let _ = sender.send(Change::FileDeleted {
+                    file_id: sync_file.file_id,
+                });
+
+                continue;
+            }
+
+            // FIX: Don't panic anywhere, just continue.
+            let mut file = std::fs::File::open(&full_path).expect("File cannot be opened");
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).expect("Failed to read file");
+
+            let mut hasher = DefaultHasher::new();
+            content.hash(&mut hasher);
+            let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
+
+            if content_hash != sync_file.content_hash {
+                log::info!("File was changed without monitoring. Syncing change");
+
+                sync_directory
+                    .database
+                    .update_file_content_hash(sync_file.file_id, content_hash)
+                    .expect("Failed to add file to database");
+
+                // FIX:Don't unwrap.
+                // FIX:Handle send error.
+                let _ = sender.send(Change::FileChanged {
+                    file_id: sync_file.file_id,
+                    content,
+                });
+            }
+        }
+
+        for entry in WalkDir::new(&sync_directory.path)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+        {
+            // TODO: Don't unwrap.
+            let path = PathBuf::from(entry.path().to_str().unwrap());
+            let Ok(relative_path) = path.strip_prefix(&sync_directory.path) else {
+                log::error!("Walkdir returned a path outside of the sync directory");
+                continue;
+            };
+
+            // TODO: Don't unwrap
+            match sync_directory
+                .database
+                .get_file_id(relative_path.to_str().unwrap())
+            {
+                // File is already tracked.
+                Ok(_) => {
+                    log::debug!(
+                        "File {} is already tracked",
+                        relative_path.to_string_lossy()
+                    );
+                }
+                Err(DatabaseError::MissingFile) => {
+                    log::info!("File was added without monitoring. Syncing addition");
+
+                    // Try to read the file
+                    // FIX: Don't panic anywhere, just continue.
+                    let mut file = std::fs::File::open(&path).expect("File doesn't exist");
+                    let mut content = Vec::new();
+                    file.read_to_end(&mut content).expect("Failed to read file");
+
+                    let mut hasher = DefaultHasher::new();
+                    content.hash(&mut hasher);
+                    let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
+
+                    // FIX: Don't panic.
+                    let display_name = path.file_name().expect("File is actually a directory");
+
+                    let file_id = FileId::new();
+
+                    // TODO: Don't unwrap.
+                    sync_directory
+                        .database
+                        .add_file(file_id, relative_path.to_str().unwrap(), content_hash)
+                        .unwrap();
+
+                    println!("\n-- SYNC DATABASE --");
+                    sync_directory.database.show_files().unwrap();
+
+                    // FIX:Don't unwrap.
+                    // FIX:Handle send error.
+                    let _ = sender.send(Change::FileAdded {
+                        file_id,
+                        display_name: display_name.to_str().unwrap().to_owned(),
+                        file_path: relative_path
+                            .parent()
+                            .map(|path| path.to_str().unwrap().to_owned()),
+                        content,
+                    });
+                }
+                Err(error) => {
+                    panic!("Database error: {:?}", error);
+                }
+            }
+        }
+    }
+
+    log::info!("Directories are fully synced");
+
+    while let Some(event) = watcher_events.recv().await {
+        log::debug!("Received event: {:?}", event.kind);
+
+        match event.kind {
+            DebouncedEventKind::Create { file_name } => {
+                let Some(sync_directory) = sync_directories
+                    .iter()
+                    .find(|sync_directory| file_name.starts_with(&sync_directory.path))
+                else {
+                    log::error!("Got a change from an unmonitored directory");
+                    continue;
+                };
+
+                // Try to read the file
+                // FIX: Don't panic anywhere, just continue.
+                let mut file = std::fs::File::open(&file_name).expect("File doesn't exist");
+                let mut content = Vec::new();
+                file.read_to_end(&mut content).expect("Failed to read file");
+
+                let mut hasher = DefaultHasher::new();
+                content.hash(&mut hasher);
+                let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
+
+                // FIX: Don't panic.
+                let display_name = file_name.file_name().expect("File is actually a directory");
+                let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
+
+                let file_id = FileId::new();
+
+                // TODO: Don't unwrap.
+                sync_directory
+                    .database
+                    .add_file(file_id, sync_relative_path.to_str().unwrap(), content_hash)
+                    .unwrap();
+
+                println!("\n-- SYNC DATABASE --");
+                sync_directory.database.show_files().unwrap();
+
+                // FIX:Don't unwrap.
+                // FIX:Handle send error.
+                let _ = sender.send(Change::FileAdded {
+                    file_id,
+                    display_name: display_name.to_str().unwrap().to_owned(),
+                    file_path: sync_relative_path
+                        .parent()
+                        .map(|path| path.to_str().unwrap().to_owned()),
+                    content,
+                });
+            }
+            DebouncedEventKind::Move { from, to } => {}
+            DebouncedEventKind::Modify { file_name } => {
+                let Some(sync_directory) = sync_directories
+                    .iter()
+                    .find(|sync_directory| file_name.starts_with(&sync_directory.path))
+                else {
+                    log::error!("Got a change from an unmonitored directory");
+                    continue;
+                };
+
+                let mut file = std::fs::File::open(&file_name).expect("File doesn't exist");
+                let mut content = Vec::new();
+                file.read_to_end(&mut content).expect("Failed to read file");
+
+                let mut hasher = DefaultHasher::new();
+                content.hash(&mut hasher);
+                let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
+
+                let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
+
+                // FIX: Don't unwrap.
+                let file_id = sync_directory
+                    .database
+                    .get_file_id(sync_relative_path.to_str().unwrap())
+                    .unwrap();
+
+                sync_directory
+                    .database
+                    .update_file_content_hash(file_id, content_hash)
+                    .expect("Failed to add file to database");
+
+                println!("\n-- SYNC DATABASE --");
+                sync_directory.database.show_files().unwrap();
+
+                // FIX:Don't unwrap.
+                // FIX:Handle send error.
+                let _ = sender.send(Change::FileChanged { file_id, content });
+            }
+            DebouncedEventKind::Remove { file_name } => {
+                let Some(sync_directory) = sync_directories
+                    .iter()
+                    .find(|sync_directory| file_name.starts_with(&sync_directory.path))
+                else {
+                    log::error!("Got a change from an unmonitored directory");
+                    continue;
+                };
+
+                let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
+
+                // FIX: Don't unwrap.
+                let file_id = sync_directory
+                    .database
+                    .get_file_id(sync_relative_path.to_str().unwrap())
+                    .unwrap();
+
+                // FIX: Don't unwrap.
+                sync_directory
+                    .database
+                    .remove_file_by_path(sync_relative_path.to_str().unwrap())
+                    .unwrap();
+
+                println!("\n-- SYNC DATABASE --");
+                sync_directory.database.show_files().unwrap();
+
+                // FIX:Don't unwrap.
+                // FIX:Handle send error.
+                let _ = sender.send(Change::FileDeleted { file_id });
+            }
+        }
     }
 }

@@ -93,6 +93,7 @@ pub mod state {
             file_path: Option<String>,
             // encoding: ,
             content: Vec<u8>,
+            // tags: Vec<TagId>,
         },
         FileMoved {
             file_id: FileId,

@@ -9,8 +9,7 @@ use std::{
 
 pub use notify;
 use notify::{
-    Event, RecommendedWatcher, Watcher,
-    event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
+    Event, EventKind, RecommendedWatcher, Watcher, event::{CreateKind, ModifyKind, RemoveKind, RenameMode}
 };
 
 #[derive(Clone, Debug)]
@@ -85,8 +84,8 @@ impl DebouncedEventKind {
 
 #[derive(Clone, Debug)]
 pub struct DebouncedEvent {
-    kind: DebouncedEventKind,
-    timestamp: Instant,
+    pub kind: DebouncedEventKind,
+    pub timestamp: Instant,
 }
 
 #[derive(Default)]
@@ -104,7 +103,7 @@ impl Debouncer {
         // NOTE: This code assumes that events will not be bundled. E.g. two create events being
         // combined into a single event with multiple paths.
         match event.kind {
-            notify::EventKind::Create(create_kind) => {
+            EventKind::Create(create_kind) => {
                 // We don't track the creation/deletion of directories. Directories are only
                 // tracked implicitely through the files that are contained in them.
                 if create_kind == CreateKind::File {
@@ -114,7 +113,7 @@ impl Debouncer {
                     split_new_events.push(DebouncedEventKind::Create { file_name });
                 }
             }
-            notify::EventKind::Modify(modify_kind) => {
+            EventKind::Modify(modify_kind) => {
                 match modify_kind {
                     ModifyKind::Data(_) => {
                         assert_eq!(event.paths.len(), 1, "Wrong number of paths");
@@ -158,7 +157,7 @@ impl Debouncer {
                     ModifyKind::Any | ModifyKind::Metadata(_) | ModifyKind::Other => {}
                 }
             }
-            notify::EventKind::Remove(remove_kind) => {
+            EventKind::Remove(remove_kind) => {
                 // We don't track the creation/deletion of directories. Directories are only
                 // tracked implicitely through the files that are contained in them.
                 if remove_kind == RemoveKind::File {
@@ -169,7 +168,7 @@ impl Debouncer {
                 }
             }
             // Not used, skip adding it.
-            notify::EventKind::Any | notify::EventKind::Access(_) | notify::EventKind::Other => {}
+            EventKind::Any | EventKind::Access(_) | EventKind::Other => {}
         }
 
         'insert: for new_event in split_new_events {
@@ -329,7 +328,7 @@ impl Debouncer {
         let mut debounced_events = Vec::new();
 
         self.queued.retain(|event| {
-            if event.timestamp.elapsed() > Duration::from_secs(1) {
+            if event.timestamp.elapsed() > Duration::from_millis(500) {
                 // TODO: Optimize to not clone.
                 debounced_events.push(event.clone());
                 return false;
@@ -360,9 +359,7 @@ impl Drop for WatchDispatcher {
     }
 }
 
-pub async fn create_dispatcher(
-    tick_rate: Duration,
-) -> Result<
+pub async fn create_dispatcher() -> Result<
     (
         WatchDispatcher,
         tokio::sync::mpsc::UnboundedReceiver<DebouncedEvent>,
@@ -381,7 +378,7 @@ pub async fn create_dispatcher(
             if stop_clone.load(Ordering::Acquire) {
                 break;
             }
-            tokio::time::sleep(tick_rate).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
 
             let mut debouncer = data_clone.lock().unwrap();
             for event in debouncer.extract_finalized() {
