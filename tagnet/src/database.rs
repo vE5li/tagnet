@@ -769,6 +769,7 @@ impl FileDatabase {
     // }
 }
 
+#[derive(Debug, Clone)]
 pub struct SyncDirectoryFile {
     pub file_id: FileId,
     pub path: String,
@@ -886,6 +887,30 @@ impl SyncDirectoryDatabase {
 
         Ok(statement
             .query_map([], |row| {
+                Ok(SyncDirectoryFile {
+                    file_id: row.get(0)?,
+                    path: row.get(1)?,
+                    content_hash: row.get(2)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .collect())
+    }
+
+    pub fn get_all_files_at(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<Vec<SyncDirectoryFile>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path, content_hash FROM files WHERE path LIKE ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let matcher = format!("{}%", path.as_ref());
+
+        Ok(statement
+            .query_map([matcher], |row| {
                 Ok(SyncDirectoryFile {
                     file_id: row.get(0)?,
                     path: row.get(1)?,

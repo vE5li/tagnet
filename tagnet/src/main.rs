@@ -1,8 +1,9 @@
 use std::{
+    fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -12,12 +13,15 @@ use futures_util::StreamExt;
 use notify::{RecursiveMode, Watcher};
 use rusqlite::Connection;
 use tagnet_core::{FileId, state::Change};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc::UnboundedSender,
+};
 use walkdir::WalkDir;
 
 use crate::{
     configuration::{Configuration, SyncType},
-    database::{DatabaseError, FileDatabase, SyncDirectoryDatabase},
+    database::{DatabaseError, FileDatabase, SyncDirectoryDatabase, SyncDirectoryFile},
     watcher::{DebouncedEventKind, WatchDispatcher},
 };
 
@@ -45,6 +49,14 @@ mod watcher;
 // admin@central
 // -> single connectino to an authorized account. This way everything will be forwarded.
 
+#[derive(Debug, Clone, Copy)]
+enum FooBarError {
+    UnmonitoredDirectory,
+    FailedToOpenFile,
+    FailedToReadFile,
+    MissingTrackedFile,
+}
+
 async fn handle_connection(
     sender: tokio::sync::mpsc::UnboundedSender<Change>,
     raw_stream: TcpStream,
@@ -69,6 +81,10 @@ async fn handle_connection(
     }
 }
 
+async fn handle_sync_directories(sender: UnboundedSender<Change>) {
+    SyncDirectoryManager::new(sender).await.run().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     env_logger::init();
@@ -79,8 +95,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    tokio::spawn(setup(sender.clone()));
-
+    tokio::spawn(handle_sync_directories(sender.clone()));
     tokio::spawn(handle_changes(receiver));
 
     while let Ok((stream, address)) = listener.accept().await {
@@ -171,330 +186,362 @@ struct RichSyncDirectory {
     database: SyncDirectoryDatabase,
 }
 
-pub async fn setup(sender: tokio::sync::mpsc::UnboundedSender<Change>) {
-    let configuration = Configuration::new();
+struct SyncDirectoryManager {
+    sync_directories: Vec<RichSyncDirectory>,
+    sender: tokio::sync::mpsc::UnboundedSender<Change>,
+    dispatcher: WatchDispatcher,
+    watcher_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
+}
 
-    let (mut dispatcher, mut watcher_events) = WatchDispatcher::new()
-        .await
-        .expect("Failed to set up debouncer");
+impl SyncDirectoryManager {
+    pub async fn new(sender: tokio::sync::mpsc::UnboundedSender<Change>) -> Self {
+        let configuration = Configuration::new();
 
-    let sync_directories = configuration
-        .sync_directories
-        .iter()
-        .filter_map(|sync_directory| {
-            let path = sync_directory.path.clone();
+        let (mut dispatcher, watcher_events) = WatchDispatcher::new()
+            .await
+            .expect("Failed to set up debouncer");
 
+        let sync_directories = configuration
+            .sync_directories
+            .iter()
+            .filter_map(|sync_directory| {
+                let path = sync_directory.path.clone();
+
+                log::debug!(
+                    "Setting up sync directory at {}",
+                    sync_directory.path.to_string_lossy()
+                );
+
+                if let Err(error) = std::fs::create_dir_all(&path) {
+                    log::error!("Failed to create sync directory: {}", error);
+                    return None;
+                }
+
+                if let Err(error) = dispatcher
+                    .watcher()
+                    .watch(path.as_ref(), RecursiveMode::Recursive)
+                {
+                    log::error!("Failed to set up watcher for sync directory: {}", error);
+                    return None;
+                }
+
+                // TODO: Improve the name selection.
+                let database_name = format!("{}.db", path.file_name().unwrap().to_string_lossy());
+
+                let database = match SyncDirectoryDatabase::initialize(database_name) {
+                    Ok(database) => database,
+                    Err(error) => {
+                        log::error!("Failed to set up sync directory database: {:?}", error);
+                        return None;
+                    }
+                };
+
+                Some(RichSyncDirectory {
+                    path,
+                    sync_type: sync_directory.sync_type.clone(),
+                    database,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            sync_directories,
+            sender,
+            dispatcher,
+            watcher_events,
+        }
+    }
+
+    fn add_file(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        path: impl AsRef<Path>,
+        content: Vec<u8>,
+        content_hash: String,
+    ) {
+        let file_id = FileId::new();
+
+        // TODO: Don't unwrap.
+        sync_directory
+            .database
+            .add_file(file_id, path.as_ref().to_string_lossy(), content_hash)
+            .unwrap();
+
+        // FIX:Handle send error.
+        let _ = self.sender.send(Change::FileAdded {
+            file_id,
+            path: path.as_ref().to_string_lossy().to_string(),
+            content,
+        });
+    }
+
+    fn get_file_content(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, String), FooBarError> {
+        let mut file = std::fs::File::open(path).map_err(|_| FooBarError::FailedToOpenFile)?;
+        let mut content = Vec::new();
+
+        file.read_to_end(&mut content)
+            .map_err(|_| FooBarError::FailedToReadFile)?;
+
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
+
+        Ok((content, content_hash))
+    }
+
+    fn update_file_content(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        file_id: FileId,
+        content: Vec<u8>,
+        content_hash: String,
+    ) {
+        // TODO: Don't panic
+        sync_directory
+            .database
+            .update_file_content_hash(file_id, content_hash)
+            .expect("Failed to pudate file content");
+
+        // FIX:Handle send error.
+        let _ = self.sender.send(Change::FileChanged { file_id, content });
+    }
+
+    fn update_file_path(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        file_id: FileId,
+        path: impl AsRef<Path>,
+    ) {
+        // TODO: Don't panic
+        sync_directory
+            .database
+            .update_file_path(file_id, path.as_ref().to_string_lossy())
+            .expect("Failed to update file path");
+
+        // FIX:Handle send error.
+        let _ = self.sender.send(Change::FileMoved {
+            file_id,
+            path: path.as_ref().to_string_lossy().to_string(),
+        });
+    }
+
+    fn remove_file_by_id(&self, sync_directory: &RichSyncDirectory, file_id: FileId) {
+        // FIX: Don't unwrap.
+        sync_directory.database.remove_file_by_id(file_id).unwrap();
+
+        // FIX:Handle send error.
+        let _ = self.sender.send(Change::FileDeleted { file_id });
+    }
+
+    fn get_all_files(
+        &self,
+        sync_directory: &RichSyncDirectory,
+    ) -> Result<Vec<SyncDirectoryFile>, FooBarError> {
+        sync_directory
+            .database
+            .get_all_files()
+            .map_err(|_| FooBarError::MissingTrackedFile)
+    }
+
+    fn get_all_files_at(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<SyncDirectoryFile>, FooBarError> {
+        sync_directory
+            .database
+            .get_all_files_at(path.as_ref().to_string_lossy())
+            .map_err(|_| FooBarError::MissingTrackedFile)
+    }
+
+    fn sync_directory_for_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<&RichSyncDirectory, FooBarError> {
+        self.sync_directories
+            .iter()
+            .find(|sync_directory| path.as_ref().starts_with(&sync_directory.path))
+            .ok_or(FooBarError::UnmonitoredDirectory)
+    }
+
+    fn get_file_id(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        path: impl AsRef<Path>,
+    ) -> Result<FileId, FooBarError> {
+        sync_directory
+            .database
+            .get_file_id(path.as_ref().to_string_lossy())
+            .map_err(|_| FooBarError::MissingTrackedFile)
+    }
+
+    fn run_initial_sync(&self) {
+        for sync_directory in &self.sync_directories {
             log::debug!(
-                "Setting up sync directory at {}",
+                "Checking for missed updates at {}",
                 sync_directory.path.to_string_lossy()
             );
 
-            if let Err(error) = std::fs::create_dir_all(&path) {
-                log::error!("Failed to create sync directory: {}", error);
-                return None;
-            }
-
-            if let Err(error) = dispatcher
-                .watcher()
-                .watch(path.as_ref(), RecursiveMode::Recursive)
-            {
-                log::error!("Failed to set up watcher for sync directory: {}", error);
-                return None;
-            }
-
-            // TODO: Improve the name selection.
-            let database_name = format!("{}.db", path.file_name().unwrap().to_string_lossy());
-
-            let database = match SyncDirectoryDatabase::initialize(database_name) {
-                Ok(database) => database,
+            let files = match self.get_all_files(sync_directory) {
+                Ok(files) => files,
                 Err(error) => {
-                    log::error!("Failed to set up sync directory database: {:?}", error);
-                    return None;
+                    log::error!("Failed to get list of tracked files: {:?}", error);
+                    continue;
                 }
             };
 
-            Some(RichSyncDirectory {
-                path,
-                sync_type: sync_directory.sync_type.clone(),
-                database,
-            })
-        })
-        .collect::<Vec<_>>();
+            for sync_file in files {
+                let full_path = sync_directory.path.join(sync_file.path);
 
-    for sync_directory in &sync_directories {
-        log::debug!(
-            "Checking for missed updates at {}",
-            sync_directory.path.to_string_lossy()
-        );
+                log::debug!("Checking file {}", full_path.to_string_lossy());
 
-        // TODO: Don't unwrap.
-        let files = sync_directory.database.get_all_files().unwrap();
-
-        for sync_file in files {
-            log::debug!("Checking file {}", sync_file.path);
-
-            let full_path = sync_directory.path.join(sync_file.path);
-
-            if !full_path.exists() {
-                log::info!(
-                    "File {} was deleted without monitoring. Syncing deletion",
-                    full_path.to_string_lossy()
-                );
-
-                // FIX: Don't unwrap.
-                sync_directory
-                    .database
-                    .remove_file_by_id(sync_file.file_id)
-                    .unwrap();
-
-                // FIX:Handle send error.
-                let _ = sender.send(Change::FileDeleted {
-                    file_id: sync_file.file_id,
-                });
-
-                continue;
-            }
-
-            // FIX: Don't panic anywhere, just continue.
-            let mut file = std::fs::File::open(&full_path).expect("File cannot be opened");
-            let mut content = Vec::new();
-            file.read_to_end(&mut content).expect("Failed to read file");
-
-            let mut hasher = DefaultHasher::new();
-            content.hash(&mut hasher);
-            let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
-            if content_hash != sync_file.content_hash {
-                log::info!(
-                    "File {} was changed without monitoring. Syncing change",
-                    full_path.to_string_lossy()
-                );
-
-                sync_directory
-                    .database
-                    .update_file_content_hash(sync_file.file_id, content_hash)
-                    .expect("Failed to add file to database");
-
-                // FIX:Handle send error.
-                let _ = sender.send(Change::FileChanged {
-                    file_id: sync_file.file_id,
-                    content,
-                });
-            }
-        }
-
-        for entry in WalkDir::new(&sync_directory.path)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let Ok(relative_path) = entry.path().strip_prefix(&sync_directory.path) else {
-                log::error!("Walkdir returned a path outside of the sync directory");
-                continue;
-            };
-
-            match sync_directory
-                .database
-                .get_file_id(relative_path.to_string_lossy())
-            {
-                // File is already tracked.
-                Ok(_) => {
-                    log::debug!(
-                        "File {} is already tracked",
-                        relative_path.to_string_lossy()
-                    );
-                }
-                Err(DatabaseError::MissingFile) => {
+                if !full_path.exists() {
                     log::info!(
-                        "File {} was added without monitoring. Syncing addition",
-                        entry.path().to_string_lossy()
+                        "File {} was deleted without monitoring. Syncing deletion",
+                        full_path.to_string_lossy()
                     );
 
-                    // Try to read the file
-                    // FIX: Don't panic anywhere, just continue.
-                    let mut file = std::fs::File::open(entry.path()).expect("File doesn't exist");
-                    let mut content = Vec::new();
-                    file.read_to_end(&mut content).expect("Failed to read file");
-
-                    let mut hasher = DefaultHasher::new();
-                    content.hash(&mut hasher);
-                    let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
-                    let file_id = FileId::new();
-
-                    // TODO: Don't unwrap.
-                    sync_directory
-                        .database
-                        .add_file(file_id, relative_path.to_string_lossy(), content_hash)
-                        .unwrap();
-
-                    println!("\n-- SYNC DATABASE --");
-                    sync_directory.database.show_files().unwrap();
-
-                    // FIX:Handle send error.
-                    let _ = sender.send(Change::FileAdded {
-                        file_id,
-                        path: relative_path.to_string_lossy().to_string(),
-                        content,
-                    });
+                    self.remove_file_by_id(sync_directory, sync_file.file_id);
+                    continue;
                 }
-                Err(error) => {
-                    panic!("Database error: {:?}", error);
+
+                let (content, content_hash) = match self.get_file_content(&full_path) {
+                    Ok((content, content_hash)) => (content, content_hash),
+                    Err(error) => {
+                        log::error!("Failed to read file content: {:?}", error);
+                        continue;
+                    }
+                };
+
+                if content_hash != sync_file.content_hash {
+                    log::info!(
+                        "File {} was changed without monitoring. Syncing change",
+                        full_path.to_string_lossy()
+                    );
+
+                    self.update_file_content(
+                        sync_directory,
+                        sync_file.file_id,
+                        content,
+                        content_hash,
+                    );
+                }
+            }
+
+            for entry in WalkDir::new(&sync_directory.path)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_file())
+            {
+                let Ok(relative_path) = entry.path().strip_prefix(&sync_directory.path) else {
+                    log::error!("Walkdir returned a path outside of the sync directory");
+                    continue;
+                };
+
+                match sync_directory
+                    .database
+                    .get_file_id(relative_path.to_string_lossy())
+                {
+                    // File is already tracked.
+                    Ok(_) => {
+                        log::debug!(
+                            "File {} is already tracked",
+                            relative_path.to_string_lossy()
+                        );
+                    }
+                    Err(DatabaseError::MissingFile) => {
+                        log::info!(
+                            "File {} was added without monitoring. Syncing addition",
+                            entry.path().to_string_lossy()
+                        );
+
+                        let (content, content_hash) = match self.get_file_content(entry.path()) {
+                            Ok((content, content_hash)) => (content, content_hash),
+                            Err(error) => {
+                                log::error!("Failed to read added file: {:?}", error);
+                                continue;
+                            }
+                        };
+
+                        self.add_file(sync_directory, relative_path, content, content_hash);
+                    }
+                    Err(error) => {
+                        panic!("Database error: {:?}", error);
+                    }
                 }
             }
         }
     }
 
-    log::info!("Directories are fully synced");
-
-    while let Some(event) = watcher_events.recv().await {
-        log::debug!("Received event: {:?}", event);
-
+    fn handle_event(&self, event: DebouncedEventKind) -> Result<(), FooBarError> {
         match event {
             DebouncedEventKind::Create { file_name } => {
-                let Some(sync_directory) = sync_directories
-                    .iter()
-                    .find(|sync_directory| file_name.starts_with(&sync_directory.path))
-                else {
-                    log::error!("Got a change from an unmonitored directory");
-                    continue;
-                };
-
-                // Try to read the file
-                // FIX: Don't panic anywhere, just continue.
-                let mut file = std::fs::File::open(&file_name).expect("File doesn't exist");
-                let mut content = Vec::new();
-                file.read_to_end(&mut content).expect("Failed to read file");
-
-                let mut hasher = DefaultHasher::new();
-                content.hash(&mut hasher);
-                let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
-                // FIX: Don't panic.
-                let display_name = file_name.file_name().expect("File is actually a directory");
+                let sync_directory = self.sync_directory_for_path(&file_name)?;
+                let (content, content_hash) = self.get_file_content(&file_name)?;
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
 
-                let file_id = FileId::new();
-
-                // TODO: Don't unwrap.
-                sync_directory
-                    .database
-                    .add_file(file_id, sync_relative_path.to_string_lossy(), content_hash)
-                    .unwrap();
-
-                println!("\n-- SYNC DATABASE --");
-                sync_directory.database.show_files().unwrap();
-
-                // FIX:Handle send error.
-                let _ = sender.send(Change::FileAdded {
-                    file_id,
-                    path: sync_relative_path.to_string_lossy().to_string(),
-                    content,
-                });
+                self.add_file(sync_directory, sync_relative_path, content, content_hash);
             }
             DebouncedEventKind::Move { from, to } => {
                 let any_path = from.as_ref().or(to.as_ref()).unwrap();
-
-                let Some(sync_directory) = sync_directories
-                    .iter()
-                    .find(|sync_directory| any_path.starts_with(&sync_directory.path))
-                else {
-                    log::error!("Got a change from an unmonitored directory");
-                    continue;
-                };
+                let sync_directory = self.sync_directory_for_path(any_path)?;
 
                 if let Some(from) = &from
                     && let Some(to) = &to
                 {
                     // Move within the directory.
 
-                    if to.is_file() {
-                        let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
-                        let relative_to = to.strip_prefix(&sync_directory.path).unwrap();
+                    let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
+                    let relative_to = to.strip_prefix(&sync_directory.path).unwrap();
 
-                        // FIX: Don't unwrap.
-                        let file_id = sync_directory
-                            .database
-                            .get_file_id(relative_from.to_string_lossy())
-                            .unwrap();
-
-                        sync_directory
-                            .database
-                            .update_file_path(file_id, relative_to.to_string_lossy())
-                            .unwrap();
-
-                        println!("\n-- SYNC DATABASE --");
-                        sync_directory.database.show_files().unwrap();
-
-                        // FIX:Handle send error.
-                        let _ = sender.send(Change::FileMoved {
-                            file_id,
-                            path: relative_to.to_string_lossy().to_string(),
-                        });
-                    } else if to.is_dir() {
-                        // TODO:
+                    if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
+                        self.update_file_path(sync_directory, file_id, relative_to);
                     } else {
-                        log::warn!(
-                            "A file that is not a regular file or a directory was detected. This is unsupported at the moment"
-                        );
+                        for sync_file in self.get_all_files_at(sync_directory, relative_from)? {
+                            let path = PathBuf::from(sync_file.path);
+                            let relative_path = path.strip_prefix(relative_from).unwrap();
+                            let new_path = relative_to.join(relative_path);
+
+                            self.update_file_path(sync_directory, sync_file.file_id, new_path);
+                        }
                     }
                 } else if let Some(from) = from {
                     // Files was moved here from outside of the synced directory.
 
-                    // TODO: Check doesn't work like that if the file is no longer there.
-                    // if from.is_file() {
-                    //     // FIX: Don't unwrap.
-                    //     let file_id = sync_directory
-                    //         .database
-                    //         .get_file_id(from.to_string_lossy())
-                    //         .unwrap();
-                    //
-                    //     sync_directory
-                    //         .database
-                    //         .update_file_path(file_id, from.to_string_lossy())
-                    //         .unwrap();
-                    // } else if from.is_dir() {
-                    //     // TODO:
-                    // } else {
-                    //     log::warn!(
-                    //         "A file that is not a regular file or a directory was detected. This is unsupported at the moment"
-                    //     );
-                    // }
+                    let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
+
+                    if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
+                        self.remove_file_by_id(sync_directory, file_id);
+                    } else {
+                        for sync_file in self.get_all_files_at(sync_directory, relative_from)? {
+                            self.remove_file_by_id(sync_directory, sync_file.file_id);
+                        }
+                    }
                 } else if let Some(to) = to {
                     // Files was moved outside of the synced directory.
 
                     if to.is_file() {
-                        // Try to read the file
-                        // FIX: Don't panic anywhere, just continue.
-                        let mut file = std::fs::File::open(&to).expect("File doesn't exist");
-                        let mut content = Vec::new();
-                        file.read_to_end(&mut content).expect("Failed to read file");
-
-                        let mut hasher = DefaultHasher::new();
-                        content.hash(&mut hasher);
-                        let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
+                        let (content, content_hash) = self.get_file_content(&to)?;
                         let sync_relative_path = to.strip_prefix(&sync_directory.path).unwrap();
 
-                        let file_id = FileId::new();
-
-                        // TODO: Don't unwrap.
-                        sync_directory
-                            .database
-                            .add_file(file_id, sync_relative_path.to_string_lossy(), content_hash)
-                            .unwrap();
-
-                        println!("\n-- SYNC DATABASE --");
-                        sync_directory.database.show_files().unwrap();
-
-                        // FIX:Handle send error.
-                        let _ = sender.send(Change::FileAdded {
-                            file_id,
-                            path: sync_relative_path.to_string_lossy().to_string(),
-                            content,
-                        });
+                        self.add_file(sync_directory, sync_relative_path, content, content_hash);
                     } else if to.is_dir() {
-                        // TODO:
+                        for entry in WalkDir::new(&to)
+                            .into_iter()
+                            .filter_map(|entry| entry.ok())
+                            .filter(|entry| entry.file_type().is_file())
+                        {
+                            let (content, content_hash) = self.get_file_content(entry.path())?;
+                            let sync_relative_path =
+                                entry.path().strip_prefix(&sync_directory.path).unwrap();
+
+                            self.add_file(
+                                sync_directory,
+                                sync_relative_path,
+                                content,
+                                content_hash,
+                            );
+                        }
                     } else {
                         log::warn!(
                             "A file that is not a regular file or a directory was detected. This is unsupported at the moment"
@@ -505,67 +552,36 @@ pub async fn setup(sender: tokio::sync::mpsc::UnboundedSender<Change>) {
                 }
             }
             DebouncedEventKind::Modify { file_name } => {
-                let Some(sync_directory) = sync_directories
-                    .iter()
-                    .find(|sync_directory| file_name.starts_with(&sync_directory.path))
-                else {
-                    log::error!("Got a change from an unmonitored directory");
-                    continue;
-                };
-
-                let mut file = std::fs::File::open(&file_name).expect("File doesn't exist");
-                let mut content = Vec::new();
-                file.read_to_end(&mut content).expect("Failed to read file");
-
-                let mut hasher = DefaultHasher::new();
-                content.hash(&mut hasher);
-                let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
+                let sync_directory = self.sync_directory_for_path(&file_name)?;
+                let (content, content_hash) = self.get_file_content(&file_name)?;
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
+                let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
 
-                // FIX: Don't unwrap.
-                let file_id = sync_directory
-                    .database
-                    .get_file_id(sync_relative_path.to_string_lossy())
-                    .unwrap();
-
-                sync_directory
-                    .database
-                    .update_file_content_hash(file_id, content_hash)
-                    .expect("Failed to add file to database");
-
-                println!("\n-- SYNC DATABASE --");
-                sync_directory.database.show_files().unwrap();
-
-                // FIX:Handle send error.
-                let _ = sender.send(Change::FileChanged { file_id, content });
+                self.update_file_content(sync_directory, file_id, content, content_hash);
             }
             DebouncedEventKind::Remove { file_name } => {
-                let Some(sync_directory) = sync_directories
-                    .iter()
-                    .find(|sync_directory| file_name.starts_with(&sync_directory.path))
-                else {
-                    log::error!("Got a change from an unmonitored directory");
-                    continue;
-                };
-
+                let sync_directory = self.sync_directory_for_path(&file_name)?;
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
+                let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
 
-                let file_id = sync_directory
-                    .database
-                    .get_file_id(sync_relative_path.to_string_lossy())
-                    .unwrap();
+                self.remove_file_by_id(sync_directory, file_id);
+            }
+        }
 
-                sync_directory
-                    .database
-                    .remove_file_by_path(sync_relative_path.to_string_lossy())
-                    .unwrap();
+        Ok(())
+    }
 
-                println!("\n-- SYNC DATABASE --");
-                sync_directory.database.show_files().unwrap();
+    pub async fn run(&mut self) {
+        self.run_initial_sync();
 
-                // FIX:Handle send error.
-                let _ = sender.send(Change::FileDeleted { file_id });
+        log::info!("Directories are fully synced");
+
+        while let Some(event) = self.watcher_events.recv().await {
+            log::debug!("Received event: {:?}", event);
+
+            // FIX: Don't drop events until they are processed correctly.
+            if let Err(error) = self.handle_event(event) {
+                log::error!("Failed to handle event: {:?}", error);
             }
         }
     }
