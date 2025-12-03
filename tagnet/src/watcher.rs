@@ -9,7 +9,8 @@ use std::{
 
 pub use notify;
 use notify::{
-    Event, EventKind, RecommendedWatcher, Watcher, event::{CreateKind, ModifyKind, RemoveKind, RenameMode}
+    Event, EventKind, RecommendedWatcher, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
 };
 
 #[derive(Clone, Debug)]
@@ -83,14 +84,14 @@ impl DebouncedEventKind {
 }
 
 #[derive(Clone, Debug)]
-pub struct DebouncedEvent {
+pub struct DebouncingEvent {
     pub kind: DebouncedEventKind,
     pub timestamp: Instant,
 }
 
 #[derive(Default)]
 struct Debouncer {
-    queued: Vec<DebouncedEvent>,
+    queued: Vec<DebouncingEvent>,
 }
 
 impl Debouncer {
@@ -317,20 +318,20 @@ impl Debouncer {
                 }
             }
 
-            self.queued.push(DebouncedEvent {
+            self.queued.push(DebouncingEvent {
                 kind: new_event,
                 timestamp,
             });
         }
     }
 
-    fn extract_finalized(&mut self) -> Vec<DebouncedEvent> {
+    fn extract_finalized(&mut self) -> Vec<DebouncedEventKind> {
         let mut debounced_events = Vec::new();
 
         self.queued.retain(|event| {
             if event.timestamp.elapsed() > Duration::from_millis(500) {
                 // TODO: Optimize to not clone.
-                debounced_events.push(event.clone());
+                debounced_events.push(event.kind.clone());
                 return false;
             }
 
@@ -348,6 +349,53 @@ pub struct WatchDispatcher {
 }
 
 impl WatchDispatcher {
+    pub async fn new() -> Result<
+        (
+            WatchDispatcher,
+            tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
+        ),
+        notify::Error,
+    > {
+        let debouncer = Arc::new(Mutex::new(Debouncer::default()));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let data_clone = debouncer.clone();
+        let stop_clone = stop.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if stop_clone.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                let mut debouncer = data_clone.lock().unwrap();
+                for event in debouncer.extract_finalized() {
+                    let _ = sender.send(event);
+                }
+            }
+        });
+
+        let watcher = RecommendedWatcher::new(
+            move |result: Result<Event, notify::Error>| {
+                if let Ok(event) = result {
+                    debouncer.lock().unwrap().push_raw(event);
+                }
+            },
+            notify::Config::default(),
+        )?;
+
+        Ok((
+            WatchDispatcher {
+                stop,
+                watcher,
+                _task: task,
+            },
+            receiver,
+        ))
+    }
+
     pub fn watcher(&mut self) -> &mut RecommendedWatcher {
         &mut self.watcher
     }
@@ -357,51 +405,4 @@ impl Drop for WatchDispatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
-}
-
-pub async fn create_dispatcher() -> Result<
-    (
-        WatchDispatcher,
-        tokio::sync::mpsc::UnboundedReceiver<DebouncedEvent>,
-    ),
-    notify::Error,
-> {
-    let debouncer = Arc::new(Mutex::new(Debouncer::default()));
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-
-    let data_clone = debouncer.clone();
-    let stop_clone = stop.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            if stop_clone.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-
-            let mut debouncer = data_clone.lock().unwrap();
-            for event in debouncer.extract_finalized() {
-                let _ = sender.send(event);
-            }
-        }
-    });
-
-    let watcher = RecommendedWatcher::new(
-        move |result: Result<Event, notify::Error>| {
-            if let Ok(event) = result {
-                debouncer.lock().unwrap().push_raw(event);
-            }
-        },
-        notify::Config::default(),
-    )?;
-
-    Ok((
-        WatchDispatcher {
-            stop,
-            watcher,
-            _task: task,
-        },
-        receiver,
-    ))
 }

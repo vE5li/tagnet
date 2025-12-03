@@ -63,13 +63,11 @@ impl FileDatabase {
         let connection =
             Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
-        // TODO: Double check if it makes sense to store the display_name and the path separately.
         connection
             .execute(
                 "CREATE TABLE IF NOT EXISTS files (
             id              TEXT PRIMARY KEY,
-            display_name    TEXT NOT NULL,
-            path            TEXT
+            path            TEXT NOT NULL
         )",
                 (), // empty list of parameters.
             )
@@ -104,17 +102,20 @@ impl FileDatabase {
     }
 
     /// Add a new file.
-    pub fn add_file(
-        &self,
-        file_id: FileId,
-        display_name: String,
-        file_path: Option<String>,
-    ) -> Result<(), DatabaseError> {
+    pub fn add_file(&self, file_id: FileId, path: String) -> Result<(), DatabaseError> {
         self.connection
             .execute(
-                "INSERT INTO files (id, display_name, path) VALUES (?1, ?2, ?3)",
-                (file_id, display_name, file_path.unwrap_or_default()),
+                "INSERT INTO files (id, path) VALUES (?1, ?2)",
+                (file_id, path),
             )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn update_file_path(&self, file_id: FileId, path: String) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("UPDATE files SET path = ?2 WHERE id = ?1", (file_id, path))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(())
@@ -690,12 +691,11 @@ impl FileDatabase {
         pub struct File {
             pub id: FileId,
             pub path: String,
-            pub display_name: String,
         }
 
         let mut statement = self
             .connection
-            .prepare("SELECT id, path, display_name FROM files")
+            .prepare("SELECT id, path FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -703,7 +703,6 @@ impl FileDatabase {
                 Ok(File {
                     id: row.get(0)?,
                     path: row.get(1)?,
-                    display_name: row.get(2)?,
                 })
             })
             .unwrap();
@@ -804,13 +803,13 @@ impl SyncDirectoryDatabase {
     pub fn add_file(
         &self,
         file_id: FileId,
-        path: &str,
+        path: impl AsRef<str>,
         content_hash: String,
     ) -> Result<(), DatabaseError> {
         self.connection
             .execute(
                 "INSERT INTO files (id, path, content_hash) VALUES (?1, ?2, ?3)",
-                (file_id, path, content_hash),
+                (file_id, path.as_ref(), content_hash),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -832,6 +831,21 @@ impl SyncDirectoryDatabase {
         Ok(())
     }
 
+    pub fn update_file_path(
+        &self,
+        file_id: FileId,
+        path: impl AsRef<str>,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE files SET path = ?2 WHERE id = ?1",
+                (file_id, path.as_ref()),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
     pub fn remove_file_by_id(&self, file_id: FileId) -> Result<(), DatabaseError> {
         self.connection
             .execute("DELETE FROM files WHERE id = ?1", [file_id])
@@ -840,22 +854,22 @@ impl SyncDirectoryDatabase {
         Ok(())
     }
 
-    pub fn remove_file_by_path(&self, path: &str) -> Result<(), DatabaseError> {
+    pub fn remove_file_by_path(&self, path: impl AsRef<str>) -> Result<(), DatabaseError> {
         self.connection
-            .execute("DELETE FROM files WHERE path = ?1", [path])
+            .execute("DELETE FROM files WHERE path = ?1", [path.as_ref()])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(())
     }
 
-    pub fn get_file_id(&self, path: &str) -> Result<FileId, DatabaseError> {
+    pub fn get_file_id(&self, path: impl AsRef<str>) -> Result<FileId, DatabaseError> {
         let mut statement = self
             .connection
             .prepare("SELECT id FROM files WHERE path = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let id = statement
-            .query_map([path], |row| row.get(0))
+            .query_map([path.as_ref()], |row| row.get(0))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .map(|preview| preview.unwrap())
             .next()

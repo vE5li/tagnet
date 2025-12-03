@@ -1,11 +1,6 @@
-use notify::Watcher;
-use std::{io::Read, net::IpAddr, path::PathBuf, time::Duration};
+use std::{net::IpAddr, path::PathBuf};
 
-use crate::watcher::{
-    DebouncedEvent, DebouncedEventKind, create_dispatcher,
-    notify::{EventKind, RecursiveMode},
-};
-use tagnet_core::{FileId, TagId, state::Change};
+use tagnet_core::TagId;
 
 pub struct Peer {
     pub address: IpAddr,

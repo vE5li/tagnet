@@ -62,17 +62,14 @@ async fn main() {
 
     match arguments.command {
         Commands::Upload { path } => {
-            // FIX: Decide this pased on path.
-            let file_path = None;
-
             let mut file = std::fs::File::open(&path).expect("File doesn't exist");
             let mut content = Vec::new();
             file.read_to_end(&mut content).expect("Failed to read file");
 
             let change = Change::FileAdded {
                 file_id: FileId::new(),
-                display_name: path.file_name().unwrap().to_str().unwrap().to_owned(),
-                file_path,
+                // FIX: Decide when to use the full path pased on command line arguments.
+                path: path.file_name().unwrap().to_string_lossy().to_string(),
                 content,
             };
 

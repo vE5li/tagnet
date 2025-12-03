@@ -89,16 +89,14 @@ pub mod state {
         // The client can't know the Id of the file initially.
         FileAdded {
             file_id: FileId,
-            display_name: String,
-            file_path: Option<String>,
+            path: String,
             // encoding: ,
             content: Vec<u8>,
             // tags: Vec<TagId>,
         },
         FileMoved {
             file_id: FileId,
-            display_name: String,
-            path: Option<String>,
+            path: String,
         },
         FileChanged {
             file_id: FileId,
