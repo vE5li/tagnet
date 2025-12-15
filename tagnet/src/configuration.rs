@@ -6,6 +6,9 @@ pub struct Peer {
     pub address: IpAddr,
     pub port: u16,
     pub user: String,
+    pub public_key: String,
+    pub synchronized_tags: Vec<TagId>,
+    pub synchronizes_all: bool,
 }
 
 #[derive(Debug, Clone)]

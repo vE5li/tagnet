@@ -13,7 +13,7 @@ use notify::{
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DebouncedEventKind {
     /// Creating of a *file*.
     Create { file_name: PathBuf },
@@ -359,23 +359,27 @@ impl WatchDispatcher {
         let debouncer = Arc::new(Mutex::new(Debouncer::default()));
 
         let stop = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        let data_clone = debouncer.clone();
-        let stop_clone = stop.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                if stop_clone.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+        let task = {
+            let debouncer = debouncer.clone();
+            let stop = stop.clone();
 
-                let mut debouncer = data_clone.lock().unwrap();
-                for event in debouncer.extract_finalized() {
-                    let _ = sender.send(event);
+            tokio::spawn(async move {
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+
+                    let mut debouncer = debouncer.lock().unwrap();
+                    for event in debouncer.extract_finalized() {
+                        let _ = event_sender.send(event);
+                    }
                 }
-            }
-        });
+            })
+        };
 
         let watcher = RecommendedWatcher::new(
             move |result: Result<Event, notify::Error>| {
@@ -392,7 +396,7 @@ impl WatchDispatcher {
                 watcher,
                 _task: task,
             },
-            receiver,
+            event_receiver,
         ))
     }
 

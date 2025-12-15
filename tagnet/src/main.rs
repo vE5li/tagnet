@@ -15,12 +15,12 @@ use rusqlite::Connection;
 use tagnet_core::{FileId, state::Change};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc::UnboundedSender,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 use walkdir::WalkDir;
 
 use crate::{
-    configuration::{Configuration, SyncType},
+    configuration::{Configuration, Peer, SyncDirectory, SyncType},
     database::{DatabaseError, FileDatabase, SyncDirectoryDatabase, SyncDirectoryFile},
     watcher::{DebouncedEventKind, WatchDispatcher},
 };
@@ -84,44 +84,63 @@ async fn handle_connection(
     }
 }
 
-async fn handle_sync_directories(sender: UnboundedSender<Change>) {
-    SyncDirectoryManager::new(sender).await.run().await;
-}
-
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     env_logger::init();
+
+    let configuration = Configuration::new();
 
     let listener = TcpListener::bind("127.0.0.1:9001")
         .await
         .expect("Failed to bind");
 
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (skip_sender, skip_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    tokio::spawn(handle_sync_directories(sender.clone()));
-    tokio::spawn(handle_changes(receiver));
+    tokio::spawn(handle_sync_directories(
+        configuration.sync_directories,
+        change_sender.clone(),
+        skip_receiver,
+    ));
+
+    tokio::spawn(handle_changes(
+        configuration.peers,
+        change_receiver,
+        skip_sender,
+    ));
 
     while let Ok((stream, address)) = listener.accept().await {
-        tokio::spawn(handle_connection(sender.clone(), stream, address));
+        tokio::spawn(handle_connection(change_sender.clone(), stream, address));
     }
 
     Ok(())
 }
 
-async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Change>) {
+async fn handle_sync_directories(
+    sync_directories: Vec<SyncDirectory>,
+    change_sender: UnboundedSender<Change>,
+    skip_events: UnboundedReceiver<DebouncedEventKind>,
+) {
+    SyncDirectoryManager::new(sync_directories, change_sender, skip_events)
+        .await
+        .run()
+        .await;
+}
+
+async fn handle_changes(
+    peers: Vec<Peer>,
+    mut change_receiver: tokio::sync::mpsc::UnboundedReceiver<Change>,
+    skip_sender: UnboundedSender<DebouncedEventKind>,
+) {
     let database = FileDatabase::initialize("test.db").expect("Failed to open database file");
 
-    while let Some(change) = receiver.recv().await {
+    while let Some(change) = change_receiver.recv().await {
         match change {
             Change::FileAdded {
                 file_id,
                 path,
                 content,
             } => {
-                // let path = file_path.as_ref().map(|file_path| {
-                //     PathBuf::try_from(file_path).expect("Failed to parse file buffer")
-                // });
-
                 // FIX: Don't unwrap.
                 let mut file = std::fs::File::create(file_id.to_string()).unwrap();
                 file.write_all(&content).unwrap();
@@ -129,6 +148,10 @@ async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Chang
                 database
                     .add_file(file_id, path)
                     .expect("Failed to add file to database");
+
+                // TODO: We need to know where this change comes from.
+                // If it does not come from this system we also need to create the file in the sync
+                // directories *and* ignore the event.
             }
             Change::FileMoved { file_id, path } => {
                 database
@@ -147,32 +170,47 @@ async fn handle_changes(mut receiver: tokio::sync::mpsc::UnboundedReceiver<Chang
                     .remove_file(file_id)
                     .expect("Failed to remove file");
             }
-            Change::TagAdded { tag_name, metadata } => todo!(),
-            Change::TagRenamed { tag_id, tag_name } => todo!(),
-            Change::TagChanged { tag_id, metadata } => todo!(),
-            Change::TagRemoved { tag_id } => todo!(),
+            Change::TagAdded {
+                tag_name: _,
+                metadata: _,
+            } => todo!(),
+            Change::TagRenamed {
+                tag_id: _,
+                tag_name: _,
+            } => todo!(),
+            Change::TagChanged {
+                tag_id: _,
+                metadata: _,
+            } => todo!(),
+            Change::TagRemoved { tag_id: _ } => todo!(),
             Change::FileTagged {
-                file_id,
-                tag_id,
-                metadata,
+                file_id: _,
+                tag_id: _,
+                metadata: _,
             } => todo!(),
             Change::FileTagChanged {
-                file_id,
-                tag_id,
-                metadata,
+                file_id: _,
+                tag_id: _,
+                metadata: _,
             } => todo!(),
-            Change::FileUntagged { file_id, tag_id } => todo!(),
+            Change::FileUntagged {
+                file_id: _,
+                tag_id: _,
+            } => todo!(),
             Change::TagTagged {
-                taggee_id,
-                tag_id,
-                metadata,
+                taggee_id: _,
+                tag_id: _,
+                metadata: _,
             } => todo!(),
             Change::TagTagChanged {
-                taggee_id,
-                tag_id,
-                metadata,
+                taggee_id: _,
+                tag_id: _,
+                metadata: _,
             } => todo!(),
-            Change::TagUntagged { taggee_id, tag_id } => todo!(),
+            Change::TagUntagged {
+                taggee_id: _,
+                tag_id: _,
+            } => todo!(),
         }
 
         println!("\n-- FILE DATABASE --");
@@ -191,21 +229,23 @@ struct RichSyncDirectory {
 
 struct SyncDirectoryManager {
     sync_directories: Vec<RichSyncDirectory>,
-    sender: tokio::sync::mpsc::UnboundedSender<Change>,
-    dispatcher: WatchDispatcher,
+    change_sender: tokio::sync::mpsc::UnboundedSender<Change>,
+    _dispatcher: WatchDispatcher,
     watcher_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
+    skip_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
 }
 
 impl SyncDirectoryManager {
-    pub async fn new(sender: tokio::sync::mpsc::UnboundedSender<Change>) -> Self {
-        let configuration = Configuration::new();
-
+    pub async fn new(
+        sync_directories: Vec<SyncDirectory>,
+        change_sender: tokio::sync::mpsc::UnboundedSender<Change>,
+        skip_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
+    ) -> Self {
         let (mut dispatcher, watcher_events) = WatchDispatcher::new()
             .await
             .expect("Failed to set up debouncer");
 
-        let sync_directories = configuration
-            .sync_directories
+        let sync_directories = sync_directories
             .iter()
             .filter_map(|sync_directory| {
                 let path = sync_directory.path.clone();
@@ -249,9 +289,10 @@ impl SyncDirectoryManager {
 
         Self {
             sync_directories,
-            sender,
-            dispatcher,
+            change_sender,
+            _dispatcher: dispatcher,
             watcher_events,
+            skip_events,
         }
     }
 
@@ -269,28 +310,14 @@ impl SyncDirectoryManager {
             .add_file(file_id, path.as_ref().to_string_lossy(), content_hash)
             .map_err(|_| FooBarError::FailedAddingFile)?;
 
-        // FIX:Handle send error.
-        let _ = self.sender.send(Change::FileAdded {
+        // FIX: Put this into a queue for proper retry handling instead.
+        let _ = self.change_sender.send(Change::FileAdded {
             file_id,
             path: path.as_ref().to_string_lossy().to_string(),
             content,
         });
 
         Ok(())
-    }
-
-    fn get_file_content(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, String), FooBarError> {
-        let mut file = std::fs::File::open(path).map_err(|_| FooBarError::FailedToOpenFile)?;
-        let mut content = Vec::new();
-
-        file.read_to_end(&mut content)
-            .map_err(|_| FooBarError::FailedToReadFile)?;
-
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
-        Ok((content, content_hash))
     }
 
     fn update_file_content(
@@ -305,8 +332,10 @@ impl SyncDirectoryManager {
             .update_file_content_hash(file_id, content_hash)
             .map_err(|_| FooBarError::FailedUpdatingFile)?;
 
-        // FIX:Handle send error.
-        let _ = self.sender.send(Change::FileChanged { file_id, content });
+        // FIX: Put this into a queue for proper retry handling instead.
+        let _ = self
+            .change_sender
+            .send(Change::FileChanged { file_id, content });
 
         Ok(())
     }
@@ -322,8 +351,8 @@ impl SyncDirectoryManager {
             .update_file_path(file_id, path.as_ref().to_string_lossy())
             .map_err(|_| FooBarError::FailedUpdatingFile)?;
 
-        // FIX:Handle send error.
-        let _ = self.sender.send(Change::FileMoved {
+        // FIX: Put this into a queue for proper retry handling instead.
+        let _ = self.change_sender.send(Change::FileMoved {
             file_id,
             path: path.as_ref().to_string_lossy().to_string(),
         });
@@ -341,8 +370,8 @@ impl SyncDirectoryManager {
             .remove_file_by_id(file_id)
             .map_err(|_| FooBarError::FailedRemovingFile)?;
 
-        // FIX:Handle send error.
-        let _ = self.sender.send(Change::FileDeleted { file_id });
+        // FIX: Put this into a queue for proper retry handling instead.
+        let _ = self.change_sender.send(Change::FileDeleted { file_id });
 
         Ok(())
     }
@@ -366,6 +395,20 @@ impl SyncDirectoryManager {
             .database
             .get_all_files_at(path.as_ref().to_string_lossy())
             .map_err(|_| FooBarError::MissingTrackedFile)
+    }
+
+    fn get_file_content(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, String), FooBarError> {
+        let mut file = std::fs::File::open(path).map_err(|_| FooBarError::FailedToOpenFile)?;
+        let mut content = Vec::new();
+
+        file.read_to_end(&mut content)
+            .map_err(|_| FooBarError::FailedToReadFile)?;
+
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
+
+        Ok((content, content_hash))
     }
 
     fn sync_directory_for_path(
@@ -611,12 +654,37 @@ impl SyncDirectoryManager {
 
         log::info!("Directories are fully synced");
 
-        while let Some(event) = self.watcher_events.recv().await {
-            log::debug!("Received event: {:?}", event);
+        // TODO: Check for skip entries that are too old somewhere.
+        // Likely also needs to save the timestamp for that.
+        let mut skip_queue = Vec::new();
 
-            // FIX: Don't drop events until they are processed correctly.
-            if let Err(error) = self.handle_event(event) {
-                log::error!("Failed to handle event: {:?}", error);
+        loop {
+            tokio::select! {
+                skip_event = self.skip_events.recv() => {
+                    let Some(event) = skip_event else {
+                        // TODO: Maybe this is an error?
+                        break;
+                    };
+
+                    skip_queue.push(event);
+                },
+                watcher_event = self.watcher_events.recv() => {
+                    let Some(event) = watcher_event else {
+                        // TODO: Maybe this is an error?
+                        break;
+                    };
+
+                    log::debug!("Received event: {:?}", event);
+
+                    if let Some(index) = skip_queue.iter().position(|skip_event| *skip_event == event) {
+                        log::debug!("Event was emitted locally and will thus be ignored");
+                        skip_queue.remove(index);
+                    }
+
+                    if let Err(error) = self.handle_event(event) {
+                        log::error!("Failed to handle event: {:?}", error);
+                    }
+                },
             }
         }
     }
