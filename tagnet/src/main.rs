@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
@@ -10,6 +11,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::StreamExt;
 
+use clap::{Parser, Subcommand, ValueEnum, command};
 use notify::{RecursiveMode, Watcher};
 use rusqlite::Connection;
 use tagnet_core::{FileId, state::Change};
@@ -20,7 +22,7 @@ use tokio::{
 use walkdir::WalkDir;
 
 use crate::{
-    configuration::{Configuration, Peer, SyncDirectory, SyncType},
+    configuration::{Configuration, Peer, RuntimeConfiguration, SyncDirectory, SyncType},
     database::{DatabaseError, FileDatabase, SyncDirectoryDatabase, SyncDirectoryFile},
     watcher::{DebouncedEventKind, WatchDispatcher},
 };
@@ -84,33 +86,57 @@ async fn handle_connection(
     }
 }
 
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+struct Arguments {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Generate { file_name: PathBuf },
+    Run { configuration_file: PathBuf },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     env_logger::init();
 
-    let configuration = Configuration::new();
+    let arguments = Arguments::parse();
 
-    let listener = TcpListener::bind("127.0.0.1:9001")
-        .await
-        .expect("Failed to bind");
+    match arguments.command {
+        Commands::Generate { file_name } => {
+            let configuration = Configuration::new_example();
+            configuration.write_to_file(file_name);
+        }
+        Commands::Run { configuration_file } => {
+            let configuration = Configuration::new(configuration_file);
+            let runtime_configuration = RuntimeConfiguration::new(&configuration);
 
-    let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let (skip_sender, skip_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let listener = TcpListener::bind("127.0.0.1:9001")
+                .await
+                .expect("Failed to bind");
 
-    tokio::spawn(handle_sync_directories(
-        configuration.sync_directories,
-        change_sender.clone(),
-        skip_receiver,
-    ));
+            let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (skip_sender, skip_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-    tokio::spawn(handle_changes(
-        configuration.peers,
-        change_receiver,
-        skip_sender,
-    ));
+            tokio::spawn(handle_sync_directories(
+                configuration.sync_directories,
+                change_sender.clone(),
+                skip_receiver,
+            ));
 
-    while let Ok((stream, address)) = listener.accept().await {
-        tokio::spawn(handle_connection(change_sender.clone(), stream, address));
+            tokio::spawn(handle_changes(
+                configuration.peers,
+                change_receiver,
+                skip_sender,
+            ));
+
+            while let Ok((stream, address)) = listener.accept().await {
+                tokio::spawn(handle_connection(change_sender.clone(), stream, address));
+            }
+        }
     }
 
     Ok(())
