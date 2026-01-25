@@ -165,6 +165,44 @@ impl FileDatabase {
         Ok(())
     }
 
+    pub fn update_tag_name(
+        &self,
+        tag_id: TagId,
+        name: impl Into<String>,
+    ) -> Result<(), DatabaseError> {
+        let name = name.into();
+
+        // TODO: Check that the tag name is not only numbers.
+        if name.is_empty() {
+            return Err(DatabaseError::InvalidTagName);
+        }
+
+        self.connection
+            .execute("UPDATE tags SET name = ?2 WHERE id = ?1", (tag_id, name))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn update_tag_color(
+        &self,
+        tag_id: TagId,
+        color: impl Into<String>,
+    ) -> Result<(), DatabaseError> {
+        let color = color.into();
+
+        // TODO: Check that the tag name is not only numbers.
+        if color.is_empty() {
+            return Err(DatabaseError::InvalidColor);
+        }
+
+        self.connection
+            .execute("UPDATE tags SET color = ?2 WHERE id = ?1", (tag_id, color))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
     pub fn remove_tag(&self, tag_id: TagId) -> Result<(), DatabaseError> {
         self.connection
             .execute("DELETE FROM tags WHERE id = ?1", [&tag_id])
@@ -424,90 +462,9 @@ impl FileDatabase {
 
         Ok(tags)
     }
-}
-
-/*
-    // pub fn get_preview(
-    //     &self,
-    //     preview_id: PreviewId,
-    //     preview_size: PreviewSize,
-    //     // TODO: Not a DatabaseError, might also be a client (Nextcloud) error.
-    // ) -> Result<String, DatabaseError> {
-    //     let column = match preview_size {
-    //         PreviewSize::Small => "small",
-    //         PreviewSize::Medium => "medium",
-    //         PreviewSize::Big => "big",
-    //     };
-    //
-    //     let query = format!("SELECT {column} FROM previews WHERE id = ?1");
-    //     let mut statement = self
-    //         .connection
-    //         .prepare(&query)
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let preview = statement
-    //         .query_map([preview_id], |row| row.get(0))
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-    //         .map(|preview| preview.unwrap())
-    //         .next()
-    //         .ok_or(DatabaseError::MissingFile)?;
-    //
-    //     Ok(preview)
-    // }
-    //
-    // pub fn set_preview(
-    //     &self,
-    //     file_id: FileId,
-    //     previews: (String, String, String),
-    // ) -> Result<PreviewId, DatabaseError> {
-    //     self.connection
-    //         .execute(
-    //             "INSERT INTO previews (small, medium, big) VALUES (?1, ?2, ?3)",
-    //             previews,
-    //         )
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let preview_id = PreviewId(self.connection.last_insert_rowid());
-    //
-    //     self.connection
-    //         .execute(
-    //             "UPDATE files SET preview_id = ?2 WHERE id = ?1",
-    //             (file_id, Some(preview_id)),
-    //         )
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     Ok(preview_id)
-    // }
-
-    /// Get all files.
-    pub fn all_files(&self) -> Result<impl IntoIterator<Item = File>, DatabaseError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, path, display_name, last_modified, content_length, content_type, has_preview, preview_id FROM files")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let file_list = statement
-            .query_map([], |row| {
-                Ok(File {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    display_name: row.get(2)?,
-                    last_modified: row.get(3)?,
-                    content_length: row.get(4)?,
-                    content_type: row.get(5)?,
-                    has_preview: row.get(6)?,
-                    preview_id: row.get(7)?,
-                })
-            })
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|file| file.unwrap())
-            .collect::<Vec<_>>();
-
-        Ok(file_list)
-    }
 
     /// Get all tags.
-    pub fn all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
+    pub fn get_all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
         let mut statement = self
             .connection
             .prepare("SELECT id, name, color FROM tags")
@@ -519,6 +476,7 @@ impl FileDatabase {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     color: row.get(2)?,
+                    metadata: None,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -527,62 +485,6 @@ impl FileDatabase {
 
         Ok(tag_list)
     }
-
-    /// Get a file by its ID.
-    pub fn file_from_id(&self, file_id: FileId) -> Result<File, DatabaseError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT path, display_name, last_modified, content_length, content_type, has_preview, preview_id FROM files WHERE id = ?1")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let file = statement
-            .query_map([file_id], |row| {
-                Ok(File {
-                    id: file_id,
-                    path: row.get(0)?,
-                    display_name: row.get(1)?,
-                    last_modified: row.get(2)?,
-                    content_length: row.get(3)?,
-                    content_type: row.get(4)?,
-                    has_preview: row.get(5)?,
-                    preview_id: row.get(6)?,
-                })
-            })
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .map(|file| file.unwrap())
-            .next()
-            .ok_or(DatabaseError::MissingFile)?;
-
-        Ok(file)
-    }
-
-    /// Get the a file by its preview ID.
-    // pub fn file_from_preview_id(&self, preview_id: PreviewId) -> Result<File, DatabaseError> {
-    //     let mut statement = self
-    //         .connection
-    //         .prepare("SELECT id, path, display_name, last_modified, content_length, content_type FROM files WHERE preview = ?1")
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let file = statement
-    //         .query_map([Some(preview_id)], |row| {
-    //             Ok(File {
-    //                 id: row.get(0)?,
-    //                 path: row.get(1)?,
-    //                 display_name: row.get(2)?,
-    //                 last_modified: row.get(3)?,
-    //                 content_length: row.get(4)?,
-    //                 content_type: row.get(5)?,
-    //
-    //                 preview: Some(preview_id),
-    //             })
-    //         })
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-    //         .map(|file| file.unwrap())
-    //         .next()
-    //         .ok_or(DatabaseError::MissingFile)?;
-    //
-    //     Ok(file)
-    // }
 
     /// Get the name of a tag by the ID.
     pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
@@ -597,6 +499,7 @@ impl FileDatabase {
                     id: tag_id,
                     name: row.get(0)?,
                     color: row.get(1)?,
+                    metadata: None,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -608,10 +511,7 @@ impl FileDatabase {
     }
 
     /// Get the ID of a file by the path.
-    pub fn file_id_from_path(
-        &self,
-        file_path: impl AsRef<OsString>,
-    ) -> Result<FileId, DatabaseError> {
+    pub fn file_id_from_path(&self, file_path: impl AsRef<Path>) -> Result<FileId, DatabaseError> {
         let file_path = file_path
             .as_ref()
             .to_str()
@@ -648,51 +548,11 @@ impl FileDatabase {
 
         Ok(tag_id)
     }
-
-    pub fn update_tag_name(
-        &self,
-        tag_id: TagId,
-        name: impl Into<String>,
-    ) -> Result<(), DatabaseError> {
-        let name = name.into();
-
-        // TODO: Check that the tag name is not only numbers.
-        if name.is_empty() {
-            return Err(DatabaseError::InvalidTagName);
-        }
-
-        self.connection
-            .execute("UPDATE tags SET name = ?2 WHERE id = ?1", (tag_id, name))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        Ok(())
-    }
-
-    pub fn update_tag_color(
-        &self,
-        tag_id: TagId,
-        color: impl Into<String>,
-    ) -> Result<(), DatabaseError> {
-        let color = color.into();
-
-        // TODO: Check that the tag name is not only numbers.
-        if color.is_empty() {
-            return Err(DatabaseError::InvalidColor);
-        }
-
-        self.connection
-            .execute("UPDATE tags SET color = ?2 WHERE id = ?1", (tag_id, color))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        Ok(())
-    }
 }
-
-*/
 
 // TODO: Temporary functions to debug.
 impl FileDatabase {
-    pub fn show_files(&self) -> Result<(), DatabaseError> {
+    pub fn show_content(&self, include_raw: bool) -> Result<(), DatabaseError> {
         #[derive(Debug, Serialize, Deserialize)]
         #[allow(dead_code)]
         pub struct File {
@@ -700,28 +560,6 @@ impl FileDatabase {
             pub path: String,
         }
 
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, path FROM files")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let iterator = statement
-            .query_map([], |row| {
-                Ok(File {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                })
-            })
-            .unwrap();
-
-        for file in iterator {
-            println!("{:?}", file.unwrap());
-        }
-
-        Ok(())
-    }
-
-    pub fn show_tags(&self) -> Result<(), DatabaseError> {
         #[derive(Debug, Serialize, Deserialize)]
         #[allow(dead_code)]
         pub struct Tag {
@@ -730,12 +568,36 @@ impl FileDatabase {
             pub color: String,
         }
 
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Entry {
+            tag_id: TagId,
+            target_id_as_file_id: FileId,
+            target_id_as_tag_id: TagId,
+            r#type: EntryType,
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let files = statement
+            .query_map([], |row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                })
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+
         let mut statement = self
             .connection
             .prepare("SELECT id, name, color FROM tags")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        let iterator = statement
+        let tags = statement
             .query_map([], |row| {
                 Ok(Tag {
                     id: row.get(0)?,
@@ -743,45 +605,104 @@ impl FileDatabase {
                     color: row.get(2)?,
                 })
             })
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
 
-        for tag in iterator {
-            println!("{:?}", tag.unwrap());
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id, target_id, type FROM entries")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let entries = statement
+            .query_map([], |row| {
+                Ok(Entry {
+                    tag_id: row.get(0)?,
+                    target_id_as_file_id: row.get(1)?,
+                    target_id_as_tag_id: row.get(1)?,
+                    r#type: row.get(2)?,
+                })
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        if include_raw {
+            for file in &files {
+                println!("{:?}", file.as_ref().unwrap());
+            }
+
+            for tag in &tags {
+                println!("{:?}", tag.as_ref().unwrap());
+            }
+
+            for entry in &entries {
+                println!("{:?}", entry.as_ref().unwrap());
+            }
+        }
+
+        for file in &files {
+            let file = file.as_ref().unwrap();
+
+            let tags = entries
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    (entry.r#type == EntryType::File && entry.target_id_as_file_id == file.id)
+                        .then_some(entry)
+                })
+                .map(|entry| {
+                    tags.iter()
+                        .find(|tag| {
+                            let tag = tag.as_ref().unwrap();
+                            tag.id == entry.tag_id
+                        })
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                })
+                .map(|tag| format!("\x1B[0;31m{}\x1B[0m", tag.name))
+                .collect::<Vec<String>>();
+
+            println!(
+                "\x1B[0;34m{}\x1B[0m | \x1B[0;35m{}\x1B[0m | {}",
+                file.id.to_string(),
+                file.path,
+                tags.join(", ")
+            );
+        }
+
+        for tag in &tags {
+            let tag = tag.as_ref().unwrap();
+
+            let tags = entries
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    (entry.r#type == EntryType::Tag && entry.target_id_as_tag_id == tag.id)
+                        .then_some(entry)
+                })
+                .map(|entry| {
+                    tags.iter()
+                        .find(|tag| {
+                            let tag = tag.as_ref().unwrap();
+                            tag.id == entry.tag_id
+                        })
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                })
+                .map(|tag| format!("\x1B[0;32m{}\x1B[0m", tag.name))
+                .collect::<Vec<String>>();
+
+            println!(
+                "\x1B[0;36m{}\x1B[0m | \x1B[0;33m{}\x1B[0m | {}",
+                tag.id.to_string(),
+                tag.name,
+                tags.join(", ")
+            );
         }
 
         Ok(())
     }
-
-    // pub fn show_entries(&self) -> Result<(), DatabaseError> {
-    //     #[derive(Debug)]
-    //     #[allow(dead_code)]
-    //     struct Entry {
-    //         tag_id: TagId,
-    //         target_id: i64,
-    //         r#type: EntryType,
-    //     }
-    //
-    //     let mut statement = self
-    //         .connection
-    //         .prepare("SELECT tag_id, target_id, type FROM entries")
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let iterator = statement
-    //         .query_map([], |row| {
-    //             Ok(Entry {
-    //                 tag_id: row.get(0)?,
-    //                 target_id: row.get(1)?,
-    //                 r#type: row.get(2)?,
-    //             })
-    //         })
-    //         .unwrap();
-    //
-    //     for entry in iterator {
-    //         println!("{:?}", entry.unwrap());
-    //     }
-    //
-    //     Ok(())
-    // }
 }
 
 #[derive(Debug, Clone)]

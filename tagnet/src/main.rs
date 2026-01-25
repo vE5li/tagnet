@@ -1,4 +1,4 @@
-use std::{ffi::OsString, io::Write, net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf};
 
 use futures_util::StreamExt;
 
@@ -15,76 +15,13 @@ use tokio::{
 use crate::{
     configuration::{Configuration, RuntimeConfiguration, SyncType},
     database::FileDatabase,
-    directory_manager::SyncDirectoryManager,
+    directory_manager::{SyncDirectoryCommand, SyncDirectoryManager},
 };
 
 mod configuration;
 mod database;
 mod directory_manager;
 mod watcher;
-
-// ## On the server:
-//
-// /home/foo/cloud
-// -> configured as "any file". Special type of sync connection that stores all
-//    files by their hash, without any subdirectories.
-//
-// lucas@computer
-// lucas@laptop
-// -> configure connections with a user specific (likely during connection buildup) to enforce
-//    visibility.
-
-// ## On the client:
-//
-// /home/foo/some-tag
-// /home/foo/other-tag
-// -> configured as "everything with tag x". Regular two way sync.
-//
-// admin@central
-// -> single connectino to an authorized account. This way everything will be forwarded.
-
-#[derive(Debug, Clone, Copy)]
-enum FooBarError {
-    UnmonitoredDirectory,
-    FailedToOpenFile,
-    FailedToReadFile,
-    MissingTrackedFile,
-    FailedAddingFile,
-    FailedUpdatingFile,
-    FailedRemovingFile,
-}
-
-async fn handle_connection(
-    sender: tokio::sync::mpsc::UnboundedSender<(Change, ChangeOrigin)>,
-    raw_stream: TcpStream,
-    address: SocketAddr,
-) {
-    log::debug!("Incoming TCP connection from: {:?}", address);
-
-    let Ok(ws_stream) = tokio_tungstenite::accept_async(raw_stream).await else {
-        log::error!("Error during the websocket handshake occurred");
-        return;
-    };
-
-    log::debug!("WebSocket connection established: {:?}", address);
-
-    let (outgoing, mut incoming) = ws_stream.split();
-
-    // TODO: Do tagnet handshake to determine the public key.
-    let public_key = "FIX ME".to_owned();
-
-    while let Some(Ok(message)) = incoming.next().await {
-        let text = message.to_string();
-        let change = serde_json::from_str(&text).expect("Failed to deserialize");
-
-        sender.send((
-            change,
-            ChangeOrigin::Peer {
-                public_key: public_key.clone(),
-            },
-        ));
-    }
-}
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -148,7 +85,7 @@ async fn main() -> Result<(), std::io::Error> {
                 )
                 .unwrap();
 
-            database.show_tags().unwrap();
+            database.show_content(false).unwrap();
         }
         Commands::Generate { file_name } => {
             let configuration = Configuration::new_example();
@@ -186,6 +123,39 @@ async fn main() -> Result<(), std::io::Error> {
     Ok(())
 }
 
+async fn handle_connection(
+    sender: tokio::sync::mpsc::UnboundedSender<(Change, ChangeOrigin)>,
+    raw_stream: TcpStream,
+    address: SocketAddr,
+) {
+    log::debug!("Incoming TCP connection from: {:?}", address);
+
+    let Ok(ws_stream) = tokio_tungstenite::accept_async(raw_stream).await else {
+        log::error!("Error during the websocket handshake occurred");
+        return;
+    };
+
+    log::debug!("WebSocket connection established: {:?}", address);
+
+    let (outgoing, mut incoming) = ws_stream.split();
+
+    // TODO: Do tagnet handshake to determine the public key.
+    let public_key = "FIX ME".to_owned();
+
+    while let Some(Ok(message)) = incoming.next().await {
+        let text = message.to_string();
+        let change = serde_json::from_str(&text).expect("Failed to deserialize");
+
+        // TODO: Use result.
+        let _ = sender.send((
+            change,
+            ChangeOrigin::Peer {
+                public_key: public_key.clone(),
+            },
+        ));
+    }
+}
+
 async fn handle_sync_directories(
     configuration: Configuration,
     change_sender: UnboundedSender<(Change, ChangeOrigin)>,
@@ -195,30 +165,6 @@ async fn handle_sync_directories(
         .await
         .run()
         .await;
-}
-
-pub enum SyncDirectoryCommand {
-    CreateFile {
-        file_id: FileId,
-        file_name: OsString,
-        content: Vec<u8>,
-        // Maybe a bit weird to have it like this? Not sure.
-        // We currently need that to check which directory this event was meant for.
-        sync_directory_path: PathBuf,
-    },
-    ModifyFile {
-        file_id: FileId,
-        content: Vec<u8>,
-        // Maybe a bit weird to have it like this? Not sure.
-        // We currently need that to check which directory this event was meant for.
-        sync_directory_path: PathBuf,
-    },
-    RemoveFile {
-        file_id: FileId,
-        // Maybe a bit weird to have it like this? Not sure.
-        // We currently need that to check which directory this event was meant for.
-        sync_directory_path: PathBuf,
-    },
 }
 
 fn contains_all_tags(sync_directory_tags: &[TagId], file_tags: &[TagId]) -> bool {
@@ -235,8 +181,25 @@ async fn handle_changes(
     let database = FileDatabase::initialize("/home/lucas/.tagnet/main.db")
         .expect("Failed to open database file");
 
+    fn forward_to_peers(
+        configuration: &Configuration,
+        _change: &Change,
+        change_origin: &ChangeOrigin,
+    ) {
+        for peer in &configuration.peers {
+            if let ChangeOrigin::Peer { public_key } = &change_origin
+                && public_key == &peer.public_key
+            {
+                // Nothing to do, the change originates from this peer.
+                continue;
+            }
+
+            // TODO: Inform this peer.
+        }
+    }
+
     while let Some((change, change_origin)) = change_receiver.recv().await {
-        match change {
+        match &change {
             // Change::Copy {
             //   path,
             //   content,
@@ -248,12 +211,12 @@ async fn handle_changes(
                 tags,
             } => {
                 database
-                    .add_file(file_id, path.clone())
+                    .add_file(*file_id, path.clone())
                     .expect("Failed to add file to database");
 
                 tags.iter().for_each(|tag_id| {
                     database
-                        .tag_file(*tag_id, file_id)
+                        .tag_file(*tag_id, *file_id)
                         .expect("failed to tag added file");
                 });
 
@@ -270,7 +233,7 @@ async fn handle_changes(
                     if let SyncType::TagBased {
                         tags: sync_directory_tags,
                     } = &sync_directory.sync_type
-                        && !contains_all_tags(sync_directory_tags, &tags)
+                        && !contains_all_tags(sync_directory_tags, tags)
                     {
                         // If the directory is tag based and the file *does not* have all the
                         // tags the sync directory does, skip this sync directory.
@@ -281,34 +244,61 @@ async fn handle_changes(
                     // the tags match, thus we may want to apply the change.
                     // TODO: Handle result.
                     let _ = command_sender.send(SyncDirectoryCommand::CreateFile {
-                        file_id,
+                        file_id: *file_id,
                         file_name: path.clone().into(),
                         content: content.clone(),
                         sync_directory_path: sync_directory.path.clone(),
                     });
                 }
 
-                // TODO: Iterate special directories and if the origing is in an upload directory, delete
-                // the file.
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
+            Change::FileMoved { file_id, path } => {
+                // TODO: Don't unwrap.
+                // TODO: Should this be include? Currently this WILL NOT WORK since add file
+                // doesn't consider subtags. We would need to get a list of *all* tags (incuding
+                // subdags) when adding the file to make it work.
+                // -> Maybe make it configurable in the config, per-sync directory.
+                let file_tags = database
+                    .tag_ids_for_file(*file_id, database::SubtagRule::Exclude)
+                    .expect("failed to get file tags")
+                    .into_iter()
+                    .collect::<Vec<TagId>>();
 
-                for peer in &configuration.peers {
-                    if let ChangeOrigin::Peer { public_key } = &change_origin
-                        && public_key == &peer.public_key
+                database
+                    .update_file_path(*file_id, path.clone())
+                    .expect("Failed to update file path");
+
+                for sync_directory in &configuration.sync_directories {
+                    if let ChangeOrigin::Local { directory_path } = &change_origin
+                        && directory_path == &sync_directory.path
                     {
-                        // Nothing to do, the change originates from this peer.
+                        // If the file is already modified in the origin, we don't need to take
+                        // any action.
+                        continue;
+                    };
+
+                    if let SyncType::TagBased {
+                        tags: sync_directory_tags,
+                    } = &sync_directory.sync_type
+                        && !contains_all_tags(sync_directory_tags, &file_tags)
+                    {
+                        // If the directory is tag based and the file *does not* have all the
+                        // tags the sync directory does, skip this sync directory.
                         continue;
                     }
 
-                    // TODO: Inform this peer.
+                    // This means the event didn't originate from this sync directory itself and
+                    // the tags match, thus we may want to apply the change.
+                    // TODO: Handle result.
+                    let _ = command_sender.send(SyncDirectoryCommand::MoveFile {
+                        file_id: *file_id,
+                        path: PathBuf::from(&path),
+                        sync_directory_path: sync_directory.path.clone(),
+                    });
                 }
-            }
-            Change::FileMoved { file_id, path } => {
-                database
-                    .update_file_path(file_id, path)
-                    .expect("Failed to update file path");
 
-                // TODO: In checks, assert that this event did not come from an upload or copy sync
-                // directory.
+                forward_to_peers(&configuration, &change, &change_origin);
             }
             Change::FileChanged { file_id, content } => {
                 // TODO: Don't unwrap.
@@ -317,7 +307,7 @@ async fn handle_changes(
                 // subdags) when adding the file to make it work.
                 // -> Maybe make it configurable in the config, per-sync directory.
                 let file_tags = database
-                    .tag_ids_for_file(file_id, database::SubtagRule::Exclude)
+                    .tag_ids_for_file(*file_id, database::SubtagRule::Exclude)
                     .expect("failed to get file tags")
                     .into_iter()
                     .collect::<Vec<TagId>>();
@@ -344,23 +334,14 @@ async fn handle_changes(
                     // This means the event didn't originate from this sync directory itself and
                     // the tags match, thus we may want to apply the change.
                     // TODO: Handle result.
-                    let _ = command_sender.send(SyncDirectoryCommand::ModifyFile {
-                        file_id,
+                    let _ = command_sender.send(SyncDirectoryCommand::ChangeFile {
+                        file_id: *file_id,
                         content: content.clone(),
                         sync_directory_path: sync_directory.path.clone(),
                     });
                 }
 
-                for peer in &configuration.peers {
-                    if let ChangeOrigin::Peer { public_key } = &change_origin
-                        && public_key == &peer.public_key
-                    {
-                        // Nothing to do, the change originates from this peer.
-                        continue;
-                    }
-
-                    // TODO: Inform this peer.
-                }
+                forward_to_peers(&configuration, &change, &change_origin);
             }
             Change::FileDeleted { file_id } => {
                 // TODO: Don't unwrap.
@@ -369,13 +350,13 @@ async fn handle_changes(
                 // subdags) when adding the file to make it work.
                 // -> Maybe make it configurable in the config, per-sync directory.
                 let file_tags = database
-                    .tag_ids_for_file(file_id, database::SubtagRule::Exclude)
+                    .tag_ids_for_file(*file_id, database::SubtagRule::Exclude)
                     .expect("failed to get file tags")
                     .into_iter()
                     .collect::<Vec<TagId>>();
 
                 database
-                    .remove_file(file_id)
+                    .remove_file(*file_id)
                     .expect("Failed to remove file from database");
 
                 for sync_directory in &configuration.sync_directories {
@@ -401,69 +382,93 @@ async fn handle_changes(
                     // we may want to apply it.
                     // TODO: Handle result.
                     let _ = command_sender.send(SyncDirectoryCommand::RemoveFile {
-                        file_id,
+                        file_id: *file_id,
                         sync_directory_path: sync_directory.path.clone(),
                     });
                 }
 
-                for peer in &configuration.peers {
-                    if let ChangeOrigin::Peer { public_key } = &change_origin
-                        && public_key == &peer.public_key
-                    {
-                        // Nothing to do, the change originates from this peer.
-                        continue;
-                    }
-
-                    // TODO: Inform this peer.
-                }
+                forward_to_peers(&configuration, &change, &change_origin);
             }
             Change::TagAdded {
-                tag_name: _,
+                tag_id,
+                tag_name,
                 metadata: _,
-            } => todo!(),
-            Change::TagRenamed {
-                tag_id: _,
-                tag_name: _,
-            } => todo!(),
+            } => {
+                // TODO: Don't unwrap.
+                database.add_tag(*tag_id, tag_name, "red").unwrap();
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
+            Change::TagRenamed { tag_id, tag_name } => {
+                // TODO: Don't unwrap.
+                database.update_tag_name(*tag_id, tag_name).unwrap();
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
             Change::TagChanged {
                 tag_id: _,
                 metadata: _,
-            } => todo!(),
-            Change::TagRemoved { tag_id: _ } => todo!(),
+            } => { // TODO
+            }
+            Change::TagRemoved { tag_id } => {
+                // TODO: Don't unwrap.
+                database.remove_tag(*tag_id).unwrap();
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
             Change::FileTagged {
-                file_id: _,
-                tag_id: _,
+                file_id,
+                tag_id,
                 metadata: _,
-            } => todo!(),
+            } => {
+                // TODO: Don't unwrap.
+                database.tag_file(*tag_id, *file_id).unwrap();
+
+                // FIX: Update the files in the sync directories.
+
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
             Change::FileTagChanged {
                 file_id: _,
                 tag_id: _,
                 metadata: _,
-            } => todo!(),
-            Change::FileUntagged {
-                file_id: _,
-                tag_id: _,
-            } => todo!(),
+            } => { // TODO
+            }
+            Change::FileUntagged { file_id, tag_id } => {
+                // TODO: Don't unwrap.
+                database.untag_file(*tag_id, *file_id).unwrap();
+
+                // FIX: Update the files in the sync directories.
+
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
             Change::TagTagged {
-                taggee_id: _,
-                tag_id: _,
+                taggee_id,
+                tag_id,
                 metadata: _,
-            } => todo!(),
+            } => {
+                // TODO: Don't unwrap.
+                database.tag_tag(*tag_id, *taggee_id).unwrap();
+
+                // NOTE: Currently this is correct, but if we change the subtag rules on the sync
+                // directories we will have to update the sync directories here too.
+
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
             Change::TagTagChanged {
                 taggee_id: _,
                 tag_id: _,
                 metadata: _,
-            } => todo!(),
-            Change::TagUntagged {
-                taggee_id: _,
-                tag_id: _,
-            } => todo!(),
+            } => { // TODO
+            }
+            Change::TagUntagged { taggee_id, tag_id } => {
+                // TODO: Don't unwrap.
+                database.untag_tag(*tag_id, *taggee_id).unwrap();
+
+                // NOTE: Currently this is correct, but if we change the subtag rules on the sync
+                // directories we will have to update the sync directories here too.
+
+                forward_to_peers(&configuration, &change, &change_origin);
+            }
         }
 
-        println!("\n-- FILE DATABASE --");
-        database.show_files().unwrap();
-        database.show_tags().unwrap();
-        // handle.show_entries().unwrap();
-        // handle.show_previews().unwrap();
+        database.show_content(false).unwrap();
     }
 }

@@ -14,11 +14,53 @@ use tagnet_core::{
 use walkdir::WalkDir;
 
 use crate::{
-    FooBarError, SyncDirectoryCommand,
     configuration::{Configuration, SyncType},
-    database::{self, DatabaseError, SyncDirectoryDatabase, SyncDirectoryFile},
+    database::{DatabaseError, SyncDirectoryDatabase, SyncDirectoryFile},
     watcher::{DebouncedEventKind, WatchDispatcher},
 };
+
+#[derive(Debug, Clone, Copy)]
+enum SyncDirectoryError {
+    UnmonitoredDirectory,
+    FailedToOpenFile,
+    FailedToReadFile,
+    MissingTrackedFile,
+    FailedAddingFile,
+    FailedChangingFile,
+    FailedMovingFile,
+    FailedRemovingFile,
+}
+
+pub enum SyncDirectoryCommand {
+    CreateFile {
+        file_id: FileId,
+        file_name: PathBuf,
+        content: Vec<u8>,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+    ChangeFile {
+        file_id: FileId,
+        content: Vec<u8>,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+    MoveFile {
+        file_id: FileId,
+        path: PathBuf,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+    RemoveFile {
+        file_id: FileId,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+}
 
 struct RichSyncDirectory {
     path: PathBuf,
@@ -106,7 +148,7 @@ impl SyncDirectoryManager {
         &self,
         sync_directory: &RichSyncDirectory,
         change: Change,
-    ) -> Result<(), FooBarError> {
+    ) -> Result<(), SyncDirectoryError> {
         let change_origin = ChangeOrigin::Local {
             directory_path: sync_directory.path.clone(),
         };
@@ -124,13 +166,13 @@ impl SyncDirectoryManager {
         content: Vec<u8>,
         content_hash: String,
         tags: Vec<TagId>,
-    ) -> Result<(), FooBarError> {
+    ) -> Result<(), SyncDirectoryError> {
         let file_id = FileId::new();
 
         sync_directory
             .database
             .add_file(file_id, path.as_ref().to_string_lossy(), content_hash)
-            .map_err(|_| FooBarError::FailedAddingFile)?;
+            .map_err(|_| SyncDirectoryError::FailedAddingFile)?;
 
         self.send_change(
             sync_directory,
@@ -149,7 +191,7 @@ impl SyncDirectoryManager {
         path: impl AsRef<Path>,
         content: Vec<u8>,
         tags: Vec<TagId>,
-    ) -> Result<(), FooBarError> {
+    ) -> Result<(), SyncDirectoryError> {
         let file_id = FileId::new();
 
         if let Err(error) = self.send_change(
@@ -195,11 +237,11 @@ impl SyncDirectoryManager {
         file_id: FileId,
         content: Vec<u8>,
         content_hash: String,
-    ) -> Result<(), FooBarError> {
+    ) -> Result<(), SyncDirectoryError> {
         sync_directory
             .database
             .update_file_content_hash(file_id, content_hash)
-            .map_err(|_| FooBarError::FailedUpdatingFile)?;
+            .map_err(|_| SyncDirectoryError::FailedChangingFile)?;
 
         self.send_change(sync_directory, Change::FileChanged { file_id, content })
     }
@@ -209,11 +251,11 @@ impl SyncDirectoryManager {
         sync_directory: &RichSyncDirectory,
         file_id: FileId,
         path: impl AsRef<Path>,
-    ) -> Result<(), FooBarError> {
+    ) -> Result<(), SyncDirectoryError> {
         sync_directory
             .database
             .update_file_path(file_id, path.as_ref().to_string_lossy())
-            .map_err(|_| FooBarError::FailedUpdatingFile)?;
+            .map_err(|_| SyncDirectoryError::FailedChangingFile)?;
 
         self.send_change(
             sync_directory,
@@ -228,11 +270,11 @@ impl SyncDirectoryManager {
         &self,
         sync_directory: &RichSyncDirectory,
         file_id: FileId,
-    ) -> Result<(), FooBarError> {
+    ) -> Result<(), SyncDirectoryError> {
         sync_directory
             .database
             .remove_file_by_id(file_id)
-            .map_err(|_| FooBarError::FailedRemovingFile)?;
+            .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
 
         self.send_change(sync_directory, Change::FileDeleted { file_id })
     }
@@ -240,22 +282,22 @@ impl SyncDirectoryManager {
     fn get_all_files(
         &self,
         sync_directory: &RichSyncDirectory,
-    ) -> Result<Vec<SyncDirectoryFile>, FooBarError> {
+    ) -> Result<Vec<SyncDirectoryFile>, SyncDirectoryError> {
         sync_directory
             .database
             .get_all_files()
-            .map_err(|_| FooBarError::MissingTrackedFile)
+            .map_err(|_| SyncDirectoryError::MissingTrackedFile)
     }
 
     fn get_all_files_at(
         &self,
         sync_directory: &RichSyncDirectory,
         path: impl AsRef<Path>,
-    ) -> Result<Vec<SyncDirectoryFile>, FooBarError> {
+    ) -> Result<Vec<SyncDirectoryFile>, SyncDirectoryError> {
         sync_directory
             .database
             .get_all_files_at(path.as_ref().to_string_lossy())
-            .map_err(|_| FooBarError::MissingTrackedFile)
+            .map_err(|_| SyncDirectoryError::MissingTrackedFile)
     }
 
     fn calculate_content_hash(content: &[u8]) -> String {
@@ -264,12 +306,16 @@ impl SyncDirectoryManager {
         BASE64_STANDARD.encode(hasher.finish().to_le_bytes())
     }
 
-    fn get_file_content(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, String), FooBarError> {
-        let mut file = std::fs::File::open(path).map_err(|_| FooBarError::FailedToOpenFile)?;
+    fn get_file_content(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(Vec<u8>, String), SyncDirectoryError> {
+        let mut file =
+            std::fs::File::open(path).map_err(|_| SyncDirectoryError::FailedToOpenFile)?;
         let mut content = Vec::new();
 
         file.read_to_end(&mut content)
-            .map_err(|_| FooBarError::FailedToReadFile)?;
+            .map_err(|_| SyncDirectoryError::FailedToReadFile)?;
 
         let content_hash = Self::calculate_content_hash(&content);
 
@@ -279,22 +325,22 @@ impl SyncDirectoryManager {
     fn sync_directory_for_path(
         &self,
         path: impl AsRef<Path>,
-    ) -> Result<&RichSyncDirectory, FooBarError> {
+    ) -> Result<&RichSyncDirectory, SyncDirectoryError> {
         self.sync_directories
             .iter()
             .find(|sync_directory| path.as_ref().starts_with(&sync_directory.path))
-            .ok_or(FooBarError::UnmonitoredDirectory)
+            .ok_or(SyncDirectoryError::UnmonitoredDirectory)
     }
 
     fn get_file_id(
         &self,
         sync_directory: &RichSyncDirectory,
         path: impl AsRef<Path>,
-    ) -> Result<FileId, FooBarError> {
+    ) -> Result<FileId, SyncDirectoryError> {
         sync_directory
             .database
             .get_file_id(path.as_ref().to_string_lossy())
-            .map_err(|_| FooBarError::MissingTrackedFile)
+            .map_err(|_| SyncDirectoryError::MissingTrackedFile)
     }
 
     fn intial_sync_universal(
@@ -536,7 +582,20 @@ impl SyncDirectoryManager {
         }
     }
 
-    fn handle_command(&mut self, command: SyncDirectoryCommand) -> Result<(), FooBarError> {
+    fn try_remove_empty_directory(&self, directory_path: impl AsRef<Path>) {
+        if let Ok(mut read_dir) = directory_path.as_ref().read_dir()
+            && read_dir.next().is_none()
+        {
+            log::info!(
+                "Removing empty directory {}",
+                directory_path.as_ref().to_string_lossy()
+            );
+
+            std::fs::remove_dir(directory_path).expect("failed to remove empty directory");
+        }
+    }
+
+    fn handle_command(&mut self, command: SyncDirectoryCommand) -> Result<(), SyncDirectoryError> {
         match command {
             SyncDirectoryCommand::CreateFile {
                 file_id,
@@ -565,7 +624,7 @@ impl SyncDirectoryManager {
                 sync_directory
                     .database
                     .add_file(file_id, file_name.to_string_lossy(), content_hash)
-                    .map_err(|_| FooBarError::FailedAddingFile)?;
+                    .map_err(|_| SyncDirectoryError::FailedAddingFile)?;
 
                 self.skip_queue
                     .borrow_mut()
@@ -573,7 +632,7 @@ impl SyncDirectoryManager {
                         file_name: file_path.clone(),
                     });
             }
-            SyncDirectoryCommand::ModifyFile {
+            SyncDirectoryCommand::ChangeFile {
                 file_id,
                 content,
                 sync_directory_path,
@@ -586,7 +645,7 @@ impl SyncDirectoryManager {
                         sync_directory
                             .database
                             .get_file(file_id)
-                            .map_err(|_| FooBarError::FailedUpdatingFile)?
+                            .map_err(|_| SyncDirectoryError::FailedChangingFile)?
                             .path
                     }
                 };
@@ -603,7 +662,7 @@ impl SyncDirectoryManager {
                 sync_directory
                     .database
                     .update_file_content_hash(file_id, content_hash)
-                    .map_err(|_| FooBarError::FailedAddingFile)?;
+                    .map_err(|_| SyncDirectoryError::FailedAddingFile)?;
 
                 self.skip_queue
                     .borrow_mut()
@@ -611,17 +670,74 @@ impl SyncDirectoryManager {
                         file_name: file_path.clone(),
                     });
             }
+            SyncDirectoryCommand::MoveFile {
+                file_id,
+                path,
+                sync_directory_path,
+            } => {
+                let sync_directory = self.sync_directory_for_path(&sync_directory_path)?;
+
+                match &sync_directory.sync_type {
+                    SyncType::Universal => {
+                        // For a universal sync directory, we don't need to update anything apart from
+                        // the database.
+                        sync_directory
+                            .database
+                            .update_file_path(file_id, path.to_string_lossy())
+                            .map_err(|_| SyncDirectoryError::FailedMovingFile)?;
+                    }
+                    SyncType::TagBased { .. } => {
+                        let file = sync_directory
+                            .database
+                            .get_file(file_id)
+                            .map_err(|_| SyncDirectoryError::FailedMovingFile)?;
+
+                        let old_file_path = sync_directory.path.join(&file.path);
+                        let new_file_path = sync_directory.path.join(&path);
+
+                        log::info!(
+                            "Moving file from {} to {}",
+                            old_file_path.to_string_lossy(),
+                            new_file_path.to_string_lossy()
+                        );
+
+                        sync_directory
+                            .database
+                            .update_file_path(file_id, path.to_string_lossy())
+                            .map_err(|_| SyncDirectoryError::FailedMovingFile)?;
+
+                        // TODO: Don't unwrap
+                        std::fs::create_dir_all(new_file_path.parent().unwrap())
+                            .expect("failed to create new directory");
+                        std::fs::rename(&old_file_path, &new_file_path)
+                            .expect("failed to move file");
+
+                        // If the moved file was in a directory that is now empty, we want to remove the
+                        // directory as well.
+                        self.try_remove_empty_directory(old_file_path.parent().unwrap());
+
+                        self.skip_queue.borrow_mut().push(DebouncedEventKind::Move {
+                            from: Some(old_file_path),
+                            to: Some(new_file_path),
+                        });
+                    }
+                };
+            }
             SyncDirectoryCommand::RemoveFile {
                 file_id,
                 sync_directory_path,
             } => {
-                log::info!("Removing file with id {}", file_id.to_string());
-
                 let sync_directory = self.sync_directory_for_path(&sync_directory_path)?;
                 let file = sync_directory
                     .database
                     .get_file(file_id)
-                    .map_err(|_| FooBarError::FailedRemovingFile)?;
+                    .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
+
+                log::info!(
+                    "Removing file {} from {}",
+                    file.path,
+                    sync_directory.path.to_string_lossy()
+                );
 
                 let file_path = match &sync_directory.sync_type {
                     SyncType::Universal => sync_directory.path.join(file_id.to_string()),
@@ -635,21 +751,14 @@ impl SyncDirectoryManager {
                 if let SyncType::TagBased { .. } = &sync_directory.sync_type
                     && let Some(directory) = PathBuf::from(file.path).parent()
                 {
-                    let full_path = sync_directory.path.join(directory);
-
-                    if let Ok(mut read_dir) = full_path.read_dir()
-                        && read_dir.next().is_none()
-                    {
-                        log::info!("Removing empty directory {}", full_path.to_string_lossy());
-
-                        std::fs::remove_dir(full_path).expect("failed to remove empty directory");
-                    }
+                    let directory_path = sync_directory.path.join(directory);
+                    self.try_remove_empty_directory(directory_path);
                 }
 
                 sync_directory
                     .database
                     .remove_file_by_id(file_id)
-                    .map_err(|_| FooBarError::FailedRemovingFile)?;
+                    .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
 
                 self.skip_queue
                     .borrow_mut()
@@ -662,7 +771,7 @@ impl SyncDirectoryManager {
         Ok(())
     }
 
-    fn handle_event(&self, event: DebouncedEventKind) -> Result<(), FooBarError> {
+    fn handle_event(&self, event: DebouncedEventKind) -> Result<(), SyncDirectoryError> {
         match event {
             DebouncedEventKind::Create { file_name } => {
                 let sync_directory = self.sync_directory_for_path(&file_name)?;
@@ -693,8 +802,19 @@ impl SyncDirectoryManager {
                 {
                     // Move within the directory.
 
+                    if let SyncType::Universal = sync_directory.sync_type {
+                        panic!(
+                            "figure out what should happen here. We don't really want to propagate this. Maybe we just undo the operation?"
+                        );
+                    };
+
                     let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
-                    let relative_to = to.strip_prefix(&sync_directory.path).unwrap();
+                    let Ok(relative_to) = to.strip_prefix(&sync_directory.path) else {
+                        let _sync_directory_to = self.sync_directory_for_path(to)?;
+
+                        // FIX: Special case for when `to` is a *different sync directory*.
+                        panic!("implement special case");
+                    };
 
                     if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
                         self.update_file_path(sync_directory, file_id, relative_to)?;

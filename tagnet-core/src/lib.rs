@@ -99,6 +99,7 @@ pub mod state {
             path: String,
             // encoding: ,
             content: Vec<u8>,
+            // TODO: Bundle metadata with the tag.
             tags: Vec<TagId>,
         },
         FileMoved {
@@ -114,6 +115,7 @@ pub mod state {
             file_id: FileId,
         },
         TagAdded {
+            tag_id: TagId,
             tag_name: String,
             // color,
             metadata: Option<MetadataFormat>,
