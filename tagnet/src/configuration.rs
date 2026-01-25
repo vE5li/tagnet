@@ -10,7 +10,7 @@ use tagnet_core::TagId;
 
 use crate::configuration;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     /// IP address and port of the peer. None to let the peer establish the connection.
     pub address: Option<(IpAddr, u16)>,
@@ -22,20 +22,26 @@ pub struct Peer {
 pub enum SyncType {
     Universal,
     TagBased { tags: Vec<TagId> },
-    // Upload,
-    // Copy,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SpecialType {
+    Upload,
+    Copy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncDirectory {
     pub path: PathBuf,
     pub sync_type: SyncType,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Configuration {
     /// Synchronized directories on the device itself.
     pub sync_directories: Vec<SyncDirectory>,
+    /// Directories for special features, such as uploading one-time sending.
+    // pub special_directories: Vec<SyncDirectory>,
 
     /// Port to listen on. None for not listening.
     pub listen_port: Option<u16>,
@@ -94,6 +100,7 @@ impl Configuration {
                 // tags.
                 SyncType::Universal => return SyncType::Universal,
                 SyncType::TagBased { tags } => all_synced_tags.extend_from_slice(tags),
+                // SyncType::Upload || SyncType::Copy => {},
             }
         }
 

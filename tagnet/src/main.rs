@@ -1,34 +1,26 @@
-use std::{
-    ffi::OsString,
-    fs::File,
-    hash::{DefaultHasher, Hash, Hasher},
-    io::{Read, Write},
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{ffi::OsString, io::Write, net::SocketAddr, path::PathBuf};
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::StreamExt;
 
-use clap::{Parser, Subcommand, ValueEnum, command};
-use notify::{RecursiveMode, Watcher};
-use rusqlite::Connection;
-use tagnet_core::{FileId, state::Change};
+use clap::{Parser, Subcommand};
+use tagnet_core::{
+    FileId, TagId,
+    state::{Change, ChangeOrigin},
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
-use walkdir::WalkDir;
 
 use crate::{
-    configuration::{Configuration, Peer, RuntimeConfiguration, SyncDirectory, SyncType},
-    database::{DatabaseError, FileDatabase, SyncDirectoryDatabase, SyncDirectoryFile},
-    watcher::{DebouncedEventKind, WatchDispatcher},
+    configuration::{Configuration, RuntimeConfiguration, SyncType},
+    database::FileDatabase,
+    directory_manager::SyncDirectoryManager,
 };
 
 mod configuration;
 mod database;
+mod directory_manager;
 mod watcher;
 
 // ## On the server:
@@ -63,7 +55,7 @@ enum FooBarError {
 }
 
 async fn handle_connection(
-    sender: tokio::sync::mpsc::UnboundedSender<Change>,
+    sender: tokio::sync::mpsc::UnboundedSender<(Change, ChangeOrigin)>,
     raw_stream: TcpStream,
     address: SocketAddr,
 ) {
@@ -78,11 +70,19 @@ async fn handle_connection(
 
     let (outgoing, mut incoming) = ws_stream.split();
 
+    // TODO: Do tagnet handshake to determine the public key.
+    let public_key = "FIX ME".to_owned();
+
     while let Some(Ok(message)) = incoming.next().await {
         let text = message.to_string();
         let change = serde_json::from_str(&text).expect("Failed to deserialize");
 
-        sender.send(change);
+        sender.send((
+            change,
+            ChangeOrigin::Peer {
+                public_key: public_key.clone(),
+            },
+        ));
     }
 }
 
@@ -95,6 +95,8 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    // FIX: Remove, for development only.
+    Reset { configuration_file: PathBuf },
     Generate { file_name: PathBuf },
     Run { configuration_file: PathBuf },
 }
@@ -106,6 +108,48 @@ async fn main() -> Result<(), std::io::Error> {
     let arguments = Arguments::parse();
 
     match arguments.command {
+        // FIX: Remove, for development only.
+        Commands::Reset { configuration_file } => {
+            log::info!("Re-creating /home/lucas/.tagnet");
+            std::fs::remove_dir_all("/home/lucas/.tagnet").unwrap();
+            std::fs::create_dir("/home/lucas/.tagnet").unwrap();
+
+            let configuration = Configuration::new(configuration_file);
+            for sync_directory in configuration.sync_directories {
+                if let SyncType::Universal = sync_directory.sync_type {
+                    log::info!("Re-creating {}", sync_directory.path.to_string_lossy());
+                    std::fs::remove_dir_all(&sync_directory.path).unwrap();
+                    std::fs::create_dir(&sync_directory.path).unwrap();
+                }
+            }
+
+            let database = FileDatabase::initialize("/home/lucas/.tagnet/main.db")
+                .expect("Failed to open database file");
+
+            database
+                .add_tag(
+                    TagId::from_string("e1de1ee0-3dec-47b2-8e95-842c0acc0dfd").unwrap(),
+                    "screenshots",
+                    "red",
+                )
+                .unwrap();
+            database
+                .add_tag(
+                    TagId::from_string("ca39bd61-1b06-4907-b36f-e7a968793e48").unwrap(),
+                    "computer",
+                    "red",
+                )
+                .unwrap();
+            database
+                .add_tag(
+                    TagId::from_string("5a0e2939-f881-4c55-a349-cbb91c082057").unwrap(),
+                    "image",
+                    "red",
+                )
+                .unwrap();
+
+            database.show_tags().unwrap();
+        }
         Commands::Generate { file_name } => {
             let configuration = Configuration::new_example();
             configuration.write_to_file(file_name);
@@ -119,18 +163,18 @@ async fn main() -> Result<(), std::io::Error> {
                 .expect("Failed to bind");
 
             let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
-            let (skip_sender, skip_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
 
             tokio::spawn(handle_sync_directories(
-                configuration.sync_directories,
+                configuration.clone(),
                 change_sender.clone(),
-                skip_receiver,
+                command_receiver,
             ));
 
             tokio::spawn(handle_changes(
-                configuration.peers,
+                configuration,
                 change_receiver,
-                skip_sender,
+                command_sender,
             ));
 
             while let Ok((stream, address)) = listener.accept().await {
@@ -143,58 +187,235 @@ async fn main() -> Result<(), std::io::Error> {
 }
 
 async fn handle_sync_directories(
-    sync_directories: Vec<SyncDirectory>,
-    change_sender: UnboundedSender<Change>,
-    skip_events: UnboundedReceiver<DebouncedEventKind>,
+    configuration: Configuration,
+    change_sender: UnboundedSender<(Change, ChangeOrigin)>,
+    command_receiver: UnboundedReceiver<SyncDirectoryCommand>,
 ) {
-    SyncDirectoryManager::new(sync_directories, change_sender, skip_events)
+    SyncDirectoryManager::new(configuration, change_sender, command_receiver)
         .await
         .run()
         .await;
 }
 
-async fn handle_changes(
-    peers: Vec<Peer>,
-    mut change_receiver: tokio::sync::mpsc::UnboundedReceiver<Change>,
-    skip_sender: UnboundedSender<DebouncedEventKind>,
-) {
-    let database = FileDatabase::initialize("test.db").expect("Failed to open database file");
+pub enum SyncDirectoryCommand {
+    CreateFile {
+        file_id: FileId,
+        file_name: OsString,
+        content: Vec<u8>,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+    ModifyFile {
+        file_id: FileId,
+        content: Vec<u8>,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+    RemoveFile {
+        file_id: FileId,
+        // Maybe a bit weird to have it like this? Not sure.
+        // We currently need that to check which directory this event was meant for.
+        sync_directory_path: PathBuf,
+    },
+}
 
-    while let Some(change) = change_receiver.recv().await {
+fn contains_all_tags(sync_directory_tags: &[TagId], file_tags: &[TagId]) -> bool {
+    sync_directory_tags
+        .iter()
+        .all(|tag_id| file_tags.contains(tag_id))
+}
+
+async fn handle_changes(
+    configuration: Configuration,
+    mut change_receiver: tokio::sync::mpsc::UnboundedReceiver<(Change, ChangeOrigin)>,
+    command_sender: UnboundedSender<SyncDirectoryCommand>,
+) {
+    let database = FileDatabase::initialize("/home/lucas/.tagnet/main.db")
+        .expect("Failed to open database file");
+
+    while let Some((change, change_origin)) = change_receiver.recv().await {
         match change {
+            // Change::Copy {
+            //   path,
+            //   content,
+            // }
             Change::FileAdded {
                 file_id,
                 path,
                 content,
+                tags,
             } => {
-                // FIX: Don't unwrap.
-                let mut file = std::fs::File::create(file_id.to_string()).unwrap();
-                file.write_all(&content).unwrap();
-
                 database
-                    .add_file(file_id, path)
+                    .add_file(file_id, path.clone())
                     .expect("Failed to add file to database");
 
-                // TODO: We need to know where this change comes from.
-                // If it does not come from this system we also need to create the file in the sync
-                // directories *and* ignore the event.
+                tags.iter().for_each(|tag_id| {
+                    database
+                        .tag_file(*tag_id, file_id)
+                        .expect("failed to tag added file");
+                });
+
+                for sync_directory in &configuration.sync_directories {
+                    if let ChangeOrigin::Local { directory_path } = &change_origin
+                        && directory_path == &sync_directory.path
+                        && let SyncType::TagBased { .. } = &sync_directory.sync_type
+                    {
+                        // If the file came from a tag based sync directory, we don't need to take
+                        // any action.
+                        continue;
+                    };
+
+                    if let SyncType::TagBased {
+                        tags: sync_directory_tags,
+                    } = &sync_directory.sync_type
+                        && !contains_all_tags(sync_directory_tags, &tags)
+                    {
+                        // If the directory is tag based and the file *does not* have all the
+                        // tags the sync directory does, skip this sync directory.
+                        continue;
+                    }
+
+                    // This means the event didn't originate from this sync directory itself and
+                    // the tags match, thus we may want to apply the change.
+                    // TODO: Handle result.
+                    let _ = command_sender.send(SyncDirectoryCommand::CreateFile {
+                        file_id,
+                        file_name: path.clone().into(),
+                        content: content.clone(),
+                        sync_directory_path: sync_directory.path.clone(),
+                    });
+                }
+
+                // TODO: Iterate special directories and if the origing is in an upload directory, delete
+                // the file.
+
+                for peer in &configuration.peers {
+                    if let ChangeOrigin::Peer { public_key } = &change_origin
+                        && public_key == &peer.public_key
+                    {
+                        // Nothing to do, the change originates from this peer.
+                        continue;
+                    }
+
+                    // TODO: Inform this peer.
+                }
             }
             Change::FileMoved { file_id, path } => {
                 database
                     .update_file_path(file_id, path)
                     .expect("Failed to update file path");
+
+                // TODO: In checks, assert that this event did not come from an upload or copy sync
+                // directory.
             }
             Change::FileChanged { file_id, content } => {
-                // FIX: Don't unwrap.
-                let mut file = std::fs::File::create(file_id.to_string()).unwrap();
-                file.write_all(&content).unwrap();
+                // TODO: Don't unwrap.
+                // TODO: Should this be include? Currently this WILL NOT WORK since add file
+                // doesn't consider subtags. We would need to get a list of *all* tags (incuding
+                // subdags) when adding the file to make it work.
+                // -> Maybe make it configurable in the config, per-sync directory.
+                let file_tags = database
+                    .tag_ids_for_file(file_id, database::SubtagRule::Exclude)
+                    .expect("failed to get file tags")
+                    .into_iter()
+                    .collect::<Vec<TagId>>();
+
+                for sync_directory in &configuration.sync_directories {
+                    if let ChangeOrigin::Local { directory_path } = &change_origin
+                        && directory_path == &sync_directory.path
+                    {
+                        // If the file is already modified in the origin, we don't need to take
+                        // any action.
+                        continue;
+                    };
+
+                    if let SyncType::TagBased {
+                        tags: sync_directory_tags,
+                    } = &sync_directory.sync_type
+                        && !contains_all_tags(sync_directory_tags, &file_tags)
+                    {
+                        // If the directory is tag based and the file *does not* have all the
+                        // tags the sync directory does, skip this sync directory.
+                        continue;
+                    }
+
+                    // This means the event didn't originate from this sync directory itself and
+                    // the tags match, thus we may want to apply the change.
+                    // TODO: Handle result.
+                    let _ = command_sender.send(SyncDirectoryCommand::ModifyFile {
+                        file_id,
+                        content: content.clone(),
+                        sync_directory_path: sync_directory.path.clone(),
+                    });
+                }
+
+                for peer in &configuration.peers {
+                    if let ChangeOrigin::Peer { public_key } = &change_origin
+                        && public_key == &peer.public_key
+                    {
+                        // Nothing to do, the change originates from this peer.
+                        continue;
+                    }
+
+                    // TODO: Inform this peer.
+                }
             }
             Change::FileDeleted { file_id } => {
-                std::fs::remove_file(file_id.to_string()).expect("Failed to remove file");
+                // TODO: Don't unwrap.
+                // TODO: Should this be include? Currently this WILL NOT WORK since add file
+                // doesn't consider subtags. We would need to get a list of *all* tags (incuding
+                // subdags) when adding the file to make it work.
+                // -> Maybe make it configurable in the config, per-sync directory.
+                let file_tags = database
+                    .tag_ids_for_file(file_id, database::SubtagRule::Exclude)
+                    .expect("failed to get file tags")
+                    .into_iter()
+                    .collect::<Vec<TagId>>();
 
                 database
                     .remove_file(file_id)
-                    .expect("Failed to remove file");
+                    .expect("Failed to remove file from database");
+
+                for sync_directory in &configuration.sync_directories {
+                    if let ChangeOrigin::Local { directory_path } = &change_origin
+                        && directory_path == &sync_directory.path
+                    {
+                        // If the file came from this directory, it is already removed. We
+                        // can just skip this directory.
+                        continue;
+                    };
+
+                    if let SyncType::TagBased {
+                        tags: sync_directory_tags,
+                    } = &sync_directory.sync_type
+                        && !contains_all_tags(sync_directory_tags, &file_tags)
+                    {
+                        // If the directory is tag based and the file *does not* have all the
+                        // tags the sync directory does, skip this sync directory.
+                        continue;
+                    }
+
+                    // This means the event didn't originate from this sync directory itself, thus
+                    // we may want to apply it.
+                    // TODO: Handle result.
+                    let _ = command_sender.send(SyncDirectoryCommand::RemoveFile {
+                        file_id,
+                        sync_directory_path: sync_directory.path.clone(),
+                    });
+                }
+
+                for peer in &configuration.peers {
+                    if let ChangeOrigin::Peer { public_key } = &change_origin
+                        && public_key == &peer.public_key
+                    {
+                        // Nothing to do, the change originates from this peer.
+                        continue;
+                    }
+
+                    // TODO: Inform this peer.
+                }
             }
             Change::TagAdded {
                 tag_name: _,
@@ -241,477 +462,8 @@ async fn handle_changes(
 
         println!("\n-- FILE DATABASE --");
         database.show_files().unwrap();
-        // handle.show_tags().unwrap();
+        database.show_tags().unwrap();
         // handle.show_entries().unwrap();
         // handle.show_previews().unwrap();
-    }
-}
-
-struct RichSyncDirectory {
-    path: PathBuf,
-    sync_type: SyncType,
-    database: SyncDirectoryDatabase,
-}
-
-struct SyncDirectoryManager {
-    sync_directories: Vec<RichSyncDirectory>,
-    change_sender: tokio::sync::mpsc::UnboundedSender<Change>,
-    _dispatcher: WatchDispatcher,
-    watcher_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
-    skip_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
-}
-
-impl SyncDirectoryManager {
-    pub async fn new(
-        sync_directories: Vec<SyncDirectory>,
-        change_sender: tokio::sync::mpsc::UnboundedSender<Change>,
-        skip_events: tokio::sync::mpsc::UnboundedReceiver<DebouncedEventKind>,
-    ) -> Self {
-        let (mut dispatcher, watcher_events) = WatchDispatcher::new()
-            .await
-            .expect("Failed to set up debouncer");
-
-        let sync_directories = sync_directories
-            .iter()
-            .filter_map(|sync_directory| {
-                let path = sync_directory.path.clone();
-
-                log::debug!(
-                    "Setting up sync directory at {}",
-                    sync_directory.path.to_string_lossy()
-                );
-
-                if let Err(error) = std::fs::create_dir_all(&path) {
-                    log::error!("Failed to create sync directory: {}", error);
-                    return None;
-                }
-
-                if let Err(error) = dispatcher
-                    .watcher()
-                    .watch(path.as_ref(), RecursiveMode::Recursive)
-                {
-                    log::error!("Failed to set up watcher for sync directory: {}", error);
-                    return None;
-                }
-
-                // TODO: Improve the name selection.
-                let database_name = format!("{}.db", path.file_name().unwrap().to_string_lossy());
-
-                let database = match SyncDirectoryDatabase::initialize(database_name) {
-                    Ok(database) => database,
-                    Err(error) => {
-                        log::error!("Failed to set up sync directory database: {:?}", error);
-                        return None;
-                    }
-                };
-
-                Some(RichSyncDirectory {
-                    path,
-                    sync_type: sync_directory.sync_type.clone(),
-                    database,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Self {
-            sync_directories,
-            change_sender,
-            _dispatcher: dispatcher,
-            watcher_events,
-            skip_events,
-        }
-    }
-
-    fn add_file(
-        &self,
-        sync_directory: &RichSyncDirectory,
-        path: impl AsRef<Path>,
-        content: Vec<u8>,
-        content_hash: String,
-    ) -> Result<(), FooBarError> {
-        let file_id = FileId::new();
-
-        sync_directory
-            .database
-            .add_file(file_id, path.as_ref().to_string_lossy(), content_hash)
-            .map_err(|_| FooBarError::FailedAddingFile)?;
-
-        // FIX: Put this into a queue for proper retry handling instead.
-        let _ = self.change_sender.send(Change::FileAdded {
-            file_id,
-            path: path.as_ref().to_string_lossy().to_string(),
-            content,
-        });
-
-        Ok(())
-    }
-
-    fn update_file_content(
-        &self,
-        sync_directory: &RichSyncDirectory,
-        file_id: FileId,
-        content: Vec<u8>,
-        content_hash: String,
-    ) -> Result<(), FooBarError> {
-        sync_directory
-            .database
-            .update_file_content_hash(file_id, content_hash)
-            .map_err(|_| FooBarError::FailedUpdatingFile)?;
-
-        // FIX: Put this into a queue for proper retry handling instead.
-        let _ = self
-            .change_sender
-            .send(Change::FileChanged { file_id, content });
-
-        Ok(())
-    }
-
-    fn update_file_path(
-        &self,
-        sync_directory: &RichSyncDirectory,
-        file_id: FileId,
-        path: impl AsRef<Path>,
-    ) -> Result<(), FooBarError> {
-        sync_directory
-            .database
-            .update_file_path(file_id, path.as_ref().to_string_lossy())
-            .map_err(|_| FooBarError::FailedUpdatingFile)?;
-
-        // FIX: Put this into a queue for proper retry handling instead.
-        let _ = self.change_sender.send(Change::FileMoved {
-            file_id,
-            path: path.as_ref().to_string_lossy().to_string(),
-        });
-
-        Ok(())
-    }
-
-    fn remove_file_by_id(
-        &self,
-        sync_directory: &RichSyncDirectory,
-        file_id: FileId,
-    ) -> Result<(), FooBarError> {
-        sync_directory
-            .database
-            .remove_file_by_id(file_id)
-            .map_err(|_| FooBarError::FailedRemovingFile)?;
-
-        // FIX: Put this into a queue for proper retry handling instead.
-        let _ = self.change_sender.send(Change::FileDeleted { file_id });
-
-        Ok(())
-    }
-
-    fn get_all_files(
-        &self,
-        sync_directory: &RichSyncDirectory,
-    ) -> Result<Vec<SyncDirectoryFile>, FooBarError> {
-        sync_directory
-            .database
-            .get_all_files()
-            .map_err(|_| FooBarError::MissingTrackedFile)
-    }
-
-    fn get_all_files_at(
-        &self,
-        sync_directory: &RichSyncDirectory,
-        path: impl AsRef<Path>,
-    ) -> Result<Vec<SyncDirectoryFile>, FooBarError> {
-        sync_directory
-            .database
-            .get_all_files_at(path.as_ref().to_string_lossy())
-            .map_err(|_| FooBarError::MissingTrackedFile)
-    }
-
-    fn get_file_content(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, String), FooBarError> {
-        let mut file = std::fs::File::open(path).map_err(|_| FooBarError::FailedToOpenFile)?;
-        let mut content = Vec::new();
-
-        file.read_to_end(&mut content)
-            .map_err(|_| FooBarError::FailedToReadFile)?;
-
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        let content_hash = BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-
-        Ok((content, content_hash))
-    }
-
-    fn sync_directory_for_path(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<&RichSyncDirectory, FooBarError> {
-        self.sync_directories
-            .iter()
-            .find(|sync_directory| path.as_ref().starts_with(&sync_directory.path))
-            .ok_or(FooBarError::UnmonitoredDirectory)
-    }
-
-    fn get_file_id(
-        &self,
-        sync_directory: &RichSyncDirectory,
-        path: impl AsRef<Path>,
-    ) -> Result<FileId, FooBarError> {
-        sync_directory
-            .database
-            .get_file_id(path.as_ref().to_string_lossy())
-            .map_err(|_| FooBarError::MissingTrackedFile)
-    }
-
-    fn run_initial_sync(&self) {
-        for sync_directory in &self.sync_directories {
-            log::debug!(
-                "Checking for missed updates at {}",
-                sync_directory.path.to_string_lossy()
-            );
-
-            let files = match self.get_all_files(sync_directory) {
-                Ok(files) => files,
-                Err(error) => {
-                    log::error!("Failed to get list of tracked files: {:?}", error);
-                    continue;
-                }
-            };
-
-            for sync_file in files {
-                let full_path = sync_directory.path.join(sync_file.path);
-
-                log::debug!("Checking file {}", full_path.to_string_lossy());
-
-                if !full_path.exists() {
-                    log::info!(
-                        "File {} was deleted without monitoring. Syncing deletion",
-                        full_path.to_string_lossy()
-                    );
-
-                    if let Err(error) = self.remove_file_by_id(sync_directory, sync_file.file_id) {
-                        log::error!(
-                            "Failed to remove file {}: {:?}",
-                            full_path.to_string_lossy(),
-                            error
-                        );
-                    }
-
-                    continue;
-                }
-
-                let (content, content_hash) = match self.get_file_content(&full_path) {
-                    Ok((content, content_hash)) => (content, content_hash),
-                    Err(error) => {
-                        log::error!("Failed to read file content: {:?}", error);
-                        continue;
-                    }
-                };
-
-                if content_hash != sync_file.content_hash {
-                    log::info!(
-                        "File {} was changed without monitoring. Syncing change",
-                        full_path.to_string_lossy()
-                    );
-
-                    if let Err(error) = self.update_file_content(
-                        sync_directory,
-                        sync_file.file_id,
-                        content,
-                        content_hash,
-                    ) {
-                        log::error!(
-                            "Failed to update file {}: {:?}",
-                            full_path.to_string_lossy(),
-                            error
-                        );
-                    }
-                }
-            }
-
-            for entry in WalkDir::new(&sync_directory.path)
-                .into_iter()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_type().is_file())
-            {
-                let Ok(relative_path) = entry.path().strip_prefix(&sync_directory.path) else {
-                    log::error!("Walkdir returned a path outside of the sync directory");
-                    continue;
-                };
-
-                match sync_directory
-                    .database
-                    .get_file_id(relative_path.to_string_lossy())
-                {
-                    // File is already tracked.
-                    Ok(_) => {
-                        log::debug!(
-                            "File {} is already tracked",
-                            relative_path.to_string_lossy()
-                        );
-                    }
-                    Err(DatabaseError::MissingFile) => {
-                        log::info!(
-                            "File {} was added without monitoring. Syncing addition",
-                            entry.path().to_string_lossy()
-                        );
-
-                        let (content, content_hash) = match self.get_file_content(entry.path()) {
-                            Ok((content, content_hash)) => (content, content_hash),
-                            Err(error) => {
-                                log::error!("Failed to read added file: {:?}", error);
-                                continue;
-                            }
-                        };
-
-                        if let Err(error) =
-                            self.add_file(sync_directory, relative_path, content, content_hash)
-                        {
-                            log::error!(
-                                "Failed to add file {}: {:?}",
-                                relative_path.to_string_lossy(),
-                                error
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        panic!("Database error: {:?}", error);
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_event(&self, event: DebouncedEventKind) -> Result<(), FooBarError> {
-        match event {
-            DebouncedEventKind::Create { file_name } => {
-                let sync_directory = self.sync_directory_for_path(&file_name)?;
-                let (content, content_hash) = self.get_file_content(&file_name)?;
-                let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
-
-                self.add_file(sync_directory, sync_relative_path, content, content_hash)?;
-            }
-            DebouncedEventKind::Move { from, to } => {
-                let any_path = from.as_ref().or(to.as_ref()).unwrap();
-                let sync_directory = self.sync_directory_for_path(any_path)?;
-
-                if let Some(from) = &from
-                    && let Some(to) = &to
-                {
-                    // Move within the directory.
-
-                    let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
-                    let relative_to = to.strip_prefix(&sync_directory.path).unwrap();
-
-                    if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
-                        self.update_file_path(sync_directory, file_id, relative_to)?;
-                    } else {
-                        for sync_file in self.get_all_files_at(sync_directory, relative_from)? {
-                            let path = PathBuf::from(sync_file.path);
-                            let relative_path = path.strip_prefix(relative_from).unwrap();
-                            let new_path = relative_to.join(relative_path);
-
-                            self.update_file_path(sync_directory, sync_file.file_id, new_path)?;
-                        }
-                    }
-                } else if let Some(from) = from {
-                    // Files was moved here from outside of the synced directory.
-
-                    let relative_from = from.strip_prefix(&sync_directory.path).unwrap();
-
-                    if let Ok(file_id) = self.get_file_id(sync_directory, relative_from) {
-                        self.remove_file_by_id(sync_directory, file_id)?;
-                    } else {
-                        for sync_file in self.get_all_files_at(sync_directory, relative_from)? {
-                            self.remove_file_by_id(sync_directory, sync_file.file_id)?;
-                        }
-                    }
-                } else if let Some(to) = to {
-                    // Files was moved outside of the synced directory.
-
-                    if to.is_file() {
-                        let (content, content_hash) = self.get_file_content(&to)?;
-                        let sync_relative_path = to.strip_prefix(&sync_directory.path).unwrap();
-
-                        self.add_file(sync_directory, sync_relative_path, content, content_hash)?;
-                    } else if to.is_dir() {
-                        for entry in WalkDir::new(&to)
-                            .into_iter()
-                            .filter_map(|entry| entry.ok())
-                            .filter(|entry| entry.file_type().is_file())
-                        {
-                            let (content, content_hash) = self.get_file_content(entry.path())?;
-                            let sync_relative_path =
-                                entry.path().strip_prefix(&sync_directory.path).unwrap();
-
-                            self.add_file(
-                                sync_directory,
-                                sync_relative_path,
-                                content,
-                                content_hash,
-                            )?;
-                        }
-                    } else {
-                        log::warn!(
-                            "A file that is not a regular file or a directory was detected. This is unsupported at the moment"
-                        );
-                    }
-                } else {
-                    log::error!("Received an empty move. This should never happen");
-                }
-            }
-            DebouncedEventKind::Modify { file_name } => {
-                let sync_directory = self.sync_directory_for_path(&file_name)?;
-                let (content, content_hash) = self.get_file_content(&file_name)?;
-                let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
-                let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
-
-                self.update_file_content(sync_directory, file_id, content, content_hash)?;
-            }
-            DebouncedEventKind::Remove { file_name } => {
-                let sync_directory = self.sync_directory_for_path(&file_name)?;
-                let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
-                let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
-
-                self.remove_file_by_id(sync_directory, file_id)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn run(&mut self) {
-        self.run_initial_sync();
-
-        log::info!("Directories are fully synced");
-
-        // TODO: Check for skip entries that are too old somewhere.
-        // Likely also needs to save the timestamp for that.
-        let mut skip_queue = Vec::new();
-
-        loop {
-            tokio::select! {
-                skip_event = self.skip_events.recv() => {
-                    let Some(event) = skip_event else {
-                        // TODO: Maybe this is an error?
-                        break;
-                    };
-
-                    skip_queue.push(event);
-                },
-                watcher_event = self.watcher_events.recv() => {
-                    let Some(event) = watcher_event else {
-                        // TODO: Maybe this is an error?
-                        break;
-                    };
-
-                    log::debug!("Received event: {:?}", event);
-
-                    if let Some(index) = skip_queue.iter().position(|skip_event| *skip_event == event) {
-                        log::debug!("Event was emitted locally and will thus be ignored");
-                        skip_queue.remove(index);
-                    }
-
-                    if let Err(error) = self.handle_event(event) {
-                        log::error!("Failed to handle event: {:?}", error);
-                    }
-                },
-            }
-        }
     }
 }

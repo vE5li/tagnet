@@ -70,12 +70,19 @@ pub mod tag {
 }
 
 pub mod state {
+    use std::path::PathBuf;
+
     use serde::{Deserialize, Serialize};
 
     use crate::{
         FileId, TagId,
         tag::{MetadataFormat, MetadataValues},
     };
+
+    pub enum ChangeOrigin {
+        Local { directory_path: PathBuf },
+        Peer { public_key: String },
+    }
 
     /// Anything a client can request the server to do. Add/edit/remove files and tags (including
     /// tag metadata), tag files or tags.
@@ -92,7 +99,7 @@ pub mod state {
             path: String,
             // encoding: ,
             content: Vec<u8>,
-            // tags: Vec<TagId>,
+            tags: Vec<TagId>,
         },
         FileMoved {
             file_id: FileId,
@@ -164,6 +171,10 @@ macro_rules! make_id_type {
         impl $name {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
+            }
+
+            pub fn from_string(uuid: &str) -> Option<Self> {
+                Some(Self(Uuid::try_from(uuid).ok()?))
             }
 
             pub fn to_string(&self) -> String {

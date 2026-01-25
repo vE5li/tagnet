@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{collections::BTreeSet, fs::File, path::Path};
 
 use rusqlite::{
     Connection, ToSql,
@@ -6,6 +6,12 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use tagnet_core::{FileId, TagId, tag::MetadataFormat};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtagRule {
+    Include,
+    Exclude,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryType {
@@ -128,15 +134,14 @@ impl FileDatabase {
 
         Ok(())
     }
-}
 
-/*
     /// Add a new tag.
- pub fn add_tag(
+    pub fn add_tag(
         &self,
+        tag_id: TagId,
         name: impl Into<String>,
         color: impl Into<String>,
-    ) -> Result<TagId, DatabaseError> {
+    ) -> Result<(), DatabaseError> {
         let name = name.into();
         let color = color.into();
 
@@ -152,12 +157,12 @@ impl FileDatabase {
 
         self.connection
             .execute(
-                "INSERT INTO tags (name, color) VALUES (?1, ?2)",
-                [&name, &color],
+                "INSERT INTO tags (id, name, color) VALUES (?1, ?2, ?3)",
+                (tag_id, &name, &color),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(TagId(self.connection.last_insert_rowid()))
+        Ok(())
     }
 
     pub fn remove_tag(&self, tag_id: TagId) -> Result<(), DatabaseError> {
@@ -186,58 +191,6 @@ impl FileDatabase {
 
         Ok(())
     }
-
-    // pub fn get_preview(
-    //     &self,
-    //     preview_id: PreviewId,
-    //     preview_size: PreviewSize,
-    //     // TODO: Not a DatabaseError, might also be a client (Nextcloud) error.
-    // ) -> Result<String, DatabaseError> {
-    //     let column = match preview_size {
-    //         PreviewSize::Small => "small",
-    //         PreviewSize::Medium => "medium",
-    //         PreviewSize::Big => "big",
-    //     };
-    //
-    //     let query = format!("SELECT {column} FROM previews WHERE id = ?1");
-    //     let mut statement = self
-    //         .connection
-    //         .prepare(&query)
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let preview = statement
-    //         .query_map([preview_id], |row| row.get(0))
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-    //         .map(|preview| preview.unwrap())
-    //         .next()
-    //         .ok_or(DatabaseError::MissingFile)?;
-    //
-    //     Ok(preview)
-    // }
-    //
-    // pub fn set_preview(
-    //     &self,
-    //     file_id: FileId,
-    //     previews: (String, String, String),
-    // ) -> Result<PreviewId, DatabaseError> {
-    //     self.connection
-    //         .execute(
-    //             "INSERT INTO previews (small, medium, big) VALUES (?1, ?2, ?3)",
-    //             previews,
-    //         )
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let preview_id = PreviewId(self.connection.last_insert_rowid());
-    //
-    //     self.connection
-    //         .execute(
-    //             "UPDATE files SET preview_id = ?2 WHERE id = ?1",
-    //             (file_id, Some(preview_id)),
-    //         )
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     Ok(preview_id)
-    // }
 
     /// Tag a tag with the provided tag.
     pub fn tag_tag(&self, tag_id: TagId, subtag_id: TagId) -> Result<(), DatabaseError> {
@@ -471,6 +424,60 @@ impl FileDatabase {
 
         Ok(tags)
     }
+}
+
+/*
+    // pub fn get_preview(
+    //     &self,
+    //     preview_id: PreviewId,
+    //     preview_size: PreviewSize,
+    //     // TODO: Not a DatabaseError, might also be a client (Nextcloud) error.
+    // ) -> Result<String, DatabaseError> {
+    //     let column = match preview_size {
+    //         PreviewSize::Small => "small",
+    //         PreviewSize::Medium => "medium",
+    //         PreviewSize::Big => "big",
+    //     };
+    //
+    //     let query = format!("SELECT {column} FROM previews WHERE id = ?1");
+    //     let mut statement = self
+    //         .connection
+    //         .prepare(&query)
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     let preview = statement
+    //         .query_map([preview_id], |row| row.get(0))
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+    //         .map(|preview| preview.unwrap())
+    //         .next()
+    //         .ok_or(DatabaseError::MissingFile)?;
+    //
+    //     Ok(preview)
+    // }
+    //
+    // pub fn set_preview(
+    //     &self,
+    //     file_id: FileId,
+    //     previews: (String, String, String),
+    // ) -> Result<PreviewId, DatabaseError> {
+    //     self.connection
+    //         .execute(
+    //             "INSERT INTO previews (small, medium, big) VALUES (?1, ?2, ?3)",
+    //             previews,
+    //         )
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     let preview_id = PreviewId(self.connection.last_insert_rowid());
+    //
+    //     self.connection
+    //         .execute(
+    //             "UPDATE files SET preview_id = ?2 WHERE id = ?1",
+    //             (file_id, Some(preview_id)),
+    //         )
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     Ok(preview_id)
+    // }
 
     /// Get all files.
     pub fn all_files(&self) -> Result<impl IntoIterator<Item = File>, DatabaseError> {
@@ -714,29 +721,37 @@ impl FileDatabase {
         Ok(())
     }
 
-    // pub fn show_tags(&self) -> Result<(), DatabaseError> {
-    //     let mut statement = self
-    //         .connection
-    //         .prepare("SELECT id, name, color FROM tags")
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-    //
-    //     let iterator = statement
-    //         .query_map([], |row| {
-    //             Ok(Tag {
-    //                 id: row.get(0)?,
-    //                 name: row.get(1)?,
-    //                 color: row.get(2)?,
-    //             })
-    //         })
-    //         .unwrap();
-    //
-    //     for tag in iterator {
-    //         println!("{:?}", tag.unwrap());
-    //     }
-    //
-    //     Ok(())
-    // }
-    //
+    pub fn show_tags(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[allow(dead_code)]
+        pub struct Tag {
+            pub id: TagId,
+            pub name: String,
+            pub color: String,
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, color FROM tags")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                })
+            })
+            .unwrap();
+
+        for tag in iterator {
+            println!("{:?}", tag.unwrap());
+        }
+
+        Ok(())
+    }
+
     // pub fn show_entries(&self) -> Result<(), DatabaseError> {
     //     #[derive(Debug)]
     //     #[allow(dead_code)]
@@ -855,12 +870,34 @@ impl SyncDirectoryDatabase {
         Ok(())
     }
 
-    pub fn remove_file_by_path(&self, path: impl AsRef<str>) -> Result<(), DatabaseError> {
-        self.connection
-            .execute("DELETE FROM files WHERE path = ?1", [path.as_ref()])
+    // pub fn remove_file_by_path(&self, path: impl AsRef<str>) -> Result<(), DatabaseError> {
+    //     self.connection
+    //         .execute("DELETE FROM files WHERE path = ?1", [path.as_ref()])
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     Ok(())
+    // }
+
+    pub fn get_file(&self, file_id: FileId) -> Result<SyncDirectoryFile, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, content_hash FROM files WHERE id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(())
+        let file = statement
+            .query_map([file_id], |row| {
+                Ok(SyncDirectoryFile {
+                    file_id,
+                    path: row.get(0)?,
+                    content_hash: row.get(1)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|preview| preview.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(file)
     }
 
     pub fn get_file_id(&self, path: impl AsRef<str>) -> Result<FileId, DatabaseError> {
