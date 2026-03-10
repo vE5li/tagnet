@@ -1,8 +1,16 @@
 {
   inputs = {
-    flake-utils.url = "github:numtide/flake-utils";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    flake-utils = {
+      url = "github:numtide/flake-utils";
+    };
+
+    nixpkgs = {
+      url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    };
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+    };
   };
 
   outputs = {
@@ -15,7 +23,6 @@
       system: let
         overlays = [(import rust-overlay)];
         pkgs = (import nixpkgs) {inherit system overlays;};
-        # frontend = pkgs.writeShellScriptBin "frontend" "(cd tagnet && deno task tauri dev)";
       in {
         formatter = pkgs.alejandra;
 
@@ -28,7 +35,6 @@
             ];
             buildInputs = with pkgs; [
               openssl
-              # frontend
             ];
 
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
