@@ -39,7 +39,7 @@
 //! - [`IpcClientBackend`] is the **client side** (portability plan section 6's
 //!   IPC-client backend): it connects to the socket, serialises API calls, and
 //!   returns results/events. It implements [`TransportBackend`], so the Dart UI
-//!   (via `flutter_rust_bridge`) and `tagnet-cli` talk to it exactly as they
+//!   (via `flutter_rust_bridge`) and the `tagnet` CLI talk to it exactly as they
 //!   would the in-process backend.
 
 use std::{
@@ -81,6 +81,11 @@ pub enum ControlRequest {
     // Reads (plan 5.3).
     ListTags,
     ListFiles,
+    /// Resolve a full-or-short file id prefix to a single `FileId`. Answered
+    /// with [`ControlResponse::FileId`] (or an `Error`).
+    ResolveFileId {
+        prefix: String,
+    },
     TagsForFile {
         file_id: FileId,
         subtag_rule: SubtagRule,
@@ -361,6 +366,10 @@ async fn dispatch(
             Ok(files) => ControlResponse::Files(files),
             Err(error) => ControlResponse::Error(error),
         },
+        ControlRequest::ResolveFileId { prefix } => match api.resolve_file_id(&prefix) {
+            Ok(file_id) => ControlResponse::FileId(file_id),
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::TagsForFile {
             file_id,
             subtag_rule,
@@ -445,7 +454,7 @@ async fn send_control(
 /// A thin embedded Rust client that connects to the daemon's control socket,
 /// serialises [`TransportBackend`] calls into [`ControlRequest`]s, and awaits
 /// the matching [`ControlResponse`]. It is the Linux-daemon counterpart to
-/// `InProcessBackend`; the Dart UI (and [`tagnet-cli`]) never learn which they
+/// `InProcessBackend`; the Dart UI (and the `tagnet` CLI) never learn which they
 /// hold.
 ///
 /// A single background reader task owns the socket's read half and demultiplexes
@@ -624,6 +633,13 @@ impl TransportBackend for IpcClientBackend {
     async fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
         match self.call(ControlRequest::ListFiles).await? {
             ControlResponse::Files(files) => Ok(files),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
+        match self.call(ControlRequest::ResolveFileId { prefix }).await? {
+            ControlResponse::FileId(file_id) => Ok(file_id),
             other => Err(unexpected(other)),
         }
     }

@@ -24,14 +24,14 @@ flutter_rust_bridge = ["dep:flutter_rust_bridge"]
 generated = ["flutter_rust_bridge"]
 
 [dependencies]
-tagnet = { path = "../tagnet" }
+tagnetd = { path = "../tagnetd" }
 tagnet-core = { workspace = true }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync"] }
 log = "0.4"
 
 # Pinned to the exact version of `flutter_rust_bridge_codegen` in the dev shell
 # (flake.nix); the runtime crate and the generator must match.
-flutter_rust_bridge = { version = "=2.11.1", optional = true }
+flutter_rust_bridge = { version = "=2.12.0", optional = true }
 
 # Route the core's `log` output to logcat on Android instead of `env_logger`
 # (which targets a shell/stderr that Android does not have). Only compiled for

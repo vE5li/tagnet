@@ -1,212 +1,445 @@
-//! Thin desktop CLI wrapper around the `tagnet` library.
+//! `tagnet` (CLI client): the first consumer of the IPC-client backend
+//! (portability plan section 7).
 //!
-//! All runtime logic lives in the library (`tagnet::run`); this
-//! binary only parses arguments, resolves on-disk paths from the environment,
-//! and wires up a Ctrl-C handler to the library's cooperative shutdown.
+//! Historically this tool opened a WebSocket to the daemon's **peer-sync** port
+//! and hand-built a `Change::FileAdded`, duplicating what `api::Api::upload_file`
+//! now does — and it was broken end-to-end because it never performed the peer
+//! handshake the daemon requires on that port.
+//!
+//! It now talks to the daemon's **local control socket** (a Unix domain socket
+//! at the fixed path `/run/tagnet/tagnet.sock`) via the section-6
+//! [`IpcClientBackend`] and calls the section-5 API. This both fixes the tool
+//! and validates the IPC-client backend with a minimal, UI-free consumer. The
+//! control socket is **not** the peer-sync port; local control is never routed
+//! through the network listener.
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use tagnet::{
-    RunPaths, ShutdownSignal,
-    configuration::{Configuration, SyncType},
-    control::serve_control,
-    database::FileDatabase,
-    identity::Identity,
-    paths::{Paths, control_socket_path},
-};
-use tagnet_core::TagId;
+use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
+use owo_colors::OwoColorize;
+use tagnet_core::{FileId, TagId};
+use tagnetd::{control::IpcClientBackend, database::SubtagRule, transport::TransportBackend};
+
+/// Number of leading characters needed to uniquely identify `target` among
+/// `all` ids (jj-style short change ids).
+///
+/// This is intentionally simple (O(n * len) per id) — correctness first, we can
+/// optimize with a shared prefix trie later once the behaviour is validated.
+fn unique_prefix_length(target: &str, all: &[String]) -> usize {
+    for length in 1..=target.len() {
+        let prefix = &target[..length];
+        let collisions = all
+            .iter()
+            .filter(|other| other.as_str() != target && other.starts_with(prefix))
+            .count();
+        if collisions == 0 {
+            return length;
+        }
+    }
+    target.len()
+}
+
+/// Render an id with its unique prefix highlighted and the remainder dimmed,
+/// mirroring how `jj` displays change ids.
+fn highlight_id(id: &str, prefix_length: usize) -> String {
+    let (unique, rest) = id.split_at(prefix_length.min(id.len()));
+    format!("{}{}", unique.magenta().bold(), rest.bright_black())
+}
+
+/// Resolve a user-supplied file id — a full id or any unambiguous short-id
+/// prefix (as shown by `list-files`) — to a full [`FileId`] via the daemon.
+///
+/// This is the single entry point every command that accepts a file id should
+/// use, so short ids work uniformly everywhere. Resolution is done daemon-side
+/// against all files, so uniqueness is re-checked at use time (a prefix that
+/// was unique when displayed may since have become ambiguous).
+async fn resolve_file_id(backend: &IpcClientBackend, input: &str) -> Result<FileId, String> {
+    backend
+        .resolve_file_id(input.to_owned())
+        .await
+        .map_err(|error| match error {
+            tagnetd::api::ApiError::NotFound => format!("no file matches id '{input}'"),
+            other => other.to_string(),
+        })
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Arguments {
+    /// Path to the daemon's control socket. Defaults to the fixed
+    /// `/run/tagnet/tagnet.sock`; override only for non-standard launches.
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    // FIX: Remove, for development only.
-    Reset {
-        configuration_file: PathBuf,
+    /// Upload a file's contents to the daemon, optionally tagging it.
+    #[command(visible_alias = "u")]
+    Upload {
+        /// File on disk to read and upload.
+        path: PathBuf,
+        /// Tag ids (UUIDs) to apply to the uploaded file.
+        #[arg(long = "tag", value_name = "TAG_ID")]
+        tags: Vec<String>,
     },
-    /// Create this machine's long-lived identity key in `~/.tagnet`.
-    Keygen,
-    /// Write an example configuration file, filling in this machine's public key.
-    Generate {
-        file_name: PathBuf,
+    /// List all tags known to the daemon.
+    #[command(visible_alias = "lt")]
+    ListTags,
+    /// List all files known to the daemon.
+    #[command(visible_aliases = ["lf", "ls"])]
+    ListFiles,
+    /// Create a tag; prints the newly-minted tag id.
+    #[command(visible_alias = "ct")]
+    CreateTag {
+        name: String,
+        #[arg(long, default_value = "red")]
+        color: String,
     },
-    Run {
-        configuration_file: PathBuf,
+    /// List the files carrying a tag (the v1 single-tag search).
+    #[command(visible_alias = "ft")]
+    FilesForTag { tag_id: String },
+    /// Edit a file in `$EDITOR`, fetching it from a peer first if it is not
+    /// present locally, and writing back any changes.
+    #[command(visible_alias = "e")]
+    Edit {
+        /// The file to edit, given as a full id or any unambiguous short-id
+        /// prefix of it (as shown by `list-files`).
+        id: String,
     },
-}
-
-/// Resolve on-disk paths from the environment.
-///
-/// The library no longer reads the environment itself; the desktop binary is
-/// responsible for turning `TAGNET_DATA_DIR` / `TAGNET_PRIVATE_KEY_FILE` into a
-/// [`Paths`]. Panicking here (rather than deep in the library) keeps the
-/// failure mode obvious for a shell-launched daemon.
-fn paths_from_env() -> Paths {
-    let data_dir =
-        std::env::var("TAGNET_DATA_DIR").expect("TAGNET_DATA_DIR environment variable not set");
-    let identity_file = std::env::var("TAGNET_PRIVATE_KEY_FILE")
-        .expect("TAGNET_PRIVATE_KEY_FILE environment variable not set");
-    Paths::new(data_dir, identity_file)
+    /// Download a file into the downloads directory, fetching it from a peer
+    /// first if it is not present locally.
+    #[command(visible_alias = "d")]
+    Download {
+        /// The file to download, given as a full id or any unambiguous
+        /// short-id prefix of it (as shown by `list-files`).
+        id: String,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), std::io::Error> {
-    env_logger::init();
-
+async fn main() -> ExitCode {
     let arguments = Arguments::parse();
 
-    match arguments.command {
-        // FIX: Remove, for development only.
-        Commands::Reset { configuration_file } => {
-            let paths = paths_from_env();
-            let data_dir = paths.data_dir();
-            log::info!("Re-creating {}", data_dir.to_string_lossy());
-            std::fs::remove_dir_all(data_dir).unwrap();
-            std::fs::create_dir(data_dir).unwrap();
-
-            let configuration = Configuration::new(configuration_file);
-            for sync_directory in configuration.sync_directories {
-                if let SyncType::Universal = sync_directory.sync_type {
-                    log::info!("Re-creating {}", sync_directory.path.to_string_lossy());
-                    std::fs::remove_dir_all(&sync_directory.path).unwrap();
-                    std::fs::create_dir(&sync_directory.path).unwrap();
-                }
-            }
-
-            let database = FileDatabase::initialize(paths.main_db_path())
-                .expect("Failed to open database file");
-
-            database
-                .add_tag(
-                    TagId::from_string("e1de1ee0-3dec-47b2-8e95-842c0acc0dfd").unwrap(),
-                    "screenshots",
-                    "red",
-                )
-                .unwrap();
-            database
-                .add_tag(
-                    TagId::from_string("ca39bd61-1b06-4907-b36f-e7a968793e48").unwrap(),
-                    "computer",
-                    "red",
-                )
-                .unwrap();
-            database
-                .add_tag(
-                    TagId::from_string("5a0e2939-f881-4c55-a349-cbb91c082057").unwrap(),
-                    "image",
-                    "red",
-                )
-                .unwrap();
-
-            database.show_content(false).unwrap();
+    // Connect the IPC-client backend to the daemon's control socket.
+    let backend = match &arguments.socket {
+        Some(path) => IpcClientBackend::connect(path).await,
+        None => IpcClientBackend::connect_default().await,
+    };
+    let backend = match backend {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("Failed to connect to the tagnet daemon control socket: {error}");
+            eprintln!("Is the daemon running? (tagnet run <config>)");
+            return ExitCode::FAILURE;
         }
-        // FIX: Refactor, just output to stdout instead of writing to a file.
-        Commands::Keygen => {
-            let paths = paths_from_env();
-            let path = paths.identity_path();
-            if path.exists() {
-                panic!(
-                    "An identity key already exists at {}. Refusing to overwrite it; \
-                     delete it manually if you really want to rotate this machine's identity.",
-                    path.display()
-                );
-            }
-            std::fs::create_dir_all(paths.data_dir()).unwrap();
+    };
 
-            let identity = Identity::generate();
-            identity.save(path).unwrap_or_else(|error| {
-                panic!(
-                    "Failed to write identity key to {}: {error}",
-                    path.display()
-                )
-            });
-
-            log::info!("Generated identity key at {}", path.display());
-            log::info!("Public key: {}", identity.public_key());
-        }
-        // FIX: Remove, for development only.
-        Commands::Generate { file_name } => {
-            let paths = paths_from_env();
-            let path = paths.identity_path();
-            let _identity = Identity::load(path).unwrap_or_else(|error| {
-                panic!(
-                    "No usable identity key at {} ({error}). Run 'tagnet keygen' first.",
-                    path.display()
-                )
-            });
-
-            let configuration = Configuration::new_example();
-            configuration.write_to_file(file_name);
-        }
-        Commands::Run { configuration_file } => {
-            let paths = paths_from_env();
-            let configuration = Configuration::new(configuration_file);
-
-            let run_paths = RunPaths {
-                data_dir: paths.data_dir().to_path_buf(),
-                identity_file: paths.identity_path().to_path_buf(),
-            };
-
-            // Wire Ctrl-C to the library's cooperative shutdown so the daemon
-            // (and systemd stop) exits cleanly instead of being killed.
-            let shutdown = ShutdownSignal::new();
-
-            {
-                let shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = tokio::signal::ctrl_c().await {
-                        log::warn!("Failed to listen for Ctrl-C: {error}");
-                        return;
-                    }
-                    log::info!("Received Ctrl-C; shutting down");
-                    shutdown.shutdown();
-                });
-            }
-
-            // Start the runtime, keeping the UI-facing `Api` so we can also
-            // serve the local control socket (portability plan section 7):
-            // the desktop daemon owns the DB, and a separate UI process attaches
-            // over this socket. It shares the runtime's shutdown signal so a
-            // Ctrl-C / systemd stop tears both down together.
-            let (api, driver) = match tagnet::run(configuration, run_paths, shutdown.clone()).await
-            {
-                Ok(pair) => pair,
-                Err(error) => {
-                    log::error!("tagnet runtime failed to start: {error}");
-                    return Err(std::io::Error::other(error.to_string()));
-                }
-            };
-
-            let control_socket = control_socket_path();
-            let control = tokio::spawn(serve_control(
-                api,
-                control_socket,
-                shutdown.token().child_token(),
-            ));
-
-            let run_result = driver.await;
-
-            // The runtime driver returned (shutdown observed). Make sure the
-            // control task also winds down and log any late error.
-            shutdown.shutdown();
-            match control.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log::warn!("Control socket error: {error}"),
-                Err(error) => log::warn!("Control task panicked: {error}"),
-            }
-
-            if let Err(error) = run_result {
-                log::error!("tagnet runtime failed: {error}");
-                return Err(std::io::Error::other(error.to_string()));
-            }
+    match run(&backend, arguments.command).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
         }
     }
+}
 
+async fn run(backend: &IpcClientBackend, command: Commands) -> Result<(), String> {
+    match command {
+        Commands::Upload { path, tags } => {
+            let content = std::fs::read(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            let path_name = path
+                .file_name()
+                .ok_or_else(|| format!("{} has no file name", path.display()))?
+                .to_string_lossy()
+                .to_string();
+            let tags = parse_tag_ids(&tags)?;
+
+            let file_id = backend
+                .upload_file(path_name, content, tags)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("Uploaded as file {}", file_id.to_string());
+        }
+        Commands::ListTags => {
+            let tags = backend
+                .list_tags()
+                .await
+                .map_err(|error| error.to_string())?;
+            if tags.is_empty() {
+                println!("(no tags)");
+            } else {
+                let ids: Vec<String> = tags.iter().map(|tag| tag.id.to_string()).collect();
+
+                let mut table = Table::new();
+                table
+                    .load_preset(UTF8_FULL)
+                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_header(vec!["Tag ID", "Name", "Color"]);
+
+                for tag in &tags {
+                    let id = tag.id.to_string();
+                    let prefix_length = unique_prefix_length(&id, &ids);
+                    table.add_row(vec![
+                        Cell::new(highlight_id(&id, prefix_length)),
+                        Cell::new(&tag.name),
+                        Cell::new(&tag.color),
+                    ]);
+                }
+
+                println!("{table}");
+            }
+        }
+        Commands::ListFiles => {
+            let files = backend
+                .list_files()
+                .await
+                .map_err(|error| error.to_string())?;
+            if files.is_empty() {
+                println!("(no files)");
+            } else {
+                // Map tag ids to names so we can show human-readable tags per
+                // file. Fetched once for the whole listing.
+                let tag_names: HashMap<TagId, String> = backend
+                    .list_tags()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(|tag| (tag.id, tag.name))
+                    .collect();
+
+                let mut table = Table::new();
+                table
+                    .load_preset(UTF8_FULL)
+                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_header(vec!["File ID", "Path", "Version", "Tags"]);
+
+                for file in &files {
+                    let id = file.file_id.to_string();
+                    // The daemon computes the shortest unique prefix against
+                    // *all* files in the database, not just the ones printed
+                    // here, so a short id shown by `list-files` is meaningful as
+                    // a lookup key for other commands.
+                    let prefix_length = file.short_id_length;
+
+                    // Simple per-file lookup for now; can be batched later if it
+                    // becomes a bottleneck.
+                    let tag_ids = backend
+                        .tags_for_file(file.file_id, SubtagRule::Exclude)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let tags = tag_ids
+                        .iter()
+                        .map(|tag_id| {
+                            tag_names
+                                .get(tag_id)
+                                .cloned()
+                                .unwrap_or_else(|| tag_id.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    table.add_row(vec![
+                        Cell::new(highlight_id(&id, prefix_length)),
+                        Cell::new(&file.logical_path),
+                        Cell::new(format!("v{}", file.version_number)),
+                        Cell::new(tags),
+                    ]);
+                }
+
+                println!("{table}");
+            }
+        }
+        Commands::CreateTag { name, color } => {
+            let tag_id = backend
+                .create_tag(name, color)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("{}", tag_id.to_string());
+        }
+        Commands::FilesForTag { tag_id } => {
+            let tag_id =
+                TagId::from_string(&tag_id).ok_or_else(|| format!("invalid tag id: {tag_id}"))?;
+            let file_ids = backend
+                .files_for_tag(tag_id, SubtagRule::Exclude)
+                .await
+                .map_err(|error| error.to_string())?;
+            if file_ids.is_empty() {
+                println!("(no files)");
+            }
+            for file_id in file_ids {
+                println!("{}", file_id.to_string());
+            }
+        }
+        Commands::Edit { id } => {
+            let file_id = resolve_file_id(backend, &id).await?;
+            edit_file(backend, file_id).await?;
+        }
+        Commands::Download { id } => {
+            let file_id = resolve_file_id(backend, &id).await?;
+            download_file(backend, file_id).await?;
+        }
+    }
     Ok(())
+}
+
+/// The `edit` flow.
+///
+/// - If the daemon reports the file is present in a local sync directory, open
+///   that real file directly in `$EDITOR`. The daemon's filesystem watcher
+///   picks up the save and propagates a `FileChanged` on its own — no explicit
+///   write-back, no temp file.
+/// - Otherwise fetch the bytes from a peer, drop them in a temp file, open the
+///   editor, and — only if the content actually changed — write the new bytes
+///   back with `edit_file`.
+async fn edit_file(backend: &IpcClientBackend, file_id: FileId) -> Result<(), String> {
+    if let Some(path) = backend
+        .local_path_for_file(file_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        open_in_editor(&path)?;
+        return Ok(());
+    }
+
+    // Not local: we need the expected content hash to fetch. It comes from the
+    // file's known metadata; if the daemon has never heard of this file there is
+    // nothing to fetch.
+    let files = backend
+        .list_files()
+        .await
+        .map_err(|error| error.to_string())?;
+    let expected_hash = files
+        .into_iter()
+        .find(|file| file.file_id == file_id)
+        .map(|file| file.content_hash)
+        .ok_or_else(|| format!("unknown file id: {}", file_id.to_string()))?;
+
+    let original = backend
+        .fetch_file(file_id, expected_hash)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // Write to a temp file, edit, read back. `into_temp_path` keeps the file on
+    // disk (deleted when the returned handle drops) while we shell out.
+    let temp = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("failed to create temp file: {error}"))?;
+    std::fs::write(temp.path(), &original)
+        .map_err(|error| format!("failed to write temp file: {error}"))?;
+
+    open_in_editor(temp.path())?;
+
+    let edited = std::fs::read(temp.path())
+        .map_err(|error| format!("failed to read temp file back: {error}"))?;
+
+    if edited == original {
+        println!("No changes");
+        return Ok(());
+    }
+
+    backend
+        .edit_file(file_id, edited)
+        .await
+        .map_err(|error| error.to_string())?;
+    println!("Edited file {}", file_id.to_string());
+    Ok(())
+}
+
+/// The `download` flow.
+///
+/// Shares its start with [`edit_file`]: locate the file's bytes — reading the
+/// real file if it lives in a local sync directory, otherwise fetching them
+/// from a peer — then, instead of editing, copy them into the user's downloads
+/// directory.
+async fn download_file(backend: &IpcClientBackend, file_id: FileId) -> Result<(), String> {
+    // Pull the file's metadata once: we need its content hash to fetch (if it
+    // isn't local) and its logical path to pick a sensible output filename.
+    let file = backend
+        .list_files()
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|file| file.file_id == file_id)
+        .ok_or_else(|| format!("unknown file id: {}", file_id.to_string()))?;
+
+    let bytes = if let Some(path) = backend
+        .local_path_for_file(file_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        std::fs::read(&path)
+            .map_err(|error| format!("failed to read local file {}: {error}", path.display()))?
+    } else {
+        backend
+            .fetch_file(file_id, file.content_hash)
+            .await
+            .map_err(|error| error.to_string())?
+    };
+
+    // Name the download after the file's logical path's final component, so a
+    // nested `foo/bar/name.txt` lands as `name.txt`. Fall back to the file id
+    // if the logical path has no usable component.
+    let logical = file.logical_path.to_string();
+    let file_name = logical
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(&logical);
+    let file_name = if file_name.is_empty() {
+        file_id.to_string()
+    } else {
+        file_name.to_owned()
+    };
+
+    let destination = downloads_dir()?.join(&file_name);
+    std::fs::write(&destination, &bytes)
+        .map_err(|error| format!("failed to write {}: {error}", destination.display()))?;
+
+    println!("Downloaded to {}", destination.display());
+    Ok(())
+}
+
+/// Resolve the directory downloads should be written to.
+///
+/// Follows the XDG user-dirs convention: prefer `$XDG_DOWNLOAD_DIR`, then fall
+/// back to `$HOME/Downloads`. The directory is created if it does not exist.
+fn downloads_dir() -> Result<PathBuf, String> {
+    let dir = if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| "cannot locate downloads directory: $HOME is not set".to_owned())?;
+        PathBuf::from(home).join("Downloads")
+    };
+
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "failed to create downloads directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Open `path` in the user's `$EDITOR` (falling back to `vi`), blocking until it
+/// exits. A non-zero editor exit is treated as an abort.
+fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
+    let status = std::process::Command::new(&editor)
+        .arg(path)
+        .status()
+        .map_err(|error| format!("failed to launch editor '{editor}': {error}"))?;
+    if !status.success() {
+        return Err(format!("editor '{editor}' exited without success"));
+    }
+    Ok(())
+}
+
+fn parse_tag_ids(raw: &[String]) -> Result<Vec<TagId>, String> {
+    raw.iter()
+        .map(|value| TagId::from_string(value).ok_or_else(|| format!("invalid tag id: {value}")))
+        .collect()
 }

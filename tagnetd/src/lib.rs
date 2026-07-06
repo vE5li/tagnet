@@ -25,7 +25,10 @@ use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 
 use tagnet_core::{
     FileId, PhysicalPath, TagId,
-    state::{Change, ChangeOrigin, Frame, ManifestEntry, Sync as SyncMessage},
+    state::{
+        Change, ChangeOrigin, Frame, ManifestEntry, RelationshipManifestEntry, Sync as SyncMessage,
+        TagManifestEntry,
+    },
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -76,6 +79,22 @@ impl From<RunPaths> for Paths {
     fn from(run_paths: RunPaths) -> Self {
         Paths::new(run_paths.data_dir, run_paths.identity_file)
     }
+}
+
+/// The shared routing handles every peer-connection task needs: the runtime
+/// peer table, the pending on-demand fetches, and the two senders into the
+/// change bus and sync-directory manager.
+///
+/// Bundled into one `Clone` struct so `handle_connection`, `connect_to_peer`,
+/// and `run_peer_session` can pass a single context around instead of the same
+/// four arguments each (which also keeps them under clippy's argument-count
+/// lint). All four fields are cheap to clone (`Arc`s / channel senders).
+#[derive(Clone)]
+struct PeerContext {
+    runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
+    pending_fetches: PendingFetches,
+    change_sender: UnboundedSender<DaemonMessage>,
+    command_sender: UnboundedSender<SyncDirectoryCommand>,
 }
 
 /// Cooperative shutdown handle for [`run`].
@@ -185,7 +204,7 @@ pub async fn run(
 
     let runtime_configuration = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
 
-    // Shared table of in-flight on-demand fetches (`tagnet-cli edit`). Seeded by
+    // Shared table of in-flight on-demand fetches (`tagnet edit`). Seeded by
     // `handle_changes` for local-origin requests and by peer sessions for
     // relayed ones; replies are routed by `request_id`. Owns the peer runtime so
     // its engine operations are plain methods. Cheap to clone (Arcs).
@@ -255,6 +274,15 @@ pub async fn run(
         shutdown.token().child_token(),
     ));
 
+    // The routing handles every peer-connection task needs. Built once and
+    // cloned per spawned task (below, and in the accept loop inside `driver`).
+    let peer_context = PeerContext {
+        runtime_configuration: runtime_configuration.clone(),
+        pending_fetches: pending_fetches.clone(),
+        change_sender: change_sender.clone(),
+        command_sender: command_sender.clone(),
+    };
+
     // Spawn one outbound connection task per peer that has an address configured.
     let mut peer_handles = Vec::new();
     for peer in &configuration.peers {
@@ -263,10 +291,7 @@ pub async fn run(
                 identity.clone(),
                 peer.clone(),
                 main_db_path.clone(),
-                change_sender.clone(),
-                command_sender.clone(),
-                runtime_configuration.clone(),
-                pending_fetches.clone(),
+                peer_context.clone(),
                 shutdown.token().child_token(),
             )));
         }
@@ -307,10 +332,7 @@ pub async fn run(
                                     configuration.clone(),
                                     identity.clone(),
                                     main_db_path.clone(),
-                                    runtime_configuration.clone(),
-                                    pending_fetches.clone(),
-                                    change_sender.clone(),
-                                    command_sender.clone(),
+                                    peer_context.clone(),
                                     stream,
                                     address,
                                     shutdown.token().child_token(),
@@ -355,10 +377,7 @@ async fn handle_connection(
     configuration: Configuration,
     identity: Arc<Identity>,
     main_db_path: PathBuf,
-    runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
-    pending_fetches: PendingFetches,
-    change_sender: UnboundedSender<DaemonMessage>,
-    command_sender: UnboundedSender<SyncDirectoryCommand>,
+    context: PeerContext,
     raw_stream: TcpStream,
     address: SocketAddr,
     shutdown: CancellationToken,
@@ -406,10 +425,7 @@ async fn handle_connection(
         &main_db_path,
         outgoing,
         incoming,
-        runtime_configuration,
-        pending_fetches,
-        change_sender,
-        command_sender,
+        context,
         &shutdown,
     )
     .await;
@@ -427,10 +443,7 @@ async fn connect_to_peer(
     identity: Arc<Identity>,
     peer: Peer,
     main_db_path: PathBuf,
-    change_sender: UnboundedSender<DaemonMessage>,
-    command_sender: UnboundedSender<SyncDirectoryCommand>,
-    runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
-    pending_fetches: PendingFetches,
+    context: PeerContext,
     shutdown: CancellationToken,
 ) {
     // TODO: Make this configurable.
@@ -530,10 +543,7 @@ async fn connect_to_peer(
                     &main_db_path,
                     outgoing,
                     incoming,
-                    runtime_configuration.clone(),
-                    pending_fetches.clone(),
-                    change_sender.clone(),
-                    command_sender.clone(),
+                    context.clone(),
                     &shutdown,
                 )
                 .await;
@@ -623,14 +633,17 @@ async fn run_peer_session<S>(
     main_db_path: &std::path::Path,
     mut outgoing: SplitSink<WebSocketStream<S>, Message>,
     mut incoming: SplitStream<WebSocketStream<S>>,
-    runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
-    pending_fetches: PendingFetches,
-    change_sender: UnboundedSender<DaemonMessage>,
-    command_sender: UnboundedSender<SyncDirectoryCommand>,
+    context: PeerContext,
     shutdown: &CancellationToken,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let PeerContext {
+        runtime_configuration,
+        pending_fetches,
+        change_sender,
+        command_sender,
+    } = context;
     // FileDatabase wraps a rusqlite Connection which is Send but not Sync.
     // We must never hold `&FileDatabase` across an `.await` in this task,
     // otherwise tokio::spawn rejects the future as non-Send. All sync helpers
@@ -721,6 +734,32 @@ async fn run_peer_session<S>(
         }
     }
 
+    // Send our tag manifest right after the file manifest. Same anti-entropy
+    // idea, driven by last-writer-wins timestamps instead of version chains.
+    match build_local_tag_manifest(&database) {
+        Ok((definitions, relationships)) => {
+            let frame = Frame::Sync(SyncMessage::TagManifest {
+                definitions,
+                relationships,
+            });
+            if let Err(error) = send_frame(&mut outgoing, &frame).await {
+                log::warn!("Failed to send initial tag manifest to {peer_name}: {error}");
+                clear_outbound_if_owned(
+                    &runtime_configuration,
+                    peer_public_key,
+                    owns_outbound,
+                    &our_sender,
+                )
+                .await;
+                return;
+            }
+            log::debug!("Sent initial tag manifest to {peer_name}");
+        }
+        Err(error) => {
+            log::error!("Peer {peer_name}: failed to build initial tag manifest: {error:?}");
+        }
+    }
+
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -778,13 +817,13 @@ async fn run_peer_session<S>(
                         // synchronous reconciliation. Doing the DB work
                         // outside of any held `RwLockReadGuard` keeps this
                         // future `Send` (FileDatabase isn't Sync).
-                        let outbound = {
-                            let runtime = runtime_configuration.read().await;
-                            runtime
-                                .peers
-                                .get(peer_public_key)
-                                .and_then(|runtime_peer| runtime_peer.outbound.clone())
-                        };
+                        let outbound = runtime_configuration
+                            .read()
+                            .await
+                            .peers
+                            .get(peer_public_key)
+                            .and_then(|runtime_peer| runtime_peer.outbound.clone());
+
                         let Some(outbound) = outbound else {
                             log::warn!(
                                 "No outbound channel registered for {peer_name}; \
@@ -792,6 +831,7 @@ async fn run_peer_session<S>(
                             );
                             continue;
                         };
+
                         reconcile_peer_manifest(
                             peer_name,
                             entries,
@@ -900,6 +940,69 @@ async fn run_peer_session<S>(
                         pending_fetches
                             .handle_incoming_missing(peer_public_key, request_id)
                             .await;
+                    }
+                    Frame::Sync(SyncMessage::TagManifest {
+                        definitions,
+                        relationships,
+                    }) => {
+                        // Relationships carry their whole state (including the
+                        // soft-delete flag), so apply them directly via the bus
+                        // — last-writer-wins is enforced in the DB layer. For
+                        // definitions, request the full payload of any the peer
+                        // has newer than (or that are unknown to) us.
+                        let outbound = runtime_configuration
+                            .read()
+                            .await
+                            .peers
+                            .get(peer_public_key)
+                            .and_then(|runtime_peer| runtime_peer.outbound.clone());
+                        let Some(outbound) = outbound else {
+                            log::warn!(
+                                "No outbound channel registered for {peer_name}; \
+                                 cannot answer tag manifest"
+                            );
+                            continue;
+                        };
+                        reconcile_peer_tag_manifest(
+                            peer_name,
+                            peer_public_key,
+                            definitions,
+                            relationships,
+                            &database,
+                            &outbound,
+                            &change_sender,
+                        );
+                    }
+                    Frame::Sync(SyncMessage::TagRequest { tag_id }) => {
+                        // Answer with the full tag definition as a
+                        // `Change::TagAdded`, mirroring how `Sync::Request` is
+                        // answered with `Change::FileAdded`. `TagNotFound` if we
+                        // no longer hold the tag.
+                        let outbound = runtime_configuration
+                            .read()
+                            .await
+                            .peers
+                            .get(peer_public_key)
+                            .and_then(|runtime_peer| runtime_peer.outbound.clone());
+                        let Some(outbound) = outbound else {
+                            log::warn!(
+                                "No outbound channel for {peer_name}; \
+                                 dropping response to TagRequest"
+                            );
+                            continue;
+                        };
+                        let frame = build_tag_request_response(peer_name, tag_id, &database);
+                        if let Err(error) = outbound.send(frame) {
+                            log::warn!(
+                                "Failed to enqueue tag Sync response for {peer_name}: {error}"
+                            );
+                        }
+                    }
+                    Frame::Sync(SyncMessage::TagNotFound { tag_id }) => {
+                        log::warn!(
+                            "Peer {peer_name} reported TagNotFound for tag {}",
+                            tag_id.to_string()
+                        );
                     }
                 }
             }
@@ -1226,6 +1329,177 @@ fn build_request_response(
     }
 }
 
+/// Build our local tag manifest: lightweight definition entries (id +
+/// `modified_at`) plus every relationship (with its soft-delete state). The
+/// tag counterpart of [`build_local_manifest`].
+fn build_local_tag_manifest(
+    database: &FileDatabase,
+) -> Result<(Vec<TagManifestEntry>, Vec<RelationshipManifestEntry>), String> {
+    let definitions = database
+        .tag_manifest_entries()
+        .map_err(|e| format!("tag_manifest_entries: {e:?}"))?;
+    let relationships = database
+        .relationship_manifest_entries()
+        .map_err(|e| format!("relationship_manifest_entries: {e:?}"))?;
+    Ok((definitions, relationships))
+}
+
+/// Reconcile a peer's tag manifest against ours.
+///
+/// - **Definitions**: for each tag whose `modified_at` is newer than ours (or
+///   that we don't know), enqueue a `TagRequest`; the peer answers with a
+///   `Change::TagAdded` carrying the full definition. Older/equal definitions
+///   are skipped — the peer will request ours via the symmetric path.
+/// - **Relationships**: applied directly. Each carries its whole state, so we
+///   translate it into the matching relationship `Change` (tag/untag) stamped
+///   with the peer's `modified_at` and hand it to the single DB-writer, which
+///   enforces last-writer-wins. This routes through the same code path as a
+///   live relationship change, keeping behaviour uniform.
+///
+/// Pure of `.await` and holds no lock: takes `&FileDatabase` synchronously so
+/// the caller's future stays `Send`.
+fn reconcile_peer_tag_manifest(
+    peer_name: &str,
+    peer_public_key: &str,
+    definitions: Vec<TagManifestEntry>,
+    relationships: Vec<RelationshipManifestEntry>,
+    database: &FileDatabase,
+    outbound: &UnboundedSender<Frame>,
+    change_sender: &UnboundedSender<DaemonMessage>,
+) {
+    log::info!(
+        "Reconciling {} tag definitions and {} relationships from {peer_name}",
+        definitions.len(),
+        relationships.len()
+    );
+
+    for definition in definitions {
+        let ours = match database.tag_modified_at(definition.tag_id) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!(
+                    "tag_modified_at failed for {}: {error:?}",
+                    definition.tag_id.to_string()
+                );
+                continue;
+            }
+        };
+        // Request when we don't know the tag, or the peer's is strictly newer.
+        let need = match ours {
+            None => true,
+            Some(ours) => definition.modified_at > ours,
+        };
+        if need {
+            let frame = Frame::Sync(SyncMessage::TagRequest {
+                tag_id: definition.tag_id,
+            });
+            if let Err(error) = outbound.send(frame) {
+                log::warn!("Failed to enqueue TagRequest for {peer_name}: {error}");
+                return;
+            }
+        }
+    }
+
+    for relationship in relationships {
+        // LWW pre-check: skip anything not newer than what we hold. The DB layer
+        // also enforces this, but skipping here avoids bus traffic for no-ops.
+        let ours = match database.relationship_modified_at(
+            relationship.tag_id,
+            &relationship.target_id,
+            relationship.kind.into(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("relationship_modified_at failed: {error:?}");
+                continue;
+            }
+        };
+        if let Some(ours) = ours
+            && relationship.modified_at <= ours
+        {
+            continue;
+        }
+
+        let Some(change) = relationship_to_change(&relationship) else {
+            log::warn!(
+                "Skipping relationship with unparseable target_id {}",
+                relationship.target_id
+            );
+            continue;
+        };
+        if let Err(error) = change_sender.send(DaemonMessage::Change(
+            change,
+            ChangeOrigin::Peer {
+                public_key: peer_public_key.to_owned(),
+            },
+        )) {
+            log::error!("change_sender closed; cannot apply reconciled relationship: {error}");
+            return;
+        }
+    }
+}
+
+/// Translate a reconciled relationship manifest entry into the equivalent
+/// relationship `Change`, carrying the entry's `modified_at` so last-writer-wins
+/// is preserved. Returns `None` if `target_id` doesn't parse as the id kind.
+fn relationship_to_change(entry: &RelationshipManifestEntry) -> Option<Change> {
+    use tagnet_core::state::RelationshipKind;
+    let change = match (entry.kind, entry.deleted) {
+        (RelationshipKind::File, false) => Change::FileTagged {
+            file_id: FileId::from_string(&entry.target_id)?,
+            tag_id: entry.tag_id,
+            metadata: None,
+            modified_at: entry.modified_at,
+        },
+        (RelationshipKind::File, true) => Change::FileUntagged {
+            file_id: FileId::from_string(&entry.target_id)?,
+            tag_id: entry.tag_id,
+            modified_at: entry.modified_at,
+        },
+        (RelationshipKind::Tag, false) => Change::TagTagged {
+            taggee_id: TagId::from_string(&entry.target_id)?,
+            tag_id: entry.tag_id,
+            metadata: None,
+            modified_at: entry.modified_at,
+        },
+        (RelationshipKind::Tag, true) => Change::TagUntagged {
+            taggee_id: TagId::from_string(&entry.target_id)?,
+            tag_id: entry.tag_id,
+            modified_at: entry.modified_at,
+        },
+    };
+    Some(change)
+}
+
+/// Answer a peer's `TagRequest` with the full tag definition as a
+/// `Change::TagAdded`, or `TagNotFound` if we no longer hold the tag. The tag
+/// counterpart of [`build_request_response`].
+fn build_tag_request_response(peer_name: &str, tag_id: TagId, database: &FileDatabase) -> Frame {
+    match database.tag_definition(tag_id) {
+        Ok(Some((name, color, modified_at))) => Frame::Change(Change::TagAdded {
+            tag_id,
+            tag_name: name,
+            color,
+            metadata: None,
+            modified_at,
+        }),
+        Ok(None) => {
+            log::warn!(
+                "TagRequest from {peer_name} for {} but we no longer hold it",
+                tag_id.to_string()
+            );
+            Frame::Sync(SyncMessage::TagNotFound { tag_id })
+        }
+        Err(error) => {
+            log::error!(
+                "tag_definition failed for {} requested by {peer_name}: {error:?}",
+                tag_id.to_string()
+            );
+            Frame::Sync(SyncMessage::TagNotFound { tag_id })
+        }
+    }
+}
+
 async fn handle_sync_directories(
     configuration: Configuration,
     paths: Paths,
@@ -1250,6 +1524,12 @@ fn contains_all_tags(sync_directory_tags: &[TagId], file_tags: &[TagId]) -> bool
         .all(|tag_id| file_tags.contains(tag_id))
 }
 
+// This is the single change-handling pipeline task; its parameters are the
+// distinct long-lived handles it owns (a change receiver, database, event
+// sender) plus the routing handles it shares. They don't form a reusable
+// cluster the way `PeerContext` does, so they're kept as plain arguments
+// rather than bundled into a single-use struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_changes(
     configuration: Configuration,
     runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
@@ -1334,7 +1614,7 @@ async fn handle_changes(
         };
 
         // Route the two bus message kinds. A `Fetch` is an on-demand request
-        // for a file's bytes (from `tagnet-cli edit`): satisfy it locally if we
+        // for a file's bytes (from `tagnet edit`): satisfy it locally if we
         // hold matching content, otherwise flood a `FetchRequest` to peers. A
         // `Change` falls through to the DB-writer pipeline below.
         let (change, change_origin) = match message {
@@ -1403,16 +1683,17 @@ async fn handle_changes(
                         continue;
                     }
 
-                    for tag_id in tags {
-                        if let Err(error) = database.tag_file(*tag_id, *file_id) {
-                            log::error!(
-                                "Failed to tag added file {} with {}: {:?}",
-                                file_id.to_string(),
-                                tag_id.to_string(),
-                                error
-                            );
-                        }
-                    }
+                    // NOTE: We intentionally do NOT apply `tags` here anymore.
+                    // File-tag relationships now reconcile through their own tag
+                    // manifest (with per-relationship `modified_at` for
+                    // last-writer-wins), decoupled from file content. Applying
+                    // them here would be both redundant and wrong: a bare
+                    // `FileAdded.tags` list carries no timestamp, so it could
+                    // resurrect a relationship a peer just untagged. The tag
+                    // manifest is the authoritative path. `tags` is retained on
+                    // the wire for now for backwards compatibility / local
+                    // dispatch below.
+                    let _ = tags;
 
                     if let Err(error) = database.record_version(
                         *file_id,
@@ -1767,12 +2048,19 @@ async fn handle_changes(
                 )
                 .await;
             }
+            // Every tag mutation below carries `modified_at`, stamped on the
+            // originating device and preserved across the wire. It is passed
+            // straight to the DB layer, which applies last-writer-wins: an
+            // older change is a no-op. This makes both live application and
+            // reconciliation replay idempotent and convergent.
             Change::TagAdded {
                 tag_id,
                 tag_name,
+                color,
                 metadata: _,
+                modified_at,
             } => {
-                if let Err(error) = database.add_tag(*tag_id, tag_name, "red") {
+                if let Err(error) = database.add_tag(*tag_id, tag_name, color, *modified_at) {
                     log::error!(
                         "Failed to add tag {} ({}): {:?}",
                         tag_id.to_string(),
@@ -1788,8 +2076,12 @@ async fn handle_changes(
                 )
                 .await;
             }
-            Change::TagRenamed { tag_id, tag_name } => {
-                if let Err(error) = database.update_tag_name(*tag_id, tag_name) {
+            Change::TagRenamed {
+                tag_id,
+                tag_name,
+                modified_at,
+            } => {
+                if let Err(error) = database.update_tag_name(*tag_id, tag_name, *modified_at) {
                     log::error!("Failed to rename tag {}: {:?}", tag_id.to_string(), error);
                 }
                 forward_to_peers(
@@ -1803,9 +2095,18 @@ async fn handle_changes(
             Change::TagChanged {
                 tag_id: _,
                 metadata: _,
-            } => { // TODO
+                modified_at: _,
+            } => {
+                // Tag metadata is not yet stored (the whole `MetadataFormat`
+                // API is `todo!()` in tagnet-core). When metadata lands, apply
+                // it here with the same `modified_at` LWW guard as the other
+                // tag mutations and forward. Deliberately not forwarded until
+                // then, so we never propagate state we can't apply.
             }
             Change::TagRemoved { tag_id } => {
+                // Tag removal is a hard delete for now; the tombstone-based
+                // deletion design (which will make removal reconcile
+                // offline-safely, like untag) is deferred. See roadmap.
                 if let Err(error) = database.remove_tag(*tag_id) {
                     log::error!("Failed to remove tag {}: {:?}", tag_id.to_string(), error);
                 }
@@ -1821,8 +2122,9 @@ async fn handle_changes(
                 file_id,
                 tag_id,
                 metadata: _,
+                modified_at,
             } => {
-                if let Err(error) = database.tag_file(*tag_id, *file_id) {
+                if let Err(error) = database.tag_file(*tag_id, *file_id, *modified_at) {
                     log::error!(
                         "Failed to tag file {} with {}: {:?}",
                         file_id.to_string(),
@@ -1831,7 +2133,10 @@ async fn handle_changes(
                     );
                 }
 
-                // FIX: Update the files in the sync directories.
+                // FIX: Update the files in the tag-based sync directories: a
+                // file that just gained a directory's tags should be
+                // materialized there (and dropped when it loses them on
+                // untag). Tracked separately from tag sync.
 
                 forward_to_peers(
                     &configuration,
@@ -1845,10 +2150,17 @@ async fn handle_changes(
                 file_id: _,
                 tag_id: _,
                 metadata: _,
-            } => { // TODO
+                modified_at: _,
+            } => {
+                // Relationship metadata: deferred with the rest of the metadata
+                // API. See `TagChanged`.
             }
-            Change::FileUntagged { file_id, tag_id } => {
-                if let Err(error) = database.untag_file(*tag_id, *file_id) {
+            Change::FileUntagged {
+                file_id,
+                tag_id,
+                modified_at,
+            } => {
+                if let Err(error) = database.untag_file(*tag_id, *file_id, *modified_at) {
                     log::error!(
                         "Failed to untag file {} from {}: {:?}",
                         file_id.to_string(),
@@ -1857,7 +2169,8 @@ async fn handle_changes(
                     );
                 }
 
-                // FIX: Update the files in the sync directories.
+                // FIX: Update the files in the tag-based sync directories (see
+                // `FileTagged`).
 
                 forward_to_peers(
                     &configuration,
@@ -1871,8 +2184,9 @@ async fn handle_changes(
                 taggee_id,
                 tag_id,
                 metadata: _,
+                modified_at,
             } => {
-                if let Err(error) = database.tag_tag(*tag_id, *taggee_id) {
+                if let Err(error) = database.tag_tag(*tag_id, *taggee_id, *modified_at) {
                     log::error!(
                         "Failed to tag tag {} with {}: {:?}",
                         taggee_id.to_string(),
@@ -1896,10 +2210,17 @@ async fn handle_changes(
                 taggee_id: _,
                 tag_id: _,
                 metadata: _,
-            } => { // TODO
+                modified_at: _,
+            } => {
+                // Relationship metadata: deferred with the rest of the metadata
+                // API. See `TagChanged`.
             }
-            Change::TagUntagged { taggee_id, tag_id } => {
-                if let Err(error) = database.untag_tag(*tag_id, *taggee_id) {
+            Change::TagUntagged {
+                taggee_id,
+                tag_id,
+                modified_at,
+            } => {
+                if let Err(error) = database.untag_tag(*tag_id, *taggee_id, *modified_at) {
                     log::error!(
                         "Failed to untag tag {} from {}: {:?}",
                         taggee_id.to_string(),

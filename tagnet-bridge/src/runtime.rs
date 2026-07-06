@@ -11,7 +11,7 @@
 //!
 //! 1. [`RuntimeHandle::start`] builds a multi-thread tokio runtime **manually**
 //!    on a dedicated OS thread (never `#[tokio::main]`), performs the fallible
-//!    startup ([`tagnet::run`]) on that runtime, and returns once the
+//!    startup ([`tagnetd::run`]) on that runtime, and returns once the
 //!    UI-facing [`Backend`] is ready.
 //! 2. The runtime thread then drives the sync engine to completion.
 //! 3. [`RuntimeHandle::stop`] triggers the section-3 [`ShutdownSignal`] and
@@ -20,11 +20,12 @@
 
 use std::{
     path::PathBuf,
+    str::FromStr,
     sync::mpsc,
     thread::{self, JoinHandle},
 };
 
-use tagnet::{
+use tagnetd::{
     RunPaths, ShutdownSignal,
     configuration::{Configuration, ConfigurationError},
     identity::Identity,
@@ -39,7 +40,7 @@ pub enum StartError {
     /// Building the dedicated-thread tokio runtime failed.
     Runtime(std::io::Error),
     /// The sync engine failed its fallible startup (identity, DB, bind).
-    Run(tagnet::RunError),
+    Run(tagnetd::RunError),
     /// Bootstrapping on-disk state (data directory or identity key) failed.
     Bootstrap {
         path: PathBuf,
@@ -50,7 +51,7 @@ pub enum StartError {
     /// Attaching to the daemon over IPC failed (Linux desktop topology): the
     /// control socket could not be reached or the handshake failed. Usually
     /// means the daemon is not running.
-    Ipc(tagnet::api::ApiError),
+    Ipc(tagnetd::api::ApiError),
 }
 
 impl std::fmt::Display for StartError {
@@ -279,7 +280,7 @@ fn run_thread(
     };
 
     runtime.block_on(async move {
-        let (api, driver) = match tagnet::run(configuration, run_paths, shutdown).await {
+        let (api, driver) = match tagnetd::run(configuration, run_paths, shutdown).await {
             Ok(pair) => pair,
             Err(error) => {
                 let _ = ready_sender.send(Err(StartError::Run(error)));

@@ -19,9 +19,9 @@ self: {
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.tagnet;
-      defaultText = literalExpression "tagnet.packages.\${system}.tagnet";
-      description = "The tagnet package to use.";
+      default = self.packages.${pkgs.system}.tagnetd;
+      defaultText = literalExpression "tagnet.packages.\${system}.tagnetd";
+      description = "The tagnet daemon package to use.";
     };
 
     configuration-file = mkOption {

@@ -11,5 +11,5 @@ cargo build --release
 ## Usage
 
 ```bash
-tagnet-cli upload /path/to/file
+tagnet upload /path/to/file
 ```

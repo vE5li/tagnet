@@ -16,7 +16,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use tagnet::transport::Backend;
+use tagnetd::transport::Backend;
 
 use crate::runtime::{BridgePaths, RuntimeHandle, StartError};
 

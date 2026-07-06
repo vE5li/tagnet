@@ -68,6 +68,13 @@ pub trait TransportBackend {
     /// List every currently-known file with its latest version info.
     fn list_files(&self) -> impl Future<Output = Result<Vec<FileInfo>, ApiError>> + Send;
 
+    /// Resolve a full-or-short file id `prefix` to a single [`FileId`]. Errors
+    /// with `NotFound` if nothing matches or `Ambiguous` if several do.
+    fn resolve_file_id(
+        &self,
+        prefix: String,
+    ) -> impl Future<Output = Result<FileId, ApiError>> + Send;
+
     /// List the tags applied to `file_id`.
     fn tags_for_file(
         &self,
@@ -235,6 +242,10 @@ impl TransportBackend for InProcessBackend {
         self.api.list_files()
     }
 
+    async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
+        self.api.resolve_file_id(&prefix)
+    }
+
     async fn tags_for_file(
         &self,
         file_id: FileId,
@@ -346,6 +357,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.list_files().await,
             Backend::Ipc(backend) => backend.list_files().await,
+        }
+    }
+
+    async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.resolve_file_id(prefix).await,
+            Backend::Ipc(backend) => backend.resolve_file_id(prefix).await,
         }
     }
 

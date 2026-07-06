@@ -1,0 +1,2459 @@
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rusqlite::{
+    Connection, OptionalExtension, ToSql,
+    types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
+};
+use serde::{Deserialize, Serialize};
+use tagnet_core::{
+    FileId, FileInfo, LogicalPath, PhysicalPath, TagId,
+    state::{RelationshipKind, RelationshipManifestEntry, TagManifestEntry},
+    tag::MetadataFormat,
+};
+
+/// A file's version history as `(version_number, content_hash)` pairs ordered
+/// oldest-to-newest. Mirrors `state::ManifestEntry::history`.
+pub type VersionHistory = Vec<(i64, String)>;
+
+/// One row of [`FileDatabase::manifest_entries`]: a file id, its full
+/// [`VersionHistory`], and the unix-millis timestamp of its latest version.
+/// Maps directly onto a `state::ManifestEntry`.
+pub type ManifestRow = (FileId, VersionHistory, i64);
+
+/// A single recorded version of a file's content.
+///
+/// Rows in `file_versions` are append-only. The `version_number` is a per-file
+/// monotonically increasing counter (starts at 1) that defines ordering between
+/// versions of the same file. `observed_at` is the unix-millis wall-clock time
+/// at which we recorded the version and is metadata only — do not use it for
+/// ordering.
+#[derive(Debug, Clone)]
+pub struct FileVersion {
+    pub file_id: FileId,
+    pub content_hash: String,
+    pub observed_at: i64,
+    pub version_number: i64,
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubtagRule {
+    Include,
+    Exclude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    File,
+    Tag,
+}
+
+impl ToSql for EntryType {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            EntryType::File => Ok(0.into()),
+            EntryType::Tag => Ok(1.into()),
+        }
+    }
+}
+
+impl FromSql for EntryType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_i64()? {
+            0 => Ok(Self::File),
+            1 => Ok(Self::Tag),
+            invalid => panic!("invalid entry type {}", invalid),
+        }
+    }
+}
+
+impl From<EntryType> for RelationshipKind {
+    fn from(value: EntryType) -> Self {
+        match value {
+            EntryType::File => RelationshipKind::File,
+            EntryType::Tag => RelationshipKind::Tag,
+        }
+    }
+}
+
+impl From<RelationshipKind> for EntryType {
+    fn from(value: RelationshipKind) -> Self {
+        match value {
+            RelationshipKind::File => EntryType::File,
+            RelationshipKind::Tag => EntryType::Tag,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct Tag {
+    pub id: TagId,
+    pub name: String,
+    pub color: String,
+    pub metadata: Option<MetadataFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DatabaseError {
+    UnableToOpenOrCreate,
+    FailedToExecuteCommand,
+    NonUtf8FilePath,
+    MissingFile,
+    MissingTag,
+    InvalidTagName,
+    InvalidColor,
+    CantTagItself,
+    /// A short-id prefix matched more than one row, so it cannot be resolved to
+    /// a single id. Carries the ambiguous prefix that was queried.
+    AmbiguousIdPrefix(String),
+}
+
+// ============================================================================
+// DEVELOPMENT-ONLY DATABASE MIGRATIONS
+// ============================================================================
+//
+// !!! THIS IS FOR DEVELOPMENT PURPOSES ONLY. !!!
+//
+// This is a hand-rolled, run-on-every-startup "migration" pass. It exists so
+// that developer databases created before a format change keep working without
+// anyone having to manually delete their `.db` files. It is intentionally
+// simple and idempotent: it scans the relevant id columns and rewrites any
+// value it finds in an outdated format into the current one.
+//
+// This is NOT a real migration framework:
+//   - There is no schema version tracking (no `PRAGMA user_version`).
+//   - It re-scans every id column on every single startup.
+//   - It is only meant to bridge pre-release, developer-local databases.
+//
+// Before shipping anything resembling a release, replace this with a proper
+// versioned migration mechanism (or drop it entirely once no stale dev
+// databases remain). Each distinct migration below is a standalone Rust
+// function so they can be run, one after another, before any other database
+// access occurs.
+
+/// Run all development-only migrations against a freshly opened connection.
+///
+/// `id_columns` is the list of `(table, column)` pairs holding UUID values in
+/// this particular database (the main DB and per-sync-directory DBs have
+/// different sets of tables, so each caller passes its own).
+///
+/// !!! DEVELOPMENT ONLY — see the module comment above. !!!
+fn run_development_migrations(
+    connection: &Connection,
+    id_columns: &[(&str, &str)],
+) -> Result<(), DatabaseError> {
+    migrate_ids_to_simple_hex(connection, id_columns)?;
+    migrate_tag_lww_columns(connection)?;
+    Ok(())
+}
+
+/// Migration 2: add the last-writer-wins columns (`modified_at` on `tags` and
+/// `entries`, `deleted` on `entries`) to databases created before tag sync, and
+/// drop the old `UNIQUE(name)` constraint on `tags`.
+///
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a stale dev
+/// database keeps its old shape until this runs.
+///
+/// Idempotent:
+/// - Column adds are guarded by inspecting `PRAGMA table_info`, so re-running is
+///   a no-op once the columns exist.
+/// - The `UNIQUE(name)` constraint was declared inline on the column, so SQLite
+///   backs it with an auto-index. We drop that auto-index by rebuilding the
+///   table only when the old constraint is still present; on a fresh database
+///   (created with the new non-unique schema) there is nothing to do.
+///
+/// This migration only touches the *main* database's tables; per-sync-directory
+/// databases have no `tags`/`entries` tables, so it is a no-op there.
+///
+/// !!! DEVELOPMENT ONLY — see the module comment above. !!!
+fn migrate_tag_lww_columns(connection: &Connection) -> Result<(), DatabaseError> {
+    /// Does `table` currently have a column named `column`?
+    fn has_column(
+        connection: &Connection,
+        table: &str,
+        column: &str,
+    ) -> Result<bool, DatabaseError> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let names: Vec<String> = statement
+            // `PRAGMA table_info` column 1 is the column name.
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .collect::<Result<_, _>>()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(names.iter().any(|name| name == column))
+    }
+
+    // If the `tags` table doesn't exist yet (e.g. a per-sync-directory DB),
+    // there is nothing to migrate.
+    let tags_exists: bool = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tags'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+        .unwrap_or(false);
+    if !tags_exists {
+        return Ok(());
+    }
+
+    if !has_column(connection, "tags", "modified_at")? {
+        connection
+            .execute(
+                "ALTER TABLE tags ADD COLUMN modified_at INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    }
+    if !has_column(connection, "entries", "modified_at")? {
+        connection
+            .execute(
+                "ALTER TABLE entries ADD COLUMN modified_at INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    }
+    if !has_column(connection, "entries", "deleted")? {
+        connection
+            .execute(
+                "ALTER TABLE entries ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    }
+
+    // Drop the legacy `UNIQUE(name)` constraint if the old schema is still in
+    // place. SQLite can't `DROP CONSTRAINT`, so detect the old declaration in
+    // the stored `CREATE TABLE` SQL and, if found, rebuild the table without it.
+    let tags_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tags'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    if tags_sql.to_ascii_uppercase().contains("UNIQUE") {
+        // Rebuild `tags` without the UNIQUE(name) constraint, preserving rows.
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE tags_migrated (
+                    id          TEXT PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    color       TEXT NOT NULL,
+                    metadata    TEXT,
+                    modified_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO tags_migrated (id, name, color, metadata, modified_at)
+                     SELECT id, name, color, metadata, modified_at FROM tags;
+                 DROP TABLE tags;
+                 ALTER TABLE tags_migrated RENAME TO tags;",
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        transaction
+            .commit()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    }
+
+    Ok(())
+}
+
+/// Migration 1: rewrite hyphenated UUID ids (`7f3a1b2c-...-...`) into the
+/// canonical simple hex form (`7f3a1b2c...`, 32 chars, no hyphens).
+///
+/// Idempotent: values already in simple hex form parse to the same UUID and are
+/// left untouched (we only issue an UPDATE when the canonical string differs
+/// from what's stored). Any value that does not parse as a UUID is skipped and
+/// left as-is rather than risking corrupting unrelated data.
+///
+/// !!! DEVELOPMENT ONLY — see the module comment above. !!!
+fn migrate_ids_to_simple_hex(
+    connection: &Connection,
+    id_columns: &[(&str, &str)],
+) -> Result<(), DatabaseError> {
+    for (table, column) in id_columns {
+        // Pull every current value in this id column.
+        let mut statement = connection
+            .prepare(&format!("SELECT {column} FROM {table}"))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let stored_values: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .collect::<Result<_, _>>()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        for stored in stored_values {
+            let Ok(uuid) = uuid::Uuid::try_parse(&stored) else {
+                // Not a UUID we recognise; leave it alone.
+                continue;
+            };
+            let canonical = uuid.simple().to_string();
+            if canonical == stored {
+                // Already in the canonical form; nothing to do.
+                continue;
+            }
+            connection
+                .execute(
+                    &format!("UPDATE {table} SET {column} = ?1 WHERE {column} = ?2"),
+                    (&canonical, &stored),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+    }
+    Ok(())
+}
+
+/// Current wall-clock time as unix milliseconds.
+///
+/// Used to stamp `modified_at` on locally-originated tag mutations. Peer changes
+/// carry their own `modified_at` and must NOT be restamped with this (that would
+/// let a receiver's clock override the last-writer-wins comparison).
+pub fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Number of leading characters two strings share.
+///
+/// Operates on `char`s; ids are ASCII hex so this is equivalent to bytes.
+fn common_prefix_length(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+/// Outcome of resolving a short-id prefix against an id column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefixResolution {
+    /// Exactly one id starts with the prefix.
+    Unique(String),
+    /// No id starts with the prefix.
+    NotFound,
+    /// More than one id starts with the prefix; resolution is ambiguous.
+    Ambiguous,
+}
+
+/// Resolve a short-id `prefix` against `column` of `table`, returning whether it
+/// identifies exactly one row.
+///
+/// This is the generic counterpart to shortening: given the fewest leading hex
+/// characters a user typed, find the full id — or report that the prefix is
+/// unknown or ambiguous. It backs every "accept a short id" command, so it is
+/// deliberately id-type-agnostic (callers wrap it with a typed helper such as
+/// [`FileDatabase::resolve_file_id_prefix`]).
+///
+/// Ids are stored in canonical simple-hex form, so a prefix match is a plain
+/// string-prefix test. We fetch up to two matches: zero → `NotFound`, one →
+/// `Unique`, two → `Ambiguous`. With the primary-key index on the id column
+/// this is a bounded index range scan (`LIMIT 2`), not a full-table scan.
+///
+/// `prefix` **must** be validated as lowercase hex by the caller (see
+/// [`normalise_id_prefix`]); this keeps the `LIKE` pattern free of `%`/`_`
+/// wildcards and the query injection-safe (the prefix is still bound as a
+/// parameter; `table`/`column` are internal constants, never user input).
+fn resolve_id_prefix(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    prefix: &str,
+) -> Result<PrefixResolution, DatabaseError> {
+    let pattern = format!("{prefix}%");
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {column} FROM {table} WHERE {column} LIKE ?1 ORDER BY {column} LIMIT 2"
+        ))
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    let matches: Vec<String> = statement
+        .query_map([&pattern], |row| row.get::<_, String>(0))
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+        .collect::<Result<_, _>>()
+        .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+    match matches.as_slice() {
+        [] => Ok(PrefixResolution::NotFound),
+        [only] => Ok(PrefixResolution::Unique(only.clone())),
+        _ => Ok(PrefixResolution::Ambiguous),
+    }
+}
+
+/// Normalise a user-supplied id or short-id into the canonical lowercase-hex
+/// form used for prefix matching.
+///
+/// Accepts hyphenated UUIDs, full simple-hex ids, and short prefixes of either.
+/// Hyphens are stripped (so a pasted full UUID resolves) and the result is
+/// lowercased. Returns `None` if any remaining character is not a hex digit —
+/// this both rejects junk early and guarantees the value is safe to splice into
+/// a `LIKE` pattern (no wildcards).
+pub fn normalise_id_prefix(input: &str) -> Option<String> {
+    let cleaned: String = input
+        .chars()
+        .filter(|character| *character != '-')
+        .collect();
+    if cleaned.is_empty()
+        || !cleaned
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(cleaned.to_ascii_lowercase())
+}
+
+#[derive(Debug)]
+pub struct FileDatabase {
+    connection: Connection,
+}
+
+impl FileDatabase {
+    pub fn initialize(database_path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        let connection =
+            Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
+
+        connection
+            .execute(
+                // `logical_path` is the file's logical identity: its
+                // human-readable path/name (possibly nested, e.g.
+                // `foo/bar/name.txt`), independent of where any individual sync
+                // directory stores the bytes on disk. This is what `list_files`
+                // reports and what is advertised to peers. Contrast with
+                // `SyncDirectoryDatabase.files.physical_path`, which is the
+                // on-disk location within a particular sync directory.
+                "CREATE TABLE IF NOT EXISTS files (
+            id              TEXT PRIMARY KEY,
+            logical_path    TEXT NOT NULL
+        )",
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // `name` is intentionally NOT `UNIQUE`: two devices editing offline can
+        // each mint a tag with the same name but a different `TagId`. When they
+        // reconcile, both tags must be able to coexist rather than one insert
+        // failing a constraint and leaving the databases divergent. Tag identity
+        // is the `TagId`; names are display-only and may collide. (Disambiguation
+        // in the UI is handled by tag short-ids — see roadmap pass 2.)
+        //
+        // `modified_at` is the unix-millis wall-clock time, stamped on the
+        // *originating* device and preserved across the wire, that drives
+        // last-writer-wins reconciliation of tag definitions. Never restamp it
+        // when applying a peer's change.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS tags (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            color       TEXT NOT NULL,
+            metadata    TEXT,
+            modified_at INTEGER NOT NULL DEFAULT 0
+        )",
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // `modified_at` drives last-writer-wins reconciliation of relationships,
+        // exactly as for `tags` above.
+        //
+        // `deleted` is a soft-delete flag (0 = live, 1 = tombstoned). Untagging
+        // sets `deleted = 1` and bumps `modified_at` instead of removing the row,
+        // so an "absent" relationship still carries a timestamp and can win LWW
+        // against a stale "present" from a peer. All *reads* of live
+        // relationships must filter `deleted = 0` (see the read helpers below);
+        // reconciliation deliberately considers tombstoned rows too. The
+        // `UNIQUE(tag_id, target_id, type)` constraint is retained: a
+        // relationship reappears by flipping `deleted` back to 0, never by
+        // inserting a duplicate row.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS entries (
+            id          TEXT PRIMARY KEY,
+            tag_id      TEXT NOT NULL,
+            target_id   TEXT NOT NULL,
+            type        INTEGER,
+            modified_at INTEGER NOT NULL DEFAULT 0,
+            deleted     INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (tag_id, target_id, type)
+        )",
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // Append-only log of content hashes per file. The latest row per
+        // `file_id` (highest `version_number`) is the current version.
+        //
+        // - `version_number` is a per-file monotonic counter starting at 1. It
+        //   is what we order by; do not order by `observed_at`.
+        // - `observed_at` is unix-millis wall-clock at insert time, kept for
+        //   debugging / UI.
+        // - `origin` is `'local'` for now. When cross-peer conflict resolution
+        //   lands it will hold the originating peer's public key.
+        //
+        // Intentionally no `FOREIGN KEY` on `file_id`: a version may be
+        // recorded by `SyncDirectoryManager` before the corresponding row in
+        // `files` exists (which is inserted later, asynchronously, by
+        // `handle_changes`). The same ordering will apply when peer-originated
+        // versions land. A FK here would fight the message-passing
+        // architecture.
+        //
+        // TODO: When a file is deleted (`FileDatabase::remove_file`), we
+        // currently leave its `file_versions` rows behind as a history audit
+        // trail. If/when that history grows unwieldy, add a cleanup pass or
+        // make `remove_file` cascade the delete here.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS file_versions (
+            file_id         TEXT    NOT NULL,
+            content_hash    TEXT    NOT NULL,
+            observed_at     INTEGER NOT NULL,
+            version_number  INTEGER NOT NULL,
+            origin          TEXT    NOT NULL,
+            PRIMARY KEY (file_id, version_number)
+        )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        connection
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_versions_latest
+                    ON file_versions(file_id, version_number DESC)",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // DEVELOPMENT ONLY: bridge stale dev databases to the current id format
+        // before any real access. See `run_development_migrations`.
+        run_development_migrations(
+            &connection,
+            &[
+                ("files", "id"),
+                ("tags", "id"),
+                ("entries", "tag_id"),
+                ("entries", "target_id"),
+                ("file_versions", "file_id"),
+            ],
+        )?;
+
+        Ok(Self { connection })
+    }
+
+    /// Append a new version row for `file_id`.
+    ///
+    /// The `version_number` is computed as `MAX(version_number) + 1` for this
+    /// file (starting at 1) inside a transaction so concurrent calls cannot
+    /// collide on the PK. Returns the newly assigned `version_number`.
+    ///
+    /// `origin` is `"local"` when the version was observed on disk by this
+    /// daemon; it will later be a peer's public key when the version came in
+    /// over the wire.
+    pub fn record_version(
+        &mut self,
+        file_id: FileId,
+        content_hash: &str,
+        origin: &str,
+    ) -> Result<i64, DatabaseError> {
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // `MAX(version_number)` returns NULL when there are no rows for this
+        // file_id, which rusqlite refuses to deserialize into a plain `i64`.
+        // Pull it as `Option<i64>` and default to 0 here instead.
+        let current_max: Option<i64> = transaction
+            .query_row(
+                "SELECT MAX(version_number) FROM file_versions WHERE file_id = ?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let next_version_number: i64 = current_max.unwrap_or(0) + 1;
+
+        transaction
+            .execute(
+                "INSERT INTO file_versions
+                    (file_id, content_hash, observed_at, version_number, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    file_id,
+                    content_hash,
+                    observed_at,
+                    next_version_number,
+                    origin,
+                ),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        transaction
+            .commit()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(next_version_number)
+    }
+
+    /// Return the most recent recorded `content_hash` for every file that has
+    /// at least one row in `file_versions`. Used at startup by
+    /// `SyncDirectoryManager` to detect files that changed on disk while the
+    /// daemon was offline.
+    ///
+    /// One row per `file_id`; files with no recorded version are absent from
+    /// the result.
+    pub fn latest_content_hashes(
+        &self,
+    ) -> Result<std::collections::HashMap<FileId, String>, DatabaseError> {
+        // The DESC index on (file_id, version_number) lets SQLite answer this
+        // efficiently: for each file_id, take the row with the highest
+        // version_number.
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT file_id, content_hash
+                 FROM file_versions AS outer
+                 WHERE version_number = (
+                     SELECT MAX(version_number)
+                     FROM file_versions AS inner
+                     WHERE inner.file_id = outer.file_id
+                 )",
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut hashes = std::collections::HashMap::new();
+        let rows = statement
+            .query_map([], |row| {
+                let file_id: FileId = row.get(0)?;
+                let content_hash: String = row.get(1)?;
+                Ok((file_id, content_hash))
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        for row in rows {
+            let (file_id, content_hash) = row.map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            hashes.insert(file_id, content_hash);
+        }
+
+        Ok(hashes)
+    }
+
+    /// Return the most recent recorded version for `file_id`, or `None` if the
+    /// file has never had a version recorded.
+    pub fn latest_version(&self, file_id: FileId) -> Result<Option<FileVersion>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT content_hash, observed_at, version_number, origin
+                 FROM file_versions
+                 WHERE file_id = ?1
+                 ORDER BY version_number DESC
+                 LIMIT 1",
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut rows = statement
+            .query_map([file_id], |row| {
+                Ok(FileVersion {
+                    file_id,
+                    content_hash: row.get(0)?,
+                    observed_at: row.get(1)?,
+                    version_number: row.get(2)?,
+                    origin: row.get(3)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        match rows.next() {
+            Some(Ok(version)) => Ok(Some(version)),
+            Some(Err(_)) => Err(DatabaseError::FailedToExecuteCommand),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the full version history for `file_id`, ordered oldest-first by
+    /// `version_number`. Each tuple is `(version_number, content_hash)`. An
+    /// empty vec means the file has no recorded versions.
+    ///
+    /// Used to build `state::ManifestEntry::history`.
+    pub fn version_history(&self, file_id: FileId) -> Result<VersionHistory, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT version_number, content_hash
+                 FROM file_versions
+                 WHERE file_id = ?1
+                 ORDER BY version_number ASC",
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut history = Vec::new();
+        let rows = statement
+            .query_map([file_id], |row| {
+                let version_number: i64 = row.get(0)?;
+                let content_hash: String = row.get(1)?;
+                Ok((version_number, content_hash))
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        for row in rows {
+            history.push(row.map_err(|_| DatabaseError::FailedToExecuteCommand)?);
+        }
+        Ok(history)
+    }
+
+    /// Return every `file_id` that currently has at least one row in the
+    /// `files` table (i.e. not deleted) together with its full version
+    /// history.
+    ///
+    /// Files with rows in `file_versions` but no row in `files` (a deleted
+    /// file whose history we kept around) are excluded — we don't announce
+    /// them during reconciliation. When the tombstone design lands, this is
+    /// where deletes will start being included again.
+    pub fn manifest_entries(&self) -> Result<Vec<ManifestRow>, DatabaseError> {
+        // First fetch the file_ids we still know about, then for each fetch
+        // its history. Two-stage to keep the SQL straightforward; manifest
+        // construction is a one-shot at connect time so the N+1 here is
+        // acceptable.
+        let mut id_statement = self
+            .connection
+            .prepare("SELECT id FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let file_ids: Vec<FileId> = id_statement
+            .query_map([], |row| row.get::<_, FileId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut entries = Vec::with_capacity(file_ids.len());
+        for file_id in file_ids {
+            let history = self.version_history(file_id)?;
+            // Files in `files` should always have at least one version
+            // (every add/change path records one), but be defensive.
+            if history.is_empty() {
+                log::warn!(
+                    "File {} has no recorded versions; skipping manifest entry",
+                    file_id.to_string()
+                );
+                continue;
+            }
+            let latest_observed_at = self
+                .latest_version(file_id)?
+                .map(|version| version.observed_at)
+                .unwrap_or(0);
+            entries.push((file_id, history, latest_observed_at));
+        }
+        Ok(entries)
+    }
+
+    /// Every tag definition as a lightweight manifest entry (`tag_id` +
+    /// `modified_at`). Drives last-writer-wins reconciliation of definitions:
+    /// the receiver requests the full definition only for tags whose
+    /// `modified_at` is newer than (or absent from) its own. Mirrors
+    /// [`manifest_entries`] for files.
+    pub fn tag_manifest_entries(&self) -> Result<Vec<TagManifestEntry>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, modified_at FROM tags")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let entries = statement
+            .query_map([], |row| {
+                Ok(TagManifestEntry {
+                    tag_id: row.get(0)?,
+                    modified_at: row.get(1)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(entries)
+    }
+
+    /// Every tag relationship (file-tagged and tag-tagged), *including*
+    /// soft-deleted (tombstoned) rows. Reconciliation deliberately advertises
+    /// tombstones so that an "absent" relationship can win last-writer-wins
+    /// against a peer's stale "present". Unlike tag definitions, a relationship
+    /// carries its whole state here, so the receiver applies it directly with no
+    /// follow-up request.
+    pub fn relationship_manifest_entries(
+        &self,
+    ) -> Result<Vec<RelationshipManifestEntry>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id, target_id, type, modified_at, deleted FROM entries")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let entries = statement
+            .query_map([], |row| {
+                let kind: EntryType = row.get(2)?;
+                let deleted: i64 = row.get(4)?;
+                Ok(RelationshipManifestEntry {
+                    tag_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    kind: kind.into(),
+                    modified_at: row.get(3)?,
+                    deleted: deleted != 0,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(entries)
+    }
+
+    /// The `modified_at` of a single relationship, or `None` if we have no row
+    /// for it. Used by reconciliation to decide whether an incoming
+    /// relationship wins last-writer-wins before applying it.
+    pub fn relationship_modified_at(
+        &self,
+        tag_id: TagId,
+        target_id: &str,
+        kind: EntryType,
+    ) -> Result<Option<i64>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT modified_at FROM entries
+                 WHERE tag_id = ?1 AND target_id = ?2 AND type = ?3",
+                (&tag_id, &target_id, kind),
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)
+    }
+
+    /// The `modified_at` of a tag definition, or `None` if we don't know the
+    /// tag. Used by reconciliation to decide whether to request a peer's newer
+    /// definition.
+    pub fn tag_modified_at(&self, tag_id: TagId) -> Result<Option<i64>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT modified_at FROM tags WHERE id = ?1",
+                [tag_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)
+    }
+
+    /// The full stored definition of a tag as `(name, color, modified_at)`, or
+    /// `None` if the tag is unknown. Used to answer a peer's `TagRequest` with a
+    /// `Change::TagAdded`.
+    pub fn tag_definition(
+        &self,
+        tag_id: TagId,
+    ) -> Result<Option<(String, String, i64)>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT name, color, modified_at FROM tags WHERE id = ?1",
+                [tag_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)
+    }
+
+    /// Apply an incoming relationship (from a peer's tag manifest) with
+    /// last-writer-wins, preserving its `modified_at` and `deleted` state.
+    /// Newer-wins is enforced in SQL so replaying stale relationships is a
+    /// no-op. `target_id` is the stringified `FileId`/`TagId` per `kind`.
+    pub fn apply_relationship(
+        &self,
+        entry: &RelationshipManifestEntry,
+    ) -> Result<(), DatabaseError> {
+        let kind: EntryType = entry.kind.into();
+        self.connection
+            .execute(
+                "INSERT INTO entries (id, tag_id, target_id, type, modified_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(tag_id, target_id, type) DO UPDATE SET
+                     modified_at = excluded.modified_at,
+                     deleted = excluded.deleted
+                 WHERE excluded.modified_at > entries.modified_at",
+                (
+                    TagId::new(),
+                    &entry.tag_id,
+                    &entry.target_id,
+                    kind,
+                    entry.modified_at,
+                    entry.deleted as i64,
+                ),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(())
+    }
+
+    /// Cheap existence check for a `file_id` in the `files` table. Used by
+    /// `handle_changes` to decide whether an inbound `FileAdded` should be
+    /// treated as new or as an idempotent re-announcement.
+    pub fn file_exists(&self, file_id: FileId) -> Result<bool, DatabaseError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(count > 0)
+    }
+
+    /// Compute the shortest unique prefix of `file_id` among **all** files in
+    /// the database — the "short id" shown in listings, à la `jj`/`git`.
+    ///
+    /// The result is the fewest leading hex characters of `file_id` that no
+    /// other file's id shares. The trick that makes this scale: an id only ever
+    /// needs to be distinguished from its two lexicographic *neighbours* (the id
+    /// immediately before and after it, sorted). If a prefix separates you from
+    /// both neighbours, it separates you from everyone. So this is two indexed
+    /// range lookups against the `files.id` primary-key index — O(log n) — not a
+    /// scan over all files.
+    ///
+    /// Ids are stored in canonical simple-hex form (see `FileId`'s `ToSql`), so
+    /// lexicographic ordering on the stored strings is a clean hex ordering and
+    /// prefixes never straddle a separator.
+    ///
+    /// Note: the returned length reflects the database *at call time*. It is not
+    /// stored and not stable across concurrent inserts — a prefix that is unique
+    /// now may become ambiguous if a colliding file is added later. That is the
+    /// intended behaviour (resolution re-checks uniqueness on use).
+    ///
+    /// Returns the full id length if the file has no neighbours (e.g. it is the
+    /// only file). Returns `MissingFile` if `file_id` is not in `files`.
+    pub fn shorten_file_id(&self, file_id: FileId) -> Result<usize, DatabaseError> {
+        let full = file_id.to_string();
+
+        if !self.file_exists(file_id)? {
+            return Err(DatabaseError::MissingFile);
+        }
+
+        // Immediate lexicographic predecessor, if any.
+        let predecessor: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+                [&full],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // Immediate lexicographic successor, if any.
+        let successor: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE id > ?1 ORDER BY id ASC LIMIT 1",
+                [&full],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // The prefix must be one longer than the longest prefix we share with
+        // either neighbour, so that it excludes both of them.
+        let mut required = 0;
+        for neighbour in [predecessor, successor].into_iter().flatten() {
+            let shared = common_prefix_length(&full, &neighbour);
+            required = required.max(shared + 1);
+        }
+
+        Ok(required.clamp(1, full.len()))
+    }
+
+    /// Resolve a full-or-short file id `prefix` to a single [`FileId`].
+    ///
+    /// The inverse of [`shorten_file_id`](Self::shorten_file_id): given the
+    /// characters a user typed (a short id from a listing, or a full id pasted
+    /// in either hyphenated or hex form), find the one file it identifies.
+    ///
+    /// Errors:
+    /// - [`DatabaseError::MissingFile`] if no file matches the prefix.
+    /// - [`DatabaseError::AmbiguousIdPrefix`] if more than one file matches
+    ///   (e.g. a colliding file was added since the short id was displayed).
+    pub fn resolve_file_id_prefix(&self, prefix: &str) -> Result<FileId, DatabaseError> {
+        let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingFile)?;
+        match resolve_id_prefix(&self.connection, "files", "id", &normalised)? {
+            PrefixResolution::Unique(id) => {
+                FileId::from_string(&id).ok_or(DatabaseError::MissingFile)
+            }
+            PrefixResolution::NotFound => Err(DatabaseError::MissingFile),
+            PrefixResolution::Ambiguous => Err(DatabaseError::AmbiguousIdPrefix(normalised)),
+        }
+    }
+
+    /// Add a new file.
+    pub fn add_file(
+        &self,
+        file_id: FileId,
+        logical_path: &LogicalPath,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO files (id, logical_path) VALUES (?1, ?2)",
+                (file_id, logical_path),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn update_file_logical_path(
+        &self,
+        file_id: FileId,
+        logical_path: &LogicalPath,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE files SET logical_path = ?2 WHERE id = ?1",
+                (file_id, logical_path),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn remove_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Add a new tag.
+    ///
+    /// `modified_at` is the unix-millis last-writer-wins timestamp. For a local
+    /// mutation pass [`now_millis`]; for a peer-originated change pass the
+    /// timestamp that arrived on the wire (do not restamp).
+    ///
+    /// If a row with this `tag_id` already exists, this becomes an upsert
+    /// resolved by last-writer-wins: the incoming values are applied only if
+    /// `modified_at` is newer than the stored one. This keeps reconciliation
+    /// idempotent — replaying an old `TagAdded` cannot clobber a newer local
+    /// definition.
+    pub fn add_tag(
+        &self,
+        tag_id: TagId,
+        name: impl Into<String>,
+        color: impl Into<String>,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        let name = name.into();
+        let color = color.into();
+
+        // TODO: Check that the tag name is not only numbers.
+        if name.is_empty() {
+            return Err(DatabaseError::InvalidTagName);
+        }
+
+        // TODO: Check that the color is valid.
+        if color.is_empty() {
+            return Err(DatabaseError::InvalidColor);
+        }
+
+        // Upsert with a last-writer-wins guard: on conflict, overwrite only when
+        // the incoming `modified_at` is strictly newer. `excluded` refers to the
+        // values we tried to insert.
+        self.connection
+            .execute(
+                "INSERT INTO tags (id, name, color, modified_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                     name = excluded.name,
+                     color = excluded.color,
+                     modified_at = excluded.modified_at
+                 WHERE excluded.modified_at > tags.modified_at",
+                (tag_id, &name, &color, modified_at),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Update a tag's name with a last-writer-wins guard: the update is applied
+    /// only if `modified_at` is newer than the stored value. See [`add_tag`] for
+    /// the `modified_at` contract.
+    pub fn update_tag_name(
+        &self,
+        tag_id: TagId,
+        name: impl Into<String>,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        let name = name.into();
+
+        // TODO: Check that the tag name is not only numbers.
+        if name.is_empty() {
+            return Err(DatabaseError::InvalidTagName);
+        }
+
+        self.connection
+            .execute(
+                "UPDATE tags SET name = ?2, modified_at = ?3
+                 WHERE id = ?1 AND ?3 > modified_at",
+                (tag_id, name, modified_at),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Update a tag's color with a last-writer-wins guard. See [`add_tag`] for
+    /// the `modified_at` contract.
+    pub fn update_tag_color(
+        &self,
+        tag_id: TagId,
+        color: impl Into<String>,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        let color = color.into();
+
+        // TODO: Check that the color is valid.
+        if color.is_empty() {
+            return Err(DatabaseError::InvalidColor);
+        }
+
+        self.connection
+            .execute(
+                "UPDATE tags SET color = ?2, modified_at = ?3
+                 WHERE id = ?1 AND ?3 > modified_at",
+                (tag_id, color, modified_at),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn remove_tag(&self, tag_id: TagId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM tags WHERE id = ?1", [&tag_id])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        self.connection
+            .execute(
+                "DELETE FROM entries WHERE tag_id = ?1 OR (target_id = ?1 AND type = 1)",
+                [&tag_id],
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Tag a file with the provided tag.
+    ///
+    /// `modified_at` is the last-writer-wins timestamp; see [`add_tag`]. This is
+    /// an upsert: if a (possibly tombstoned) row for this `(tag_id, file_id)`
+    /// relationship already exists, it is revived (`deleted = 0`) and stamped —
+    /// but only when `modified_at` is newer than the stored value. Re-tagging is
+    /// therefore idempotent and correctly loses to a newer untag.
+    pub fn tag_file(
+        &self,
+        tag_id: TagId,
+        file_id: FileId,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.upsert_entry(tag_id, file_id.to_string(), EntryType::File, modified_at)
+    }
+
+    /// Tag a tag with the provided tag. See [`tag_file`] for the LWW/upsert
+    /// semantics and the `modified_at` contract.
+    pub fn tag_tag(
+        &self,
+        tag_id: TagId,
+        subtag_id: TagId,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        if tag_id == subtag_id {
+            return Err(DatabaseError::CantTagItself);
+        }
+
+        self.upsert_entry(tag_id, subtag_id.to_string(), EntryType::Tag, modified_at)
+    }
+
+    /// Remove a tag from a file (soft delete). See [`untag_entry`].
+    pub fn untag_file(
+        &self,
+        tag_id: TagId,
+        file_id: FileId,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.untag_entry(tag_id, file_id.to_string(), EntryType::File, modified_at)
+    }
+
+    /// Remove a tag from a tag (soft delete). See [`untag_entry`].
+    pub fn untag_tag(
+        &self,
+        tag_id: TagId,
+        subtag_id: TagId,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.untag_entry(tag_id, subtag_id.to_string(), EntryType::Tag, modified_at)
+    }
+
+    /// Shared upsert for the two "add relationship" paths. Inserts a live
+    /// (`deleted = 0`) entry, or on conflict revives/refreshes the existing row
+    /// — gated by last-writer-wins so an older change can't override a newer
+    /// one. `target_id` is the stringified `FileId`/`TagId` (both persist as
+    /// simple-hex, matching the column's storage).
+    fn upsert_entry(
+        &self,
+        tag_id: TagId,
+        target_id: String,
+        entry_type: EntryType,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO entries (id, tag_id, target_id, type, modified_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)
+                 ON CONFLICT(tag_id, target_id, type) DO UPDATE SET
+                     modified_at = excluded.modified_at,
+                     deleted = 0
+                 WHERE excluded.modified_at > entries.modified_at",
+                (TagId::new(), &tag_id, &target_id, entry_type, modified_at),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Shared soft-delete for the two "remove relationship" paths. Marks the row
+    /// `deleted = 1` and stamps `modified_at`, gated by last-writer-wins so a
+    /// stale untag can't override a newer tag. If the relationship was never
+    /// recorded, this is a no-op (there is no row to tombstone; a peer that only
+    /// knows the untag can still learn "absent" once we've seen the tag).
+    ///
+    /// NOTE: Offline untag propagation is only fully correct once the broader
+    /// deletion/tombstone design lands — see roadmap. Today the tombstone is
+    /// created locally and reconciled, but there is no tombstone GC.
+    fn untag_entry(
+        &self,
+        tag_id: TagId,
+        target_id: String,
+        entry_type: EntryType,
+        modified_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE entries SET deleted = 1, modified_at = ?4
+                 WHERE tag_id = ?1 AND target_id = ?2 AND type = ?3
+                   AND ?4 > modified_at",
+                (&tag_id, &target_id, entry_type, modified_at),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    fn file_ids_for_tag_inner(
+        &self,
+        tag_id: TagId,
+        lookup_cache: &mut BTreeSet<TagId>,
+        collected_tag_ids: &mut BTreeSet<FileId>,
+        subtag_rule: SubtagRule,
+    ) -> Result<(), DatabaseError> {
+        enum Entry {
+            File { file_id: FileId },
+            Tag { tag_id: TagId },
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT target_id, type FROM entries WHERE tag_id = ?1 AND deleted = 0")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([tag_id], |row| {
+                let r#type: EntryType = row.get(1)?;
+
+                let entry = match r#type {
+                    EntryType::File => Entry::File {
+                        file_id: row.get(0)?,
+                    },
+                    EntryType::Tag => Entry::Tag {
+                        tag_id: row.get(0)?,
+                    },
+                };
+
+                Ok(entry)
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap());
+
+        lookup_cache.insert(tag_id);
+
+        for entry in iterator {
+            match entry {
+                Entry::File { file_id } => {
+                    collected_tag_ids.insert(file_id);
+                }
+                Entry::Tag { tag_id } => {
+                    if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
+                        self.file_ids_for_tag_inner(
+                            tag_id,
+                            lookup_cache,
+                            collected_tag_ids,
+                            subtag_rule,
+                        )?
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all files that are tagged with the provided tag.
+    pub fn file_ids_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = FileId>, DatabaseError> {
+        let mut file_ids = BTreeSet::new();
+        let mut lookup_cache = BTreeSet::new();
+
+        self.file_ids_for_tag_inner(tag_id, &mut lookup_cache, &mut file_ids, subtag_rule)?;
+
+        Ok(file_ids)
+    }
+
+    /// Get all files that are tagged with the provided tag.
+    pub fn tag_ids_for_file(
+        &self,
+        file_id: FileId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 0 AND deleted = 0")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut tag_ids = statement
+            .query_map([file_id], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|tag_id| tag_id.unwrap())
+            .collect::<BTreeSet<_>>();
+
+        if subtag_rule == SubtagRule::Include {
+            let mut lookup_cache = BTreeSet::new();
+
+            for tag_id in tag_ids.clone() {
+                self.tag_ids_for_subtag_inner(
+                    tag_id,
+                    &mut lookup_cache,
+                    &mut tag_ids,
+                    subtag_rule,
+                )?;
+            }
+        }
+
+        Ok(tag_ids)
+    }
+
+    fn subtag_ids_for_tag_inner(
+        &self,
+        tag_id: TagId,
+        lookup_cache: &mut BTreeSet<TagId>,
+        collected_tags: &mut BTreeSet<TagId>,
+        subtag_rule: SubtagRule,
+    ) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT target_id FROM entries WHERE tag_id = ?1 AND type = 1 AND deleted = 0")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([tag_id], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap());
+
+        lookup_cache.insert(tag_id);
+
+        for tag_id in iterator {
+            collected_tags.insert(tag_id);
+
+            if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
+                self.subtag_ids_for_tag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all subtags tagged with the provided tag.
+    pub fn subtag_ids_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        let mut tags = BTreeSet::new();
+        let mut lookup_cache = BTreeSet::new();
+
+        self.subtag_ids_for_tag_inner(tag_id, &mut lookup_cache, &mut tags, subtag_rule)?;
+
+        Ok(tags)
+    }
+
+    fn tag_ids_for_subtag_inner(
+        &self,
+        subtag_id: TagId,
+        lookup_cache: &mut BTreeSet<TagId>,
+        collected_tags: &mut BTreeSet<TagId>,
+        subtag_rule: SubtagRule,
+    ) -> Result<(), DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 1 AND deleted = 0")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([subtag_id], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|entry| entry.unwrap());
+
+        lookup_cache.insert(subtag_id);
+
+        for tag_id in iterator {
+            collected_tags.insert(tag_id);
+
+            if subtag_rule == SubtagRule::Include && !lookup_cache.contains(&tag_id) {
+                self.tag_ids_for_subtag_inner(tag_id, lookup_cache, collected_tags, subtag_rule)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all tags that tag the provided tag.
+    pub fn tag_ids_for_subtag(
+        &self,
+        subtag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        let mut tags = BTreeSet::new();
+        let mut lookup_cache = BTreeSet::new();
+
+        self.tag_ids_for_subtag_inner(subtag_id, &mut lookup_cache, &mut tags, subtag_rule)?;
+
+        Ok(tags)
+    }
+
+    /// Get all tags.
+    pub fn get_all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, color FROM tags")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag_list = statement
+            .query_map([], |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                    metadata: None,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|tag| tag.unwrap())
+            .collect::<Vec<_>>();
+
+        Ok(tag_list)
+    }
+
+    /// Get the name of a tag by the ID.
+    pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT name, color FROM tags WHERE id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag = statement
+            .query_map([tag_id], |row| {
+                Ok(Tag {
+                    id: tag_id,
+                    name: row.get(0)?,
+                    color: row.get(1)?,
+                    metadata: None,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|tag| tag.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingTag)?;
+
+        Ok(tag)
+    }
+
+    /// Get the ID of a file by its logical path.
+    pub fn file_id_from_logical_path(
+        &self,
+        logical_path: &LogicalPath,
+    ) -> Result<FileId, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM files WHERE logical_path = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let file_id = statement
+            .query_map([logical_path], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|id| id.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(file_id)
+    }
+
+    /// Get the ID of a tag by the name.
+    pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM tags WHERE name = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tag_id = statement
+            .query_map([name], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|id| id.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingTag)?;
+
+        Ok(tag_id)
+    }
+
+    /// Get the logical path for `file_id`.
+    ///
+    /// The inverse of `file_id_from_logical_path`. Errors with `MissingFile` if
+    /// the file has no row in `files` (unknown or deleted).
+    pub fn logical_path_for_file_id(&self, file_id: FileId) -> Result<LogicalPath, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT logical_path FROM files WHERE id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let logical_path = statement
+            .query_map([file_id], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|logical_path| logical_path.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(logical_path)
+    }
+
+    /// List every currently-known file (i.e. with a row in `files`) together
+    /// with its latest version's content hash and version number.
+    ///
+    /// Files are joined to the row in `file_versions` with the highest
+    /// `version_number`, using the DESC index on
+    /// `(file_id, version_number)`. Files without any recorded version are
+    /// excluded (they should not occur in practice, since every add/change
+    /// path records a version, but the inner join makes this defensive).
+    pub fn get_all_files(&self) -> Result<Vec<FileInfo>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.id, f.logical_path, v.content_hash, v.version_number
+                 FROM files AS f
+                 JOIN file_versions AS v
+                   ON v.file_id = f.id
+                  AND v.version_number = (
+                      SELECT MAX(version_number)
+                      FROM file_versions AS inner
+                      WHERE inner.file_id = f.id
+                  )",
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut files = Vec::new();
+        let rows = statement
+            .query_map([], |row| {
+                Ok(FileInfo {
+                    file_id: row.get(0)?,
+                    logical_path: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    version_number: row.get(3)?,
+                    // Filled in below once we have the whole set.
+                    short_id_length: 0,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        for row in rows {
+            files.push(row.map_err(|_| DatabaseError::FailedToExecuteCommand)?);
+        }
+
+        // Compute each file's shortest unique id prefix. Because this listing
+        // already contains *every* file, we can do it in-memory rather than
+        // hitting the DB per file: sort the ids, then each id only needs to be
+        // distinguished from its two immediate neighbours in that order (same
+        // reasoning as `shorten_file_id`, which the single-id path uses).
+        let mut sorted_ids: Vec<String> = files.iter().map(|f| f.file_id.to_string()).collect();
+        sorted_ids.sort();
+        for file in &mut files {
+            let id = file.file_id.to_string();
+            let position = sorted_ids
+                .binary_search(&id)
+                .expect("every file's id is in the sorted set");
+
+            let mut required = 1;
+            if position > 0 {
+                let predecessor = &sorted_ids[position - 1];
+                required = required.max(common_prefix_length(&id, predecessor) + 1);
+            }
+            if position + 1 < sorted_ids.len() {
+                let successor = &sorted_ids[position + 1];
+                required = required.max(common_prefix_length(&id, successor) + 1);
+            }
+            file.short_id_length = required.clamp(1, id.len());
+        }
+
+        Ok(files)
+    }
+}
+
+// TODO: Temporary functions to debug.
+impl FileDatabase {
+    pub fn show_content(&self, include_raw: bool) -> Result<(), DatabaseError> {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[allow(dead_code)]
+        pub struct File {
+            pub id: FileId,
+            pub logical_path: LogicalPath,
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        #[allow(dead_code)]
+        pub struct Tag {
+            pub id: TagId,
+            pub name: String,
+            pub color: String,
+        }
+
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Entry {
+            tag_id: TagId,
+            target_id_as_file_id: FileId,
+            target_id_as_tag_id: TagId,
+            r#type: EntryType,
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, logical_path FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let files = statement
+            .query_map([], |row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    logical_path: row.get(1)?,
+                })
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, color FROM tags")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let tags = statement
+            .query_map([], |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                })
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag_id, target_id, type FROM entries")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let entries = statement
+            .query_map([], |row| {
+                Ok(Entry {
+                    tag_id: row.get(0)?,
+                    target_id_as_file_id: row.get(1)?,
+                    target_id_as_tag_id: row.get(1)?,
+                    r#type: row.get(2)?,
+                })
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        if include_raw {
+            for file in &files {
+                println!("{:?}", file.as_ref().unwrap());
+            }
+
+            for tag in &tags {
+                println!("{:?}", tag.as_ref().unwrap());
+            }
+
+            for entry in &entries {
+                println!("{:?}", entry.as_ref().unwrap());
+            }
+        }
+
+        for file in &files {
+            let file = file.as_ref().unwrap();
+
+            let tags = entries
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    (entry.r#type == EntryType::File && entry.target_id_as_file_id == file.id)
+                        .then_some(entry)
+                })
+                .filter_map(|entry| {
+                    // The tag row may be absent (e.g. a file tagged with a tag
+                    // this node has never received — tags aren't synced yet).
+                    // This is debug output, so skip dangling references rather
+                    // than panicking and taking down the change handler.
+                    tags.iter()
+                        .find(|tag| tag.as_ref().unwrap().id == entry.tag_id)
+                        .map(|tag| tag.as_ref().unwrap())
+                })
+                .map(|tag| format!("\x1B[0;31m{}\x1B[0m", tag.name))
+                .collect::<Vec<String>>();
+
+            println!(
+                "\x1B[0;34m{}\x1B[0m | \x1B[0;35m{}\x1B[0m | {}",
+                file.id.to_string(),
+                file.logical_path,
+                tags.join(", ")
+            );
+        }
+
+        for tag in &tags {
+            let tag = tag.as_ref().unwrap();
+
+            let tags = entries
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    (entry.r#type == EntryType::Tag && entry.target_id_as_tag_id == tag.id)
+                        .then_some(entry)
+                })
+                .filter_map(|entry| {
+                    // See note above: skip dangling tag references instead of
+                    // panicking.
+                    tags.iter()
+                        .find(|tag| tag.as_ref().unwrap().id == entry.tag_id)
+                        .map(|tag| tag.as_ref().unwrap())
+                })
+                .map(|tag| format!("\x1B[0;32m{}\x1B[0m", tag.name))
+                .collect::<Vec<String>>();
+
+            println!(
+                "\x1B[0;36m{}\x1B[0m | \x1B[0;33m{}\x1B[0m | {}",
+                tag.id.to_string(),
+                tag.name,
+                tags.join(", ")
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncDirectoryFile {
+    pub file_id: FileId,
+    /// The file's physical path on disk, relative to this sync directory's
+    /// root. For a `TagBased` directory this equals the file's logical path;
+    /// for a `Universal` directory it is the file's `file_id` (files are stored
+    /// under their id on disk). This also serves as the reverse index for
+    /// filesystem events (path -> file_id), so it must always reflect the actual
+    /// on-disk name. It is NOT the value to advertise to peers or show to users;
+    /// for that use the logical path from `FileDatabase`
+    /// (`FileDatabase.files.logical_path`).
+    pub physical_path: PhysicalPath,
+}
+
+#[derive(Debug)]
+pub struct SyncDirectoryDatabase {
+    connection: Connection,
+}
+
+impl SyncDirectoryDatabase {
+    pub fn initialize(database_path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        let connection =
+            Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
+
+        connection
+            .execute(
+                // `physical_path` is where the bytes live on disk relative to
+                // this sync directory's root, and doubles as the reverse index
+                // for filesystem events (path -> file_id). For TagBased it
+                // equals the logical path; for Universal it is the `file_id`.
+                // The logical/human name lives in `FileDatabase.files`.
+                "CREATE TABLE IF NOT EXISTS files (
+            id              TEXT PRIMARY KEY,
+            physical_path   TEXT NOT NULL
+        )",
+                (), // empty list of parameters.
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // DEVELOPMENT ONLY: bridge stale dev databases to the current id format
+        // before any real access. See `run_development_migrations`.
+        run_development_migrations(&connection, &[("files", "id")])?;
+
+        Ok(Self { connection })
+    }
+
+    /// Add a new file.
+    ///
+    /// Note: content hashes are stored in `FileDatabase::file_versions`, not
+    /// here. After calling this you typically also want to call
+    /// `FileDatabase::record_version`.
+    pub fn add_file(
+        &self,
+        file_id: FileId,
+        physical_path: &PhysicalPath,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO files (id, physical_path) VALUES (?1, ?2)",
+                (file_id, physical_path),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn update_file_physical_path(
+        &self,
+        file_id: FileId,
+        physical_path: &PhysicalPath,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE files SET physical_path = ?2 WHERE id = ?1",
+                (file_id, physical_path),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    pub fn remove_file_by_id(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    // pub fn remove_file_by_physical_path(&self, physical_path: impl AsRef<str>) -> Result<(), DatabaseError> {
+    //     self.connection
+    //         .execute("DELETE FROM files WHERE physical_path = ?1", [physical_path.as_ref()])
+    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    //
+    //     Ok(())
+    // }
+
+    pub fn get_file(&self, file_id: FileId) -> Result<SyncDirectoryFile, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT physical_path FROM files WHERE id = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let file = statement
+            .query_map([file_id], |row| {
+                Ok(SyncDirectoryFile {
+                    file_id,
+                    physical_path: row.get(0)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|preview| preview.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(file)
+    }
+
+    pub fn get_file_id(&self, physical_path: &PhysicalPath) -> Result<FileId, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM files WHERE physical_path = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let id = statement
+            .query_map([physical_path], |row| row.get(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|preview| preview.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        Ok(id)
+    }
+
+    pub fn get_all_files(&self) -> Result<Vec<SyncDirectoryFile>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, physical_path FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(statement
+            .query_map([], |row| {
+                Ok(SyncDirectoryFile {
+                    file_id: row.get(0)?,
+                    physical_path: row.get(1)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .collect())
+    }
+
+    pub fn get_all_files_at(
+        &self,
+        physical_path: &PhysicalPath,
+    ) -> Result<Vec<SyncDirectoryFile>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, physical_path FROM files WHERE physical_path LIKE ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let matcher = format!("{}%", physical_path.as_str());
+
+        Ok(statement
+            .query_map([matcher], |row| {
+                Ok(SyncDirectoryFile {
+                    file_id: row.get(0)?,
+                    physical_path: row.get(1)?,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .collect())
+    }
+}
+
+// TODO: Temporary functions to debug.
+impl SyncDirectoryDatabase {
+    pub fn show_files(&self) -> Result<(), DatabaseError> {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[allow(dead_code)]
+        pub struct File {
+            pub id: FileId,
+            pub physical_path: PhysicalPath,
+        }
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, physical_path FROM files")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let iterator = statement
+            .query_map([], |row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    physical_path: row.get(1)?,
+                })
+            })
+            .unwrap();
+
+        for file in iterator {
+            println!("{:?}", file.unwrap());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_db() -> FileDatabase {
+        FileDatabase::initialize(":memory:").expect("open in-memory db")
+    }
+
+    #[test]
+    fn logical_path_for_file_id_roundtrips() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("photos/cat.jpg"))
+            .unwrap();
+
+        assert_eq!(
+            database.logical_path_for_file_id(file_id).unwrap(),
+            LogicalPath::new("photos/cat.jpg")
+        );
+    }
+
+    #[test]
+    fn logical_path_for_file_id_missing_is_not_found() {
+        let database = memory_db();
+        let missing = FileId::new();
+        assert!(matches!(
+            database.logical_path_for_file_id(missing),
+            Err(DatabaseError::MissingFile)
+        ));
+    }
+
+    #[test]
+    fn get_all_files_reports_latest_version() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+
+        // Two versions; get_all_files must report the latest (higher
+        // version_number), not the first.
+        let v1 = database
+            .record_version(file_id, "hash-v1", "local")
+            .unwrap();
+        let v2 = database
+            .record_version(file_id, "hash-v2", "local")
+            .unwrap();
+        assert!(v2 > v1);
+
+        let files = database.get_all_files().unwrap();
+        assert_eq!(files.len(), 1);
+        let info = &files[0];
+        assert_eq!(info.file_id, file_id);
+        assert_eq!(info.logical_path, LogicalPath::new("a.txt"));
+        assert_eq!(info.content_hash, "hash-v2");
+        assert_eq!(info.version_number, v2);
+    }
+
+    #[test]
+    fn get_all_files_excludes_files_without_versions() {
+        let database = memory_db();
+        // A file row with no recorded version: the inner join drops it.
+        database
+            .add_file(FileId::new(), &LogicalPath::new("orphan.txt"))
+            .unwrap();
+
+        assert!(database.get_all_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_all_files_empty_when_no_files() {
+        let database = memory_db();
+        assert!(database.get_all_files().unwrap().is_empty());
+    }
+
+    /// Build a `FileId` from a 32-char hex string so tests can control the
+    /// exact prefix relationships between ids.
+    fn file_id_from_hex(hex: &str) -> FileId {
+        FileId::from_string(hex).expect("valid hex uuid")
+    }
+
+    #[test]
+    fn shorten_file_id_single_file_needs_one_char() {
+        let database = memory_db();
+        let only = file_id_from_hex("00000000000000000000000000000001");
+        database.add_file(only, &LogicalPath::new("a")).unwrap();
+
+        // No neighbours -> a single character already uniquely identifies it.
+        assert_eq!(database.shorten_file_id(only).unwrap(), 1);
+    }
+
+    #[test]
+    fn shorten_file_id_grows_prefix_to_disambiguate_neighbours() {
+        let database = memory_db();
+        // Three ids: two share the leading `abcd`, one is far away.
+        let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
+        let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
+        let far = file_id_from_hex("ffff000000000000000000000000000f");
+        for (id, name) in [(shared_a, "a"), (shared_b, "b"), (far, "c")] {
+            database.add_file(id, &LogicalPath::new(name)).unwrap();
+        }
+
+        // shared_a and shared_b agree on `abcd00...000` up to the final hex
+        // char, so they must be distinguished at the last differing position.
+        let len_a = database.shorten_file_id(shared_a).unwrap();
+        let len_b = database.shorten_file_id(shared_b).unwrap();
+        let a = shared_a.to_string();
+        let b = shared_b.to_string();
+        // The prefix of each must exclude the other.
+        assert!(!b.starts_with(&a[..len_a]));
+        assert!(!a.starts_with(&b[..len_b]));
+
+        // The far id only needs one char (`f`), since neither neighbour shares
+        // its first character.
+        assert_eq!(database.shorten_file_id(far).unwrap(), 1);
+    }
+
+    #[test]
+    fn shorten_file_id_missing_is_not_found() {
+        let database = memory_db();
+        assert!(matches!(
+            database.shorten_file_id(FileId::new()),
+            Err(DatabaseError::MissingFile)
+        ));
+    }
+
+    #[test]
+    fn get_all_files_reports_short_id_length() {
+        let mut database = memory_db();
+        let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
+        let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
+        for (id, name) in [(shared_a, "a"), (shared_b, "b")] {
+            database.add_file(id, &LogicalPath::new(name)).unwrap();
+            database.record_version(id, "hash", "local").unwrap();
+        }
+
+        let files = database.get_all_files().unwrap();
+        // Both ids share all but the final character, so the short id must be
+        // the full length to disambiguate.
+        for info in &files {
+            let full = info.file_id.to_string();
+            assert_eq!(info.short_id_length, full.len());
+        }
+    }
+
+    #[test]
+    fn resolve_file_id_prefix_unique_short_prefix() {
+        let database = memory_db();
+        let far_a = file_id_from_hex("aaaa000000000000000000000000000a");
+        let far_b = file_id_from_hex("bbbb000000000000000000000000000b");
+        database.add_file(far_a, &LogicalPath::new("a")).unwrap();
+        database.add_file(far_b, &LogicalPath::new("b")).unwrap();
+
+        // A single leading char is enough to pick each out.
+        assert_eq!(database.resolve_file_id_prefix("a").unwrap(), far_a);
+        assert_eq!(database.resolve_file_id_prefix("b").unwrap(), far_b);
+    }
+
+    #[test]
+    fn resolve_file_id_prefix_accepts_full_and_hyphenated_forms() {
+        let database = memory_db();
+        let id = file_id_from_hex("7f3a1b2c4d5e6f708192a3b4c5d6e7f8");
+        database.add_file(id, &LogicalPath::new("a")).unwrap();
+
+        // Full hex form.
+        assert_eq!(
+            database
+                .resolve_file_id_prefix("7f3a1b2c4d5e6f708192a3b4c5d6e7f8")
+                .unwrap(),
+            id
+        );
+        // Hyphenated form (hyphens are stripped before matching).
+        assert_eq!(
+            database
+                .resolve_file_id_prefix("7f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8")
+                .unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn resolve_file_id_prefix_ambiguous_is_reported() {
+        let database = memory_db();
+        let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
+        let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
+        database.add_file(shared_a, &LogicalPath::new("a")).unwrap();
+        database.add_file(shared_b, &LogicalPath::new("b")).unwrap();
+
+        // `abcd` matches both.
+        assert!(matches!(
+            database.resolve_file_id_prefix("abcd"),
+            Err(DatabaseError::AmbiguousIdPrefix(prefix)) if prefix == "abcd"
+        ));
+    }
+
+    #[test]
+    fn resolve_file_id_prefix_unknown_is_missing() {
+        let database = memory_db();
+        database
+            .add_file(
+                file_id_from_hex("aaaa000000000000000000000000000a"),
+                &LogicalPath::new("a"),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            database.resolve_file_id_prefix("ffff"),
+            Err(DatabaseError::MissingFile)
+        ));
+    }
+
+    #[test]
+    fn resolve_file_id_prefix_rejects_non_hex() {
+        let database = memory_db();
+        // `zzzz` is not hex; normalisation fails and it resolves to nothing.
+        assert!(matches!(
+            database.resolve_file_id_prefix("zzzz"),
+            Err(DatabaseError::MissingFile)
+        ));
+    }
+
+    #[test]
+    fn shorten_then_resolve_roundtrips() {
+        let mut database = memory_db();
+        let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
+        let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
+        let far = file_id_from_hex("ffff000000000000000000000000000f");
+        for (id, name) in [(shared_a, "a"), (shared_b, "b"), (far, "c")] {
+            database.add_file(id, &LogicalPath::new(name)).unwrap();
+            database.record_version(id, "hash", "local").unwrap();
+        }
+
+        // Each file's displayed short id must resolve back to exactly itself.
+        for info in database.get_all_files().unwrap() {
+            let full = info.file_id.to_string();
+            let short = &full[..info.short_id_length];
+            assert_eq!(
+                database.resolve_file_id_prefix(short).unwrap(),
+                info.file_id,
+                "short id {short} should resolve to its own file"
+            );
+        }
+    }
+
+    #[test]
+    fn development_migration_rewrites_hyphenated_ids_to_hex() {
+        let database = memory_db();
+
+        // Simulate a stale dev database by inserting an id in the old
+        // hyphenated form directly, bypassing the typed `ToSql` (which now
+        // writes hex).
+        let hyphenated = "7f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8";
+        database
+            .connection
+            .execute(
+                "INSERT INTO files (id, logical_path) VALUES (?1, ?2)",
+                (hyphenated, "legacy.txt"),
+            )
+            .unwrap();
+
+        // Re-run the dev migration (idempotent) and confirm the stored id is
+        // now the simple hex form.
+        run_development_migrations(&database.connection, &[("files", "id")]).unwrap();
+
+        let stored: String = database
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE logical_path = 'legacy.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "7f3a1b2c4d5e6f708192a3b4c5d6e7f8");
+
+        // And running it again changes nothing.
+        run_development_migrations(&database.connection, &[("files", "id")]).unwrap();
+        let stored_again: String = database
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE logical_path = 'legacy.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_again, "7f3a1b2c4d5e6f708192a3b4c5d6e7f8");
+    }
+
+    // --- Tag last-writer-wins ------------------------------------------------
+
+    #[test]
+    fn add_tag_newer_modified_at_wins_older_is_noop() {
+        let database = memory_db();
+        let tag_id = TagId::new();
+
+        database.add_tag(tag_id, "work", "red", 100).unwrap();
+        // A newer definition overwrites.
+        database.add_tag(tag_id, "job", "blue", 200).unwrap();
+        let (name, color, modified_at) = database.tag_definition(tag_id).unwrap().unwrap();
+        assert_eq!(
+            (name.as_str(), color.as_str(), modified_at),
+            ("job", "blue", 200)
+        );
+
+        // A stale definition (older modified_at) must not clobber.
+        database.add_tag(tag_id, "stale", "green", 150).unwrap();
+        let (name, _, modified_at) = database.tag_definition(tag_id).unwrap().unwrap();
+        assert_eq!((name.as_str(), modified_at), ("job", 200));
+    }
+
+    #[test]
+    fn update_tag_name_respects_lww() {
+        let database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "work", "red", 100).unwrap();
+
+        // Older rename loses.
+        database.update_tag_name(tag_id, "old", 50).unwrap();
+        assert_eq!(database.tag_definition(tag_id).unwrap().unwrap().0, "work");
+
+        // Newer rename wins.
+        database.update_tag_name(tag_id, "new", 300).unwrap();
+        assert_eq!(database.tag_definition(tag_id).unwrap().unwrap().0, "new");
+    }
+
+    #[test]
+    fn duplicate_tag_names_coexist() {
+        // UNIQUE(name) was relaxed: two tags may share a name.
+        let database = memory_db();
+        let a = TagId::new();
+        let b = TagId::new();
+        database.add_tag(a, "work", "red", 100).unwrap();
+        database.add_tag(b, "work", "blue", 100).unwrap();
+
+        assert!(database.tag_definition(a).unwrap().is_some());
+        assert!(database.tag_definition(b).unwrap().is_some());
+        let all: Vec<_> = database.get_all_tags().unwrap().into_iter().collect();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn tag_file_then_untag_soft_deletes_and_hides_from_reads() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        let tag_id = TagId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+
+        database.tag_file(tag_id, file_id, 100).unwrap();
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(tags, vec![tag_id]);
+
+        // Untag soft-deletes: the read no longer sees it...
+        database.untag_file(tag_id, file_id, 200).unwrap();
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(tags.is_empty());
+
+        // ...but the tombstone row survives for reconciliation.
+        let manifest = database.relationship_manifest_entries().unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert!(manifest[0].deleted);
+        assert_eq!(manifest[0].modified_at, 200);
+    }
+
+    #[test]
+    fn stale_untag_does_not_override_newer_tag() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        let tag_id = TagId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+
+        // Tag at t=200, then a stale untag at t=100 arrives out of order.
+        database.tag_file(tag_id, file_id, 200).unwrap();
+        database.untag_file(tag_id, file_id, 100).unwrap();
+
+        // The tag must still be present (newer wins).
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(tags, vec![tag_id]);
+    }
+
+    #[test]
+    fn retag_after_untag_revives_row() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        let tag_id = TagId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+
+        database.tag_file(tag_id, file_id, 100).unwrap();
+        database.untag_file(tag_id, file_id, 200).unwrap();
+        database.tag_file(tag_id, file_id, 300).unwrap();
+
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(tags, vec![tag_id]);
+        // Still a single row (revived, not duplicated).
+        assert_eq!(database.relationship_manifest_entries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_relationship_reconciles_tombstone_with_lww() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        let tag_id = TagId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+
+        // Locally the file is tagged at t=100.
+        database.tag_file(tag_id, file_id, 100).unwrap();
+
+        // A peer's manifest carries a newer tombstone (untagged at t=200).
+        let incoming = RelationshipManifestEntry {
+            tag_id,
+            target_id: file_id.to_string(),
+            kind: RelationshipKind::File,
+            modified_at: 200,
+            deleted: true,
+        };
+        database.apply_relationship(&incoming).unwrap();
+
+        // The newer tombstone wins: the tag is now absent.
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(tags.is_empty());
+
+        // A stale "present" (t=150) from another peer must not resurrect it.
+        let stale = RelationshipManifestEntry {
+            tag_id,
+            target_id: file_id.to_string(),
+            kind: RelationshipKind::File,
+            modified_at: 150,
+            deleted: false,
+        };
+        database.apply_relationship(&stale).unwrap();
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn tag_manifest_entries_reports_all_definitions() {
+        let database = memory_db();
+        let a = TagId::new();
+        let b = TagId::new();
+        database.add_tag(a, "one", "red", 111).unwrap();
+        database.add_tag(b, "two", "blue", 222).unwrap();
+
+        let mut entries = database.tag_manifest_entries().unwrap();
+        entries.sort_by_key(|entry| entry.modified_at);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].modified_at, 111);
+        assert_eq!(entries[1].modified_at, 222);
+    }
+}

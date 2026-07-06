@@ -30,8 +30,8 @@
   }:
     {
       overlays.default = final: prev: {
+        tagnetd = final.callPackage ./tagnetd.nix {};
         tagnet = final.callPackage ./tagnet.nix {};
-        tagnet-cli = final.callPackage ./tagnet-cli.nix {};
       };
 
       nixosModules.default = import ./module.nix self;
@@ -251,8 +251,8 @@
         # serves the control socket). The user runs it separately; this just
         # produces the artifact for convenience.
         buildDaemonBody = ''
-          cargo build --release -p tagnet
-          echo "Daemon built at target/release/tagnet."
+          cargo build --release -p tagnetd
+          echo "Daemon built at target/release/tagnetd."
           echo "It serves the control socket at /run/tagnet/tagnet.sock."
         '';
 
@@ -267,9 +267,9 @@
         formatter = pkgs.alejandra;
 
         packages = rec {
+          tagnetd = pkgs.tagnetd;
           tagnet = pkgs.tagnet;
-          tagnet-cli = pkgs.tagnet-cli;
-          default = tagnet-cli;
+          default = tagnet;
         };
 
         apps = {

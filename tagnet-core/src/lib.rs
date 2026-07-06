@@ -39,21 +39,21 @@ pub mod tag {
 
     impl MetadataFormat {
         // TODO: Make this a from.
-        pub fn new(string: &str) -> Self {
+        pub fn new(_string: &str) -> Self {
             todo!()
         }
 
         pub fn value_map(
             &self,
-            values: &MetadataValues,
+            _values: &MetadataValues,
         ) -> Result<HashMap<String, WeakData>, QueryError> {
             todo!()
         }
 
         pub fn query_value(
             &self,
-            values: &MetadataValues,
-            key: &str,
+            _values: &MetadataValues,
+            _key: &str,
         ) -> Result<WeakData, QueryError> {
             todo!()
         }
@@ -62,6 +62,8 @@ pub mod tag {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct MetadataValues(HashMap<String, WeakData>);
 
+    // Fields are not yet read; the struct models planned tag-metadata storage.
+    #[allow(dead_code)]
     pub struct TagMetadata {
         file_id: FileId,
         tag_id: TagId, // <-- Tag has the `MetadataFormat`.
@@ -124,19 +126,26 @@ pub mod state {
         FileDeleted {
             file_id: FileId,
         },
+        // Tag-mutation variants each carry `modified_at`: the unix-millis
+        // wall-clock time stamped on the *originating* device. It is preserved
+        // verbatim as the change propagates and drives last-writer-wins
+        // reconciliation of tag state. Receivers must never restamp it.
         TagAdded {
             tag_id: TagId,
             tag_name: String,
-            // color,
+            color: String,
             metadata: Option<MetadataFormat>,
+            modified_at: i64,
         },
         TagRenamed {
             tag_id: TagId,
             tag_name: String,
+            modified_at: i64,
         },
         TagChanged {
             tag_id: TagId,
             metadata: Option<MetadataValues>,
+            modified_at: i64,
         },
         TagRemoved {
             tag_id: TagId,
@@ -145,29 +154,35 @@ pub mod state {
             file_id: FileId,
             tag_id: TagId,
             metadata: Option<MetadataValues>,
+            modified_at: i64,
         },
         FileTagChanged {
             file_id: FileId,
             tag_id: TagId,
             metadata: Option<MetadataValues>,
+            modified_at: i64,
         },
         FileUntagged {
             file_id: FileId,
             tag_id: TagId,
+            modified_at: i64,
         },
         TagTagged {
             taggee_id: TagId,
             tag_id: TagId,
             metadata: Option<MetadataValues>,
+            modified_at: i64,
         },
         TagTagChanged {
             taggee_id: TagId,
             tag_id: TagId,
             metadata: Option<MetadataValues>,
+            modified_at: i64,
         },
         TagUntagged {
             taggee_id: TagId,
             tag_id: TagId,
+            modified_at: i64,
         },
     }
 
@@ -189,6 +204,42 @@ pub mod state {
         pub latest_observed_at: i64,
     }
 
+    /// What a tag relationship attaches a tag to. Mirrors the daemon's
+    /// `EntryType` (`File = 0`, `Tag = 1`) but lives in the wire crate so the
+    /// protocol does not depend on the daemon's database types. The `target_id`
+    /// it accompanies is a stringified `FileId` or `TagId` accordingly.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum RelationshipKind {
+        File,
+        Tag,
+    }
+
+    /// A tag *definition* as advertised in a tag manifest: just its id and the
+    /// last-writer-wins timestamp. Unlike files, tags carry no version chain —
+    /// reconciliation compares `modified_at` and requests the full definition
+    /// when the peer's is newer (or unknown locally). The lightweight
+    /// advertise-then-request split mirrors file reconciliation and leaves room
+    /// for tag payloads (metadata) to grow without bloating every manifest.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TagManifestEntry {
+        pub tag_id: TagId,
+        pub modified_at: i64,
+    }
+
+    /// A tag *relationship* (file-tagged or tag-tagged) as advertised in a tag
+    /// manifest. `deleted` carries the soft-delete state so that an "absent"
+    /// (untagged) relationship can win last-writer-wins against a peer's stale
+    /// "present" — the tombstone is part of the reconcilable state.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RelationshipManifestEntry {
+        pub tag_id: TagId,
+        /// Stringified `FileId`/`TagId` per `kind`.
+        pub target_id: String,
+        pub kind: RelationshipKind,
+        pub modified_at: i64,
+        pub deleted: bool,
+    }
+
     /// Reconciliation messages exchanged between peers, independent of the
     /// live `Change` stream.
     ///
@@ -203,7 +254,7 @@ pub mod state {
     ///    format), or `NotFound` if the file is no longer locally available.
     ///
     /// The `Fetch*` variants are a distinct, on-demand mechanism (used by
-    /// `tagnet-cli edit`): a recursive request for a *specific* file's bytes
+    /// `tagnet edit`): a recursive request for a *specific* file's bytes
     /// that floods across an assumed-acyclic tree of live peer connections.
     /// Each node forwards a `FetchRequest` to all neighbours except the one it
     /// arrived from; the first `FetchFound` (whose hash matches
@@ -245,6 +296,33 @@ pub mod state {
         FetchMissing {
             request_id: RequestId,
         },
+
+        /// Tag reconciliation, sent unprompted right after `Manifest` at
+        /// connection time (and driving offline catch-up the same way).
+        ///
+        /// Flow, mirroring the file `Manifest`/`Request` split:
+        /// 1. Each side sends its `TagManifest` (lightweight: per-tag id +
+        ///    `modified_at`, plus every relationship as a full
+        ///    `RelationshipManifestEntry`).
+        /// 2. For each *definition* whose `modified_at` is newer than ours (or
+        ///    that we don't know), the receiver replies with `TagRequest`.
+        ///    Relationships carry their whole state in the manifest, so they are
+        ///    applied directly by last-writer-wins with no request needed.
+        /// 3. The peer answers each `TagRequest` with a `Change::TagAdded`
+        ///    carrying the full current definition (name/color/metadata +
+        ///    `modified_at`), re-using the live wire format exactly as
+        ///    `Sync::Request` is answered with `Change::FileAdded`. If the tag no
+        ///    longer exists locally it answers `TagNotFound`.
+        TagManifest {
+            definitions: Vec<TagManifestEntry>,
+            relationships: Vec<RelationshipManifestEntry>,
+        },
+        TagRequest {
+            tag_id: TagId,
+        },
+        TagNotFound {
+            tag_id: TagId,
+        },
     }
 
     /// Top-level wire message wrapper. Every WebSocket text frame between
@@ -271,6 +349,14 @@ pub struct FileInfo {
     pub logical_path: LogicalPath,
     pub content_hash: String,
     pub version_number: i64,
+    /// Number of leading characters of `file_id` (in its canonical simple-hex
+    /// form) needed to uniquely identify this file among all files known at the
+    /// time the listing was produced — the "short id" length, à la `jj`/`git`.
+    ///
+    /// This is a display hint only: it is computed on read and is not stable
+    /// across concurrent inserts. Consumers highlight `file_id[..short_id_length]`
+    /// and dim the remainder.
+    pub short_id_length: usize,
 }
 
 macro_rules! make_id_type {
@@ -281,17 +367,28 @@ macro_rules! make_id_type {
         #[serde(transparent)]
         pub struct $name(Uuid);
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         impl $name {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
 
             pub fn from_string(uuid: &str) -> Option<Self> {
+                // Accepts both the simple (32 hex chars) and hyphenated forms,
+                // so ids typed or pasted in either shape parse correctly.
                 Some(Self(Uuid::try_from(uuid).ok()?))
             }
 
             pub fn to_string(&self) -> String {
-                self.0.to_string()
+                // Render in the same simple hex form we persist (see `ToSql`),
+                // so displayed ids match what's stored and what the short-id
+                // prefix logic operates on.
+                self.0.simple().to_string()
             }
         }
 
@@ -309,7 +406,16 @@ macro_rules! make_id_type {
 
         impl ToSql for $name {
             fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-                Ok(self.0.to_string().into())
+                // Persist the UUID in its *simple* form: 32 hex characters, no
+                // hyphens (e.g. `7f3a1b2c...` rather than `7f3a-1b2c-...`).
+                //
+                // This is the canonical on-disk id format. It is chosen so that
+                // ids sort and prefix-match cleanly as plain hex strings, which
+                // is what the short-id ("shorten"/"resolve") machinery relies on
+                // — a hex prefix never straddles a hyphen. `FromSql` still
+                // accepts both hyphenated and simple forms, so reads remain
+                // backwards compatible; only new writes use this form.
+                Ok(self.0.simple().to_string().into())
             }
         }
 
@@ -340,9 +446,11 @@ impl RequestId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+}
 
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
     }
 }
 

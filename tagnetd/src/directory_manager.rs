@@ -77,7 +77,7 @@ pub enum SyncDirectoryCommand {
     /// Resolve `file_id` to the **absolute** on-disk path where its bytes
     /// currently live in the first sync directory that holds it, without reading
     /// the content. Responds with `None` if no sync directory has the file.
-    /// Used by `tagnet-cli edit` to open a locally-present file in place (so the
+    /// Used by `tagnet edit` to open a locally-present file in place (so the
     /// filesystem watcher picks up the save and propagates it).
     LocalPath {
         file_id: FileId,

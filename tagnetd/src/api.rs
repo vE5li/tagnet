@@ -46,6 +46,9 @@ use crate::directory_manager::SyncDirectoryCommand;
 pub enum ApiError {
     /// Unknown `FileId`/`TagId`.
     NotFound,
+    /// A short-id prefix matched more than one file, so it could not be
+    /// resolved to a single id. Carries the ambiguous prefix.
+    Ambiguous(String),
     /// A caller-supplied argument was invalid (e.g. empty tag name).
     InvalidArgument(String),
     /// A database-layer failure.
@@ -61,6 +64,12 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::NotFound => write!(formatter, "not found"),
+            ApiError::Ambiguous(prefix) => {
+                write!(
+                    formatter,
+                    "ambiguous id prefix '{prefix}': matches multiple files"
+                )
+            }
             ApiError::InvalidArgument(message) => {
                 write!(formatter, "invalid argument: {message}")
             }
@@ -77,6 +86,7 @@ impl From<DatabaseError> for ApiError {
     fn from(error: DatabaseError) -> Self {
         match error {
             DatabaseError::MissingFile | DatabaseError::MissingTag => ApiError::NotFound,
+            DatabaseError::AmbiguousIdPrefix(prefix) => ApiError::Ambiguous(prefix),
             DatabaseError::InvalidTagName => {
                 ApiError::InvalidArgument("invalid tag name".to_owned())
             }
@@ -194,6 +204,17 @@ impl Api {
         Ok(database.get_all_files()?)
     }
 
+    /// Resolve a full-or-short file id `prefix` (as displayed by `list_files`'s
+    /// short ids, or a pasted full id) to a single [`FileId`]. Backed by
+    /// `FileDatabase::resolve_file_id_prefix`.
+    ///
+    /// Returns [`ApiError::NotFound`] if nothing matches and
+    /// [`ApiError::Ambiguous`] if more than one file matches.
+    pub fn resolve_file_id(&self, prefix: &str) -> Result<FileId, ApiError> {
+        let database = self.open_read()?;
+        Ok(database.resolve_file_id_prefix(prefix)?)
+    }
+
     /// List the tags applied to `file_id`. `subtag_rule` controls whether the
     /// tag hierarchy is walked. Backed by `FileDatabase::tag_ids_for_file`.
     pub fn tags_for_file(
@@ -232,11 +253,20 @@ impl Api {
         if name.trim().is_empty() {
             return Err(ApiError::InvalidArgument("tag name is empty".to_owned()));
         }
+        // A locally-originated mutation is stamped with our wall clock now; the
+        // timestamp then rides the change unchanged to peers for LWW.
+        let color = if color.trim().is_empty() {
+            "red".to_owned()
+        } else {
+            color
+        };
         let tag_id = TagId::new();
         self.enqueue(Change::TagAdded {
             tag_id,
             tag_name: name,
+            color,
             metadata: None,
+            modified_at: crate::database::now_millis(),
         })?;
         Ok(tag_id)
     }
@@ -277,7 +307,7 @@ impl Api {
     /// directory manager does) and enqueues `Change::FileChanged`. Fire-and-
     /// forget: returns once enqueued, persistence is asynchronous.
     ///
-    /// Used by `tagnet-cli edit` to write back edited bytes.
+    /// Used by `tagnet edit` to write back edited bytes.
     pub fn edit_file(&self, file_id: FileId, content: Vec<u8>) -> Result<(), ApiError> {
         let content_hash = blake3::hash(&content).to_hex().to_string();
         self.enqueue(Change::FileChanged {
@@ -331,7 +361,7 @@ impl Api {
     /// Resolve `file_id` to the absolute on-disk path where its bytes currently
     /// live locally, or `None` if no sync directory holds it. Read-only.
     ///
-    /// Used by `tagnet-cli edit` to detect the "already local" case and open the
+    /// Used by `tagnet edit` to detect the "already local" case and open the
     /// real file in place (the watcher then propagates the save).
     pub async fn local_path_for_file(&self, file_id: FileId) -> Result<Option<PathBuf>, ApiError> {
         let (respond_to, response) = oneshot::channel();
@@ -352,12 +382,17 @@ impl Api {
             file_id,
             tag_id,
             metadata: None,
+            modified_at: crate::database::now_millis(),
         })
     }
 
     /// Remove `tag_id` from `file_id`. Enqueues `Change::FileUntagged`.
     pub fn untag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
-        self.enqueue(Change::FileUntagged { file_id, tag_id })
+        self.enqueue(Change::FileUntagged {
+            file_id,
+            tag_id,
+            modified_at: crate::database::now_millis(),
+        })
     }
 
     // --- Event stream (plan 5.5) ---------------------------------------------

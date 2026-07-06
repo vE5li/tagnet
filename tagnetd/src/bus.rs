@@ -7,7 +7,7 @@
 //!
 //! [`DaemonMessage`] widens that one channel into an enum so the *same* ordered
 //! FIFO can also carry a request-reply message ([`DaemonMessage::Fetch`]) used
-//! by `tagnet-cli edit` to pull a file's bytes from a peer on demand. Keeping it
+//! by `tagnet edit` to pull a file's bytes from a peer on demand. Keeping it
 //! on the existing channel (rather than a second channel + `select!`) preserves
 //! the order of a producer's messages relative to each other — e.g. an edit
 //! enqueued just before a fetch of the same file — and reuses the existing
@@ -33,7 +33,7 @@ use tokio::sync::oneshot;
 pub enum DaemonMessage {
     /// A mutation to apply. Fire-and-forget: no reply.
     Change(Change, ChangeOrigin),
-    /// An on-demand request for a file's bytes (used by `tagnet-cli edit` when
+    /// An on-demand request for a file's bytes (used by `tagnet edit` when
     /// the file is not present locally). `handle_changes` seeds a local-origin
     /// entry in the pending-fetch table, floods `Sync::FetchRequest` to peers,
     /// and resolves `respond_to` when a matching `FetchFound` arrives (or with

@@ -3,7 +3,7 @@
 //! This is the thin layer `flutter_rust_bridge` generates Dart bindings for. It
 //! deliberately adds **no** business logic: it owns a [`RuntimeHandle`] and
 //! forwards every call to the section-6 [`Backend`], which forwards to the
-//! section-5 [`Api`](tagnet::api::Api). The Dart UI holds one [`TagnetApp`] and
+//! section-5 [`Api`](tagnetd::api::Api). The Dart UI holds one [`TagnetApp`] and
 //! never learns which transport backs it.
 //!
 //! The `#[flutter_rust_bridge::frb]` annotations are applied only when the
@@ -13,18 +13,18 @@
 
 use tokio::sync::Mutex;
 
-use tagnet::transport::{Backend, EventStream, TransportBackend};
+use tagnetd::transport::{Backend, EventStream, TransportBackend};
 
 // Re-exported (not just `use`d) so the types appearing in this module's
 // `#[frb]`-annotated signatures are reachable via `crate::api::*` — which is
 // exactly how `flutter_rust_bridge_codegen` references them in the generated
 // `frb_generated.rs`. A plain private `use` would not be visible through that
 // glob and the generated code fails to compile.
-pub use tagnet::{
+pub use tagnet_core::{FileId, FileInfo, TagId};
+pub use tagnetd::{
     api::{ApiError, ApiEvent},
     database::{SubtagRule, Tag},
 };
-pub use tagnet_core::{FileId, FileInfo, TagId};
 
 use crate::runtime::{BridgePaths, StartError};
 
@@ -40,6 +40,11 @@ pub struct FileEntry {
     pub path: String,
     pub content_hash: String,
     pub version_number: i64,
+    /// Number of leading characters of `file_id` that uniquely identify this
+    /// file among all files in the listing — the "short id" length, à la
+    /// `jj`/`git`. The UI highlights `file_id[..short_id_length]` and dims the
+    /// rest. Computed on read; not stable across concurrent inserts.
+    pub short_id_length: i64,
 }
 
 impl From<FileInfo> for FileEntry {
@@ -49,6 +54,7 @@ impl From<FileInfo> for FileEntry {
             path: info.logical_path.into_string(),
             content_hash: info.content_hash,
             version_number: info.version_number,
+            short_id_length: info.short_id_length as i64,
         }
     }
 }
@@ -91,7 +97,7 @@ impl TagnetApp {
     /// this handle is dropped.
     ///
     /// Parses `configuration_json` with
-    /// [`Configuration::from_str`](tagnet::configuration::Configuration::from_str)
+    /// [`Configuration::from_str`](tagnetd::configuration::Configuration::from_str)
     /// and initialises log routing (logcat on Android). Blocks only until the
     /// engine is ready or startup fails.
     #[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(sync))]
@@ -180,6 +186,13 @@ impl TagnetApp {
             .into_iter()
             .map(TagEntry::from)
             .collect())
+    }
+
+    /// Resolve a full-or-short file id `prefix` (as shown by `list_file_entries`'s
+    /// `short_id_length`) to a single [`FileId`]. Errors with `NotFound` if
+    /// nothing matches or `Ambiguous` if several do.
+    pub async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
+        self.try_backend()?.resolve_file_id(prefix).await
     }
 
     /// List the tags applied to `file_id`.

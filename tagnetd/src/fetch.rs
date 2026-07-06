@@ -1,6 +1,6 @@
 //! On-demand recursive file fetch across the live peer tree.
 //!
-//! Used by `tagnet-cli edit <uuid>` when a file's bytes are not present
+//! Used by `tagnet edit <uuid>` when a file's bytes are not present
 //! locally. A [`Sync::FetchRequest`](tagnet_core::state::Sync::FetchRequest) is
 //! flooded across the tree of *live* peer connections, which is assumed acyclic
 //! (there is no seen-set / TTL — a node simply never forwards a request back to
@@ -256,7 +256,7 @@ impl PendingFetches {
         if content_hash != entry.expected_hash {
             log::warn!(
                 "FetchFound for {} carried hash {} but {} was expected; dropping",
-                request_id.to_string(),
+                request_id,
                 content_hash,
                 entry.expected_hash
             );
@@ -308,7 +308,7 @@ impl PendingFetches {
     async fn report_missing(&self, request_id: RequestId, entry: PendingFetch) {
         log::debug!(
             "Reporting fetch {} for file {} as missing",
-            request_id.to_string(),
+            request_id,
             entry.file_id.to_string()
         );
         match entry.reply_to {
@@ -336,7 +336,7 @@ impl PendingFetches {
             if let Some(entry) = entry {
                 log::debug!(
                     "Fetch {} timed out at a hop; reporting missing upward",
-                    request_id.to_string()
+                    request_id
                 );
                 this.report_missing(request_id, entry).await;
             }

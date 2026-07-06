@@ -3,6 +3,7 @@ use std::{
     io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
@@ -111,25 +112,11 @@ impl Configuration {
     pub fn new(configuration_file: impl AsRef<Path>) -> Self {
         // TODO: Don't unwrap.
         let file_content = std::fs::read_to_string(configuration_file.as_ref()).unwrap();
-        let configuration = serde_json::from_str(&file_content).unwrap();
 
         // TODO: We need to make sure that sync directories are not nested.
         // TODO: Make sure that public keys are unique.
 
-        configuration
-    }
-
-    /// Parse a [`Configuration`] from a JSON string, returning a [`Result`]
-    /// instead of panicking.
-    ///
-    /// This is the non-file, non-panicking entry point required by the
-    /// portability plan (section 8): frontends without a shell/filesystem
-    /// contract (Android) generate the configuration JSON in memory and parse
-    /// it here. [`Configuration::new`] remains the file-reading desktop path.
-    pub fn from_str(json: &str) -> Result<Self, ConfigurationError> {
-        // TODO: We need to make sure that sync directories are not nested.
-        // TODO: Make sure that public keys are unique.
-        serde_json::from_str(json).map_err(ConfigurationError::Parse)
+        serde_json::from_str(&file_content).unwrap()
     }
 
     /// Read and parse a [`Configuration`] from a file, returning a [`Result`]
@@ -204,6 +191,23 @@ impl Configuration {
     }
 }
 
+impl std::str::FromStr for Configuration {
+    type Err = ConfigurationError;
+
+    /// Parse a [`Configuration`] from a JSON string, returning a [`Result`]
+    /// instead of panicking.
+    ///
+    /// This is the non-file, non-panicking entry point required by the
+    /// portability plan (section 8): frontends without a shell/filesystem
+    /// contract (Android) generate the configuration JSON in memory and parse
+    /// it here. [`Configuration::new`] remains the file-reading desktop path.
+    fn from_str(json: &str) -> Result<Self, ConfigurationError> {
+        // TODO: We need to make sure that sync directories are not nested.
+        // TODO: Make sure that public keys are unique.
+        serde_json::from_str(json).map_err(ConfigurationError::Parse)
+    }
+}
+
 pub struct ConnectionStatistics {
     // pub last_connected: Option<()>,
     // pub data_sent: usize,
@@ -223,7 +227,12 @@ pub struct RuntimePeer {
     pub outbound: Option<UnboundedSender<Frame>>,
 }
 
-// TODO: Probably make this Default instead.
+impl Default for RuntimePeer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimePeer {
     pub fn new() -> Self {
         Self {

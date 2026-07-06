@@ -598,9 +598,9 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "flutter_rust_bridge"
-version = "2.11.1"
+version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dde126295b2acc5f0a712e265e91b6fdc0ed38767496483e592ae7134db83725"
+checksum = "a0884853aae8a6517b5b58cf36f55da487f2fe110e1686938eb29b6640aae4a5"
 dependencies = [
  "allo-isolate",
  "android_logger",
@@ -627,9 +627,9 @@ dependencies = [
 
 [[package]]
 name = "flutter_rust_bridge_macros"
-version = "2.11.1"
+version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5f0420326b13675321b194928bb7830043b68cf8b810e1c651285c747abb080"
+checksum = "6b5ce32f35f710ced8c5aa557f023f1a624e737b5460cee2b70fcd3a8df09e1b"
 dependencies = [
  "hex",
  "md-5",
@@ -1558,6 +1558,42 @@ dependencies = [
 name = "tagnet"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "comfy-table",
+ "owo-colors",
+ "tagnet-core",
+ "tagnetd",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "tagnet-bridge"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "env_logger",
+ "flutter_rust_bridge",
+ "jni",
+ "log",
+ "tagnet-core",
+ "tagnetd",
+ "tokio",
+]
+
+[[package]]
+name = "tagnet-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "tagnetd"
+version = "0.1.0"
+dependencies = [
  "base64",
  "blake3",
  "clap",
@@ -1574,43 +1610,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
- "walkdir",
-]
-
-[[package]]
-name = "tagnet-bridge"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "env_logger",
- "flutter_rust_bridge",
- "jni",
- "log",
- "tagnet",
- "tagnet-core",
- "tokio",
-]
-
-[[package]]
-name = "tagnet-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "comfy-table",
- "owo-colors",
- "tagnet",
- "tagnet-core",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "tagnet-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
