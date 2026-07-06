@@ -75,6 +75,13 @@ pub trait TransportBackend {
         prefix: String,
     ) -> impl Future<Output = Result<FileId, ApiError>> + Send;
 
+    /// Resolve a full-or-short tag id `prefix` to a single [`TagId`]. Errors
+    /// with `NotFound` if nothing matches or `Ambiguous` if several do.
+    fn resolve_tag_id(
+        &self,
+        prefix: String,
+    ) -> impl Future<Output = Result<TagId, ApiError>> + Send;
+
     /// List the tags applied to `file_id`.
     fn tags_for_file(
         &self,
@@ -89,6 +96,20 @@ pub trait TransportBackend {
         subtag_rule: SubtagRule,
     ) -> impl Future<Output = Result<Vec<FileId>, ApiError>> + Send;
 
+    /// List the subtags (children) of `tag_id` in the tag hierarchy.
+    fn subtags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> impl Future<Output = Result<Vec<TagId>, ApiError>> + Send;
+
+    /// List the tags applied to `tag_id` (the tags it is a subtag of).
+    fn tags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> impl Future<Output = Result<Vec<TagId>, ApiError>> + Send;
+
     // --- Write API (plan 5.4) ------------------------------------------------
 
     /// Create a tag; returns the freshly-minted id.
@@ -100,6 +121,20 @@ pub trait TransportBackend {
 
     /// Delete a tag.
     fn delete_tag(&self, tag_id: TagId) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Rename a tag.
+    fn rename_tag(
+        &self,
+        tag_id: TagId,
+        name: String,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Change a tag's color.
+    fn set_tag_color(
+        &self,
+        tag_id: TagId,
+        color: String,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     /// Upload a file (in-memory `Vec<u8>` in v1); returns the freshly-minted id.
     fn upload_file(
@@ -133,6 +168,13 @@ pub trait TransportBackend {
     /// Delete a file.
     fn delete_file(&self, file_id: FileId) -> impl Future<Output = Result<(), ApiError>> + Send;
 
+    /// Move (rename) a file to a new logical path.
+    fn move_file(
+        &self,
+        file_id: FileId,
+        logical_path: String,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
     /// Apply `tag_id` to `file_id`.
     fn tag_file(
         &self,
@@ -145,6 +187,20 @@ pub trait TransportBackend {
         &self,
         tag_id: TagId,
         file_id: FileId,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Make `subtag_id` a subtag (child) of `parent_id`.
+    fn tag_tag(
+        &self,
+        parent_id: TagId,
+        subtag_id: TagId,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Remove `subtag_id` as a subtag of `parent_id`.
+    fn untag_tag(
+        &self,
+        parent_id: TagId,
+        subtag_id: TagId,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     // --- Event stream (plan 5.5) ---------------------------------------------
@@ -246,6 +302,10 @@ impl TransportBackend for InProcessBackend {
         self.api.resolve_file_id(&prefix)
     }
 
+    async fn resolve_tag_id(&self, prefix: String) -> Result<TagId, ApiError> {
+        self.api.resolve_tag_id(&prefix)
+    }
+
     async fn tags_for_file(
         &self,
         file_id: FileId,
@@ -262,12 +322,36 @@ impl TransportBackend for InProcessBackend {
         self.api.files_for_tag(tag_id, subtag_rule)
     }
 
+    async fn subtags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        self.api.subtags_for_tag(tag_id, subtag_rule)
+    }
+
+    async fn tags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        self.api.tags_for_tag(tag_id, subtag_rule)
+    }
+
     async fn create_tag(&self, name: String, color: String) -> Result<TagId, ApiError> {
         self.api.create_tag(name, color)
     }
 
     async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         self.api.delete_tag(tag_id)
+    }
+
+    async fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
+        self.api.rename_tag(tag_id, name)
+    }
+
+    async fn set_tag_color(&self, tag_id: TagId, color: String) -> Result<(), ApiError> {
+        self.api.set_tag_color(tag_id, color)
     }
 
     async fn upload_file(
@@ -299,12 +383,24 @@ impl TransportBackend for InProcessBackend {
         self.api.delete_file(file_id)
     }
 
+    async fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
+        self.api.move_file(file_id, logical_path)
+    }
+
     async fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
         self.api.tag_file(tag_id, file_id)
     }
 
     async fn untag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
         self.api.untag_file(tag_id, file_id)
+    }
+
+    async fn tag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        self.api.tag_tag(parent_id, subtag_id)
+    }
+
+    async fn untag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        self.api.untag_tag(parent_id, subtag_id)
     }
 
     fn subscribe(&self) -> EventStream {
@@ -367,6 +463,13 @@ impl TransportBackend for Backend {
         }
     }
 
+    async fn resolve_tag_id(&self, prefix: String) -> Result<TagId, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.resolve_tag_id(prefix).await,
+            Backend::Ipc(backend) => backend.resolve_tag_id(prefix).await,
+        }
+    }
+
     async fn tags_for_file(
         &self,
         file_id: FileId,
@@ -389,6 +492,28 @@ impl TransportBackend for Backend {
         }
     }
 
+    async fn subtags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.subtags_for_tag(tag_id, subtag_rule).await,
+            Backend::Ipc(backend) => backend.subtags_for_tag(tag_id, subtag_rule).await,
+        }
+    }
+
+    async fn tags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.tags_for_tag(tag_id, subtag_rule).await,
+            Backend::Ipc(backend) => backend.tags_for_tag(tag_id, subtag_rule).await,
+        }
+    }
+
     async fn create_tag(&self, name: String, color: String) -> Result<TagId, ApiError> {
         match self {
             Backend::InProcess(backend) => backend.create_tag(name, color).await,
@@ -400,6 +525,20 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.delete_tag(tag_id).await,
             Backend::Ipc(backend) => backend.delete_tag(tag_id).await,
+        }
+    }
+
+    async fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.rename_tag(tag_id, name).await,
+            Backend::Ipc(backend) => backend.rename_tag(tag_id, name).await,
+        }
+    }
+
+    async fn set_tag_color(&self, tag_id: TagId, color: String) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.set_tag_color(tag_id, color).await,
+            Backend::Ipc(backend) => backend.set_tag_color(tag_id, color).await,
         }
     }
 
@@ -447,6 +586,13 @@ impl TransportBackend for Backend {
         }
     }
 
+    async fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.move_file(file_id, logical_path).await,
+            Backend::Ipc(backend) => backend.move_file(file_id, logical_path).await,
+        }
+    }
+
     async fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
         match self {
             Backend::InProcess(backend) => backend.tag_file(tag_id, file_id).await,
@@ -458,6 +604,20 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.untag_file(tag_id, file_id).await,
             Backend::Ipc(backend) => backend.untag_file(tag_id, file_id).await,
+        }
+    }
+
+    async fn tag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.tag_tag(parent_id, subtag_id).await,
+            Backend::Ipc(backend) => backend.tag_tag(parent_id, subtag_id).await,
+        }
+    }
+
+    async fn untag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.untag_tag(parent_id, subtag_id).await,
+            Backend::Ipc(backend) => backend.untag_tag(parent_id, subtag_id).await,
         }
     }
 

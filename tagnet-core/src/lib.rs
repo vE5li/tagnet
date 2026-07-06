@@ -142,6 +142,15 @@ pub mod state {
             tag_name: String,
             modified_at: i64,
         },
+        /// Set a tag's color. Like every other mutation variant, it carries the
+        /// complete new value of the field it changes (there is no partial /
+        /// keep-existing semantics anywhere in the protocol). Mirrors
+        /// `TagRenamed` for the color field.
+        TagRecolored {
+            tag_id: TagId,
+            color: String,
+            modified_at: i64,
+        },
         TagChanged {
             tag_id: TagId,
             metadata: Option<MetadataValues>,

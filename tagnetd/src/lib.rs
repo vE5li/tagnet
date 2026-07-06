@@ -2092,6 +2092,25 @@ async fn handle_changes(
                 )
                 .await;
             }
+            Change::TagRecolored {
+                tag_id,
+                color,
+                modified_at,
+            } => {
+                // Carries the full new color; applied with the same `modified_at`
+                // LWW guard as the other tag mutations, then forwarded so peers
+                // converge. Mirrors `TagRenamed`.
+                if let Err(error) = database.update_tag_color(*tag_id, color, *modified_at) {
+                    log::error!("Failed to recolor tag {}: {:?}", tag_id.to_string(), error);
+                }
+                forward_to_peers(
+                    &configuration,
+                    &runtime_configuration,
+                    &change,
+                    &change_origin,
+                )
+                .await;
+            }
             Change::TagChanged {
                 tag_id: _,
                 metadata: _,
@@ -2240,10 +2259,6 @@ async fn handle_changes(
                 )
                 .await;
             }
-        }
-
-        if let Err(error) = database.show_content(false) {
-            log::warn!("Failed to dump DB contents for debugging: {:?}", error);
         }
 
         // Publish the applied change to UI-facing API subscribers (plan 5.5).

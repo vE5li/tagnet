@@ -775,6 +775,78 @@ impl FileDatabase {
         }
     }
 
+    /// Whether a tag with `tag_id` exists. The tag counterpart of
+    /// [`file_exists`](Self::file_exists).
+    pub fn tag_exists(&self, tag_id: TagId) -> Result<bool, DatabaseError> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM tags WHERE id = ?1", [tag_id], |row| {
+                row.get(0)
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(count > 0)
+    }
+
+    /// Compute the shortest unique prefix of `tag_id` among **all** tags — the
+    /// "short id" shown in listings. The tag counterpart of
+    /// [`shorten_file_id`](Self::shorten_file_id); see it for the neighbour-based
+    /// reasoning and the caveats about the length not being stable across
+    /// concurrent inserts.
+    ///
+    /// Returns `MissingTag` if `tag_id` is not in `tags`.
+    pub fn shorten_tag_id(&self, tag_id: TagId) -> Result<usize, DatabaseError> {
+        let full = tag_id.to_string();
+
+        if !self.tag_exists(tag_id)? {
+            return Err(DatabaseError::MissingTag);
+        }
+
+        let predecessor: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM tags WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+                [&full],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let successor: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM tags WHERE id > ?1 ORDER BY id ASC LIMIT 1",
+                [&full],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut required = 0;
+        for neighbour in [predecessor, successor].into_iter().flatten() {
+            let shared = common_prefix_length(&full, &neighbour);
+            required = required.max(shared + 1);
+        }
+
+        Ok(required.clamp(1, full.len()))
+    }
+
+    /// Resolve a full-or-short tag id `prefix` to a single [`TagId`]. The tag
+    /// counterpart of [`resolve_file_id_prefix`](Self::resolve_file_id_prefix).
+    ///
+    /// Errors:
+    /// - [`DatabaseError::MissingTag`] if no tag matches the prefix.
+    /// - [`DatabaseError::AmbiguousIdPrefix`] if more than one tag matches.
+    pub fn resolve_tag_id_prefix(&self, prefix: &str) -> Result<TagId, DatabaseError> {
+        let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingTag)?;
+        match resolve_id_prefix(&self.connection, "tags", "id", &normalised)? {
+            PrefixResolution::Unique(id) => {
+                TagId::from_string(&id).ok_or(DatabaseError::MissingTag)
+            }
+            PrefixResolution::NotFound => Err(DatabaseError::MissingTag),
+            PrefixResolution::Ambiguous => Err(DatabaseError::AmbiguousIdPrefix(normalised)),
+        }
+    }
+
     /// Add a new file.
     pub fn add_file(
         &self,
@@ -1405,157 +1477,6 @@ impl FileDatabase {
     }
 }
 
-// TODO: Temporary functions to debug.
-impl FileDatabase {
-    pub fn show_content(&self, include_raw: bool) -> Result<(), DatabaseError> {
-        #[derive(Debug, Serialize, Deserialize)]
-        #[allow(dead_code)]
-        pub struct File {
-            pub id: FileId,
-            pub logical_path: LogicalPath,
-        }
-
-        #[derive(Debug, Serialize, Deserialize)]
-        #[allow(dead_code)]
-        pub struct Tag {
-            pub id: TagId,
-            pub name: String,
-            pub color: String,
-        }
-
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct Entry {
-            tag_id: TagId,
-            target_id_as_file_id: FileId,
-            target_id_as_tag_id: TagId,
-            r#type: EntryType,
-        }
-
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, logical_path FROM files")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let files = statement
-            .query_map([], |row| {
-                Ok(File {
-                    id: row.get(0)?,
-                    logical_path: row.get(1)?,
-                })
-            })
-            .unwrap()
-            .collect::<Vec<_>>();
-
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, name, color FROM tags")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let tags = statement
-            .query_map([], |row| {
-                Ok(Tag {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    color: row.get(2)?,
-                })
-            })
-            .unwrap()
-            .collect::<Vec<_>>();
-
-        let mut statement = self
-            .connection
-            .prepare("SELECT tag_id, target_id, type FROM entries")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let entries = statement
-            .query_map([], |row| {
-                Ok(Entry {
-                    tag_id: row.get(0)?,
-                    target_id_as_file_id: row.get(1)?,
-                    target_id_as_tag_id: row.get(1)?,
-                    r#type: row.get(2)?,
-                })
-            })
-            .unwrap()
-            .collect::<Vec<_>>();
-
-        if include_raw {
-            for file in &files {
-                println!("{:?}", file.as_ref().unwrap());
-            }
-
-            for tag in &tags {
-                println!("{:?}", tag.as_ref().unwrap());
-            }
-
-            for entry in &entries {
-                println!("{:?}", entry.as_ref().unwrap());
-            }
-        }
-
-        for file in &files {
-            let file = file.as_ref().unwrap();
-
-            let tags = entries
-                .iter()
-                .filter_map(|entry| {
-                    let entry = entry.as_ref().unwrap();
-                    (entry.r#type == EntryType::File && entry.target_id_as_file_id == file.id)
-                        .then_some(entry)
-                })
-                .filter_map(|entry| {
-                    // The tag row may be absent (e.g. a file tagged with a tag
-                    // this node has never received — tags aren't synced yet).
-                    // This is debug output, so skip dangling references rather
-                    // than panicking and taking down the change handler.
-                    tags.iter()
-                        .find(|tag| tag.as_ref().unwrap().id == entry.tag_id)
-                        .map(|tag| tag.as_ref().unwrap())
-                })
-                .map(|tag| format!("\x1B[0;31m{}\x1B[0m", tag.name))
-                .collect::<Vec<String>>();
-
-            println!(
-                "\x1B[0;34m{}\x1B[0m | \x1B[0;35m{}\x1B[0m | {}",
-                file.id.to_string(),
-                file.logical_path,
-                tags.join(", ")
-            );
-        }
-
-        for tag in &tags {
-            let tag = tag.as_ref().unwrap();
-
-            let tags = entries
-                .iter()
-                .filter_map(|entry| {
-                    let entry = entry.as_ref().unwrap();
-                    (entry.r#type == EntryType::Tag && entry.target_id_as_tag_id == tag.id)
-                        .then_some(entry)
-                })
-                .filter_map(|entry| {
-                    // See note above: skip dangling tag references instead of
-                    // panicking.
-                    tags.iter()
-                        .find(|tag| tag.as_ref().unwrap().id == entry.tag_id)
-                        .map(|tag| tag.as_ref().unwrap())
-                })
-                .map(|tag| format!("\x1B[0;32m{}\x1B[0m", tag.name))
-                .collect::<Vec<String>>();
-
-            println!(
-                "\x1B[0;36m{}\x1B[0m | \x1B[0;33m{}\x1B[0m | {}",
-                tag.id.to_string(),
-                tag.name,
-                tags.join(", ")
-            );
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SyncDirectoryFile {
     pub file_id: FileId,
@@ -1725,38 +1646,6 @@ impl SyncDirectoryDatabase {
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .map(|file| file.unwrap())
             .collect())
-    }
-}
-
-// TODO: Temporary functions to debug.
-impl SyncDirectoryDatabase {
-    pub fn show_files(&self) -> Result<(), DatabaseError> {
-        #[derive(Debug, Serialize, Deserialize)]
-        #[allow(dead_code)]
-        pub struct File {
-            pub id: FileId,
-            pub physical_path: PhysicalPath,
-        }
-
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, physical_path FROM files")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        let iterator = statement
-            .query_map([], |row| {
-                Ok(File {
-                    id: row.get(0)?,
-                    physical_path: row.get(1)?,
-                })
-            })
-            .unwrap();
-
-        for file in iterator {
-            println!("{:?}", file.unwrap());
-        }
-
-        Ok(())
     }
 }
 
@@ -2003,6 +1892,164 @@ mod tests {
                 "short id {short} should resolve to its own file"
             );
         }
+    }
+
+    // --- Tag short-id resolution ---------------------------------------------
+
+    /// Build a `TagId` from a 32-char hex string so tests can control the exact
+    /// prefix relationships between ids.
+    fn tag_id_from_hex(hex: &str) -> TagId {
+        TagId::from_string(hex).expect("valid hex uuid")
+    }
+
+    #[test]
+    fn resolve_tag_id_prefix_unique_short_prefix() {
+        let database = memory_db();
+        let far_a = tag_id_from_hex("aaaa000000000000000000000000000a");
+        let far_b = tag_id_from_hex("bbbb000000000000000000000000000b");
+        database.add_tag(far_a, "a", "red", 1).unwrap();
+        database.add_tag(far_b, "b", "red", 1).unwrap();
+
+        assert_eq!(database.resolve_tag_id_prefix("a").unwrap(), far_a);
+        assert_eq!(database.resolve_tag_id_prefix("b").unwrap(), far_b);
+    }
+
+    #[test]
+    fn resolve_tag_id_prefix_ambiguous_is_reported() {
+        let database = memory_db();
+        let shared_a = tag_id_from_hex("abcd000000000000000000000000000a");
+        let shared_b = tag_id_from_hex("abcd000000000000000000000000000b");
+        database.add_tag(shared_a, "a", "red", 1).unwrap();
+        database.add_tag(shared_b, "b", "red", 1).unwrap();
+
+        assert!(matches!(
+            database.resolve_tag_id_prefix("abcd"),
+            Err(DatabaseError::AmbiguousIdPrefix(prefix)) if prefix == "abcd"
+        ));
+    }
+
+    #[test]
+    fn resolve_tag_id_prefix_unknown_is_missing() {
+        let database = memory_db();
+        database
+            .add_tag(
+                tag_id_from_hex("aaaa000000000000000000000000000a"),
+                "a",
+                "red",
+                1,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            database.resolve_tag_id_prefix("ffff"),
+            Err(DatabaseError::MissingTag)
+        ));
+    }
+
+    #[test]
+    fn shorten_then_resolve_tag_roundtrips() {
+        let database = memory_db();
+        let shared_a = tag_id_from_hex("abcd000000000000000000000000000a");
+        let shared_b = tag_id_from_hex("abcd000000000000000000000000000b");
+        let far = tag_id_from_hex("ffff000000000000000000000000000f");
+        for (id, name) in [(shared_a, "a"), (shared_b, "b"), (far, "c")] {
+            database.add_tag(id, name, "red", 1).unwrap();
+        }
+
+        // Each tag's displayed short id must resolve back to exactly itself.
+        for tag in database.get_all_tags().unwrap() {
+            let full = tag.id.to_string();
+            let length = database.shorten_tag_id(tag.id).unwrap();
+            let short = &full[..length];
+            assert_eq!(
+                database.resolve_tag_id_prefix(short).unwrap(),
+                tag.id,
+                "short id {short} should resolve to its own tag"
+            );
+        }
+    }
+
+    // --- Tag hierarchy (subtags) ---------------------------------------------
+
+    #[test]
+    fn tag_tag_then_subtag_ids_lists_children() {
+        let database = memory_db();
+        let parent = TagId::new();
+        let child_a = TagId::new();
+        let child_b = TagId::new();
+        for (id, name) in [(parent, "parent"), (child_a, "a"), (child_b, "b")] {
+            database.add_tag(id, name, "red", 1).unwrap();
+        }
+
+        database.tag_tag(parent, child_a, 10).unwrap();
+        database.tag_tag(parent, child_b, 10).unwrap();
+
+        let subtags: BTreeSet<TagId> = database
+            .subtag_ids_for_tag(parent, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(subtags, BTreeSet::from([child_a, child_b]));
+    }
+
+    #[test]
+    fn subtag_ids_include_walks_transitively() {
+        let database = memory_db();
+        let grandparent = TagId::new();
+        let parent = TagId::new();
+        let child = TagId::new();
+        for (id, name) in [(grandparent, "gp"), (parent, "p"), (child, "c")] {
+            database.add_tag(id, name, "red", 1).unwrap();
+        }
+
+        database.tag_tag(grandparent, parent, 10).unwrap();
+        database.tag_tag(parent, child, 10).unwrap();
+
+        // Direct only: just `parent`.
+        let direct: BTreeSet<TagId> = database
+            .subtag_ids_for_tag(grandparent, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(direct, BTreeSet::from([parent]));
+
+        // Transitive: `parent` and `child`.
+        let transitive: BTreeSet<TagId> = database
+            .subtag_ids_for_tag(grandparent, SubtagRule::Include)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(transitive, BTreeSet::from([parent, child]));
+    }
+
+    #[test]
+    fn untag_tag_removes_child_from_subtags() {
+        let database = memory_db();
+        let parent = TagId::new();
+        let child = TagId::new();
+        database.add_tag(parent, "parent", "red", 1).unwrap();
+        database.add_tag(child, "child", "red", 1).unwrap();
+
+        database.tag_tag(parent, child, 10).unwrap();
+        database.untag_tag(parent, child, 20).unwrap();
+
+        let subtags: Vec<TagId> = database
+            .subtag_ids_for_tag(parent, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(subtags.is_empty());
+    }
+
+    #[test]
+    fn tag_tag_rejects_self() {
+        let database = memory_db();
+        let tag = TagId::new();
+        database.add_tag(tag, "t", "red", 1).unwrap();
+        assert!(matches!(
+            database.tag_tag(tag, tag, 10),
+            Err(DatabaseError::CantTagItself)
+        ));
     }
 
     // --- Tag last-writer-wins ------------------------------------------------

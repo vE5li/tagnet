@@ -86,11 +86,24 @@ pub enum ControlRequest {
     ResolveFileId {
         prefix: String,
     },
+    /// Resolve a full-or-short tag id prefix to a single `TagId`. Answered with
+    /// [`ControlResponse::TagId`] (or an `Error`).
+    ResolveTagId {
+        prefix: String,
+    },
     TagsForFile {
         file_id: FileId,
         subtag_rule: SubtagRule,
     },
     FilesForTag {
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    },
+    SubtagsForTag {
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    },
+    TagsForTag {
         tag_id: TagId,
         subtag_rule: SubtagRule,
     },
@@ -101,6 +114,14 @@ pub enum ControlRequest {
     },
     DeleteTag {
         tag_id: TagId,
+    },
+    RenameTag {
+        tag_id: TagId,
+        name: String,
+    },
+    SetTagColor {
+        tag_id: TagId,
+        color: String,
     },
     UploadFile {
         path_name: String,
@@ -128,6 +149,10 @@ pub enum ControlRequest {
     DeleteFile {
         file_id: FileId,
     },
+    MoveFile {
+        file_id: FileId,
+        logical_path: String,
+    },
     TagFile {
         tag_id: TagId,
         file_id: FileId,
@@ -135,6 +160,14 @@ pub enum ControlRequest {
     UntagFile {
         tag_id: TagId,
         file_id: FileId,
+    },
+    TagTag {
+        parent_id: TagId,
+        subtag_id: TagId,
+    },
+    UntagTag {
+        parent_id: TagId,
+        subtag_id: TagId,
     },
     /// Subscribe to the event stream. After this is accepted, the daemon starts
     /// emitting [`ControlFrame::Event`]s on this connection; the response is
@@ -370,6 +403,10 @@ async fn dispatch(
             Ok(file_id) => ControlResponse::FileId(file_id),
             Err(error) => ControlResponse::Error(error),
         },
+        ControlRequest::ResolveTagId { prefix } => match api.resolve_tag_id(&prefix) {
+            Ok(tag_id) => ControlResponse::TagId(tag_id),
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::TagsForFile {
             file_id,
             subtag_rule,
@@ -384,11 +421,33 @@ async fn dispatch(
             Ok(file_ids) => ControlResponse::FileIds(file_ids),
             Err(error) => ControlResponse::Error(error),
         },
+        ControlRequest::SubtagsForTag {
+            tag_id,
+            subtag_rule,
+        } => match api.subtags_for_tag(tag_id, subtag_rule) {
+            Ok(tag_ids) => ControlResponse::TagIds(tag_ids),
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::TagsForTag {
+            tag_id,
+            subtag_rule,
+        } => match api.tags_for_tag(tag_id, subtag_rule) {
+            Ok(tag_ids) => ControlResponse::TagIds(tag_ids),
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::CreateTag { name, color } => match api.create_tag(name, color) {
             Ok(tag_id) => ControlResponse::TagId(tag_id),
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::DeleteTag { tag_id } => match api.delete_tag(tag_id) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::RenameTag { tag_id, name } => match api.rename_tag(tag_id, name) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::SetTagColor { tag_id, color } => match api.set_tag_color(tag_id, color) {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
         },
@@ -421,11 +480,32 @@ async fn dispatch(
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
         },
+        ControlRequest::MoveFile {
+            file_id,
+            logical_path,
+        } => match api.move_file(file_id, logical_path) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::TagFile { tag_id, file_id } => match api.tag_file(tag_id, file_id) {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::UntagFile { tag_id, file_id } => match api.untag_file(tag_id, file_id) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::TagTag {
+            parent_id,
+            subtag_id,
+        } => match api.tag_tag(parent_id, subtag_id) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::UntagTag {
+            parent_id,
+            subtag_id,
+        } => match api.untag_tag(parent_id, subtag_id) {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
         },
@@ -644,6 +724,13 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
+    async fn resolve_tag_id(&self, prefix: String) -> Result<TagId, ApiError> {
+        match self.call(ControlRequest::ResolveTagId { prefix }).await? {
+            ControlResponse::TagId(tag_id) => Ok(tag_id),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn tags_for_file(
         &self,
         file_id: FileId,
@@ -678,6 +765,40 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
+    async fn subtags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        match self
+            .call(ControlRequest::SubtagsForTag {
+                tag_id,
+                subtag_rule,
+            })
+            .await?
+        {
+            ControlResponse::TagIds(tag_ids) => Ok(tag_ids),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn tags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        match self
+            .call(ControlRequest::TagsForTag {
+                tag_id,
+                subtag_rule,
+            })
+            .await?
+        {
+            ControlResponse::TagIds(tag_ids) => Ok(tag_ids),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn create_tag(&self, name: String, color: String) -> Result<TagId, ApiError> {
         match self.call(ControlRequest::CreateTag { name, color }).await? {
             ControlResponse::TagId(tag_id) => Ok(tag_id),
@@ -687,6 +808,26 @@ impl TransportBackend for IpcClientBackend {
 
     async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         match self.call(ControlRequest::DeleteTag { tag_id }).await? {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
+        match self
+            .call(ControlRequest::RenameTag { tag_id, name })
+            .await?
+        {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn set_tag_color(&self, tag_id: TagId, color: String) -> Result<(), ApiError> {
+        match self
+            .call(ControlRequest::SetTagColor { tag_id, color })
+            .await?
+        {
             ControlResponse::Ok => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -755,6 +896,19 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
+    async fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
+        match self
+            .call(ControlRequest::MoveFile {
+                file_id,
+                logical_path,
+            })
+            .await?
+        {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
         match self
             .call(ControlRequest::TagFile { tag_id, file_id })
@@ -768,6 +922,32 @@ impl TransportBackend for IpcClientBackend {
     async fn untag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
         match self
             .call(ControlRequest::UntagFile { tag_id, file_id })
+            .await?
+        {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn tag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        match self
+            .call(ControlRequest::TagTag {
+                parent_id,
+                subtag_id,
+            })
+            .await?
+        {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn untag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        match self
+            .call(ControlRequest::UntagTag {
+                parent_id,
+                subtag_id,
+            })
             .await?
         {
             ControlResponse::Ok => Ok(()),

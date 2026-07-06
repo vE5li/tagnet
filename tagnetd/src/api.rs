@@ -91,6 +91,9 @@ impl From<DatabaseError> for ApiError {
                 ApiError::InvalidArgument("invalid tag name".to_owned())
             }
             DatabaseError::InvalidColor => ApiError::InvalidArgument("invalid color".to_owned()),
+            DatabaseError::CantTagItself => {
+                ApiError::InvalidArgument("a tag cannot be its own subtag".to_owned())
+            }
             other => ApiError::Database(other),
         }
     }
@@ -215,6 +218,18 @@ impl Api {
         Ok(database.resolve_file_id_prefix(prefix)?)
     }
 
+    /// Resolve a full-or-short tag id `prefix` (as displayed by `list_tags`'s
+    /// short ids, or a pasted full id) to a single [`TagId`]. The tag
+    /// counterpart of [`resolve_file_id`](Self::resolve_file_id). Backed by
+    /// `FileDatabase::resolve_tag_id_prefix`.
+    ///
+    /// Returns [`ApiError::NotFound`] if nothing matches and
+    /// [`ApiError::Ambiguous`] if more than one tag matches.
+    pub fn resolve_tag_id(&self, prefix: &str) -> Result<TagId, ApiError> {
+        let database = self.open_read()?;
+        Ok(database.resolve_tag_id_prefix(prefix)?)
+    }
+
     /// List the tags applied to `file_id`. `subtag_rule` controls whether the
     /// tag hierarchy is walked. Backed by `FileDatabase::tag_ids_for_file`.
     pub fn tags_for_file(
@@ -240,6 +255,37 @@ impl Api {
         let database = self.open_read()?;
         Ok(database
             .file_ids_for_tag(tag_id, subtag_rule)?
+            .into_iter()
+            .collect())
+    }
+
+    /// List the subtags of `tag_id` (its children in the tag hierarchy).
+    /// `subtag_rule` controls whether the hierarchy is walked transitively.
+    /// Backed by `FileDatabase::subtag_ids_for_tag`.
+    pub fn subtags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        let database = self.open_read()?;
+        Ok(database
+            .subtag_ids_for_tag(tag_id, subtag_rule)?
+            .into_iter()
+            .collect())
+    }
+
+    /// List the tags applied to `tag_id` (the tags it is a subtag of) — the tag
+    /// analogue of [`tags_for_file`](Self::tags_for_file). `subtag_rule`
+    /// controls whether the hierarchy is walked transitively. Backed by
+    /// `FileDatabase::tag_ids_for_subtag`.
+    pub fn tags_for_tag(
+        &self,
+        tag_id: TagId,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<TagId>, ApiError> {
+        let database = self.open_read()?;
+        Ok(database
+            .tag_ids_for_subtag(tag_id, subtag_rule)?
             .into_iter()
             .collect())
     }
@@ -274,6 +320,32 @@ impl Api {
     /// Delete a tag. Enqueues `Change::TagRemoved`.
     pub fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         self.enqueue(Change::TagRemoved { tag_id })
+    }
+
+    /// Rename a tag. Enqueues `Change::TagRenamed`, stamped with our wall clock
+    /// now for last-writer-wins reconciliation.
+    pub fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
+        if name.trim().is_empty() {
+            return Err(ApiError::InvalidArgument("tag name is empty".to_owned()));
+        }
+        self.enqueue(Change::TagRenamed {
+            tag_id,
+            tag_name: name,
+            modified_at: crate::database::now_millis(),
+        })
+    }
+
+    /// Change a tag's color. Enqueues `Change::TagRecolored` carrying the full
+    /// new color, stamped with our wall clock now for last-writer-wins.
+    pub fn set_tag_color(&self, tag_id: TagId, color: String) -> Result<(), ApiError> {
+        if color.trim().is_empty() {
+            return Err(ApiError::InvalidArgument("color is empty".to_owned()));
+        }
+        self.enqueue(Change::TagRecolored {
+            tag_id,
+            color,
+            modified_at: crate::database::now_millis(),
+        })
     }
 
     /// Upload a file. `content` is passed in memory as `Vec<u8>` (v1; streaming
@@ -320,6 +392,18 @@ impl Api {
     /// Delete a file. Enqueues `Change::FileDeleted`.
     pub fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
         self.enqueue(Change::FileDeleted { file_id })
+    }
+
+    /// Move (rename) a file to a new logical path. Enqueues `Change::FileMoved`;
+    /// each receiving sync directory derives its own physical placement.
+    pub fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
+        if logical_path.trim().is_empty() {
+            return Err(ApiError::InvalidArgument("path is empty".to_owned()));
+        }
+        self.enqueue(Change::FileMoved {
+            file_id,
+            logical_path: LogicalPath::new(logical_path),
+        })
     }
 
     /// The overall deadline a caller waits for an on-demand fetch to complete.
@@ -391,6 +475,36 @@ impl Api {
         self.enqueue(Change::FileUntagged {
             file_id,
             tag_id,
+            modified_at: crate::database::now_millis(),
+        })
+    }
+
+    /// Make `subtag_id` a subtag (child) of `parent_id` in the tag hierarchy.
+    /// Enqueues `Change::TagTagged`.
+    ///
+    /// A tag cannot be its own subtag; that is rejected here (with
+    /// [`ApiError::InvalidArgument`]) rather than only being caught by the
+    /// database inside the change pipeline, so the caller learns immediately.
+    pub fn tag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        if parent_id == subtag_id {
+            return Err(ApiError::InvalidArgument(
+                "a tag cannot be its own subtag".to_owned(),
+            ));
+        }
+        self.enqueue(Change::TagTagged {
+            taggee_id: subtag_id,
+            tag_id: parent_id,
+            metadata: None,
+            modified_at: crate::database::now_millis(),
+        })
+    }
+
+    /// Remove `subtag_id` as a subtag of `parent_id`. Enqueues
+    /// `Change::TagUntagged`.
+    pub fn untag_tag(&self, parent_id: TagId, subtag_id: TagId) -> Result<(), ApiError> {
+        self.enqueue(Change::TagUntagged {
+            taggee_id: subtag_id,
+            tag_id: parent_id,
             modified_at: crate::database::now_millis(),
         })
     }

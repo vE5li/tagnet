@@ -156,7 +156,17 @@
             text = ''
               ${androidEnvExports}
               # Run from the repo root regardless of where `nix run` was invoked.
-              cd "''${TAGNET_ROOT:-$PWD}"
+              # All command bodies use paths relative to the repo root (e.g.
+              # `cp tagnet-bridge/... app/...`), so we must actually chdir there;
+              # `cd "$PWD"` would leave us wherever the user invoked `nix run`
+              # (e.g. inside app/), breaking those relative paths. Resolve the
+              # root explicitly: honour an override, else ask git for the
+              # toplevel, else fall back to the current directory.
+              root="''${TAGNET_ROOT:-}"
+              if [ -z "$root" ]; then
+                root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+              fi
+              cd "''${root:-$PWD}"
               ${body}
             '';
           };
@@ -184,7 +194,24 @@
           fi
 
           # The POC entrypoint is always (re)synced from the template.
+          ${syncAndroidEntrypoint}
+        '';
+
+        # Sync the correct platform entrypoint into app/lib/main.dart.
+        #
+        # Android and Linux desktop use DIFFERENT entrypoints (the Android one
+        # starts an in-process engine + shows the device public key; the Linux
+        # one attaches to the daemon over IPC), but Flutter only reads a single
+        # app/lib/main.dart. Because both platforms share that one file, the
+        # *run* commands must (re)sync their own template every time — otherwise
+        # whichever platform's template was copied last silently sticks, and you
+        # get, e.g., the Linux IPC-attach entrypoint running on Android (which
+        # then fails to reach the non-existent Unix daemon socket).
+        syncAndroidEntrypoint = ''
           cp tagnet-bridge/app-template/lib/main.dart app/lib/main.dart
+        '';
+        syncLinuxEntrypoint = ''
+          cp tagnet-bridge/app-template/lib/main_linux.dart app/lib/main.dart
         '';
 
         # Step 4: generate the Dart <-> Rust bindings.
@@ -220,6 +247,11 @@
           fi
         '';
         runAppBody = ''
+          # Re-sync the Android entrypoint every run: app/lib/main.dart is
+          # shared with the Linux desktop build, so a prior create-linux-app /
+          # run-linux may have left the IPC-attach entrypoint in place, which
+          # crashes on Android. See syncAndroidEntrypoint.
+          ${syncAndroidEntrypoint}
           ${pickAndroidDevice}
           ( cd app && flutter run --release -d "$device" )
         '';
@@ -237,6 +269,8 @@
           # it by absolute path rather than assuming it is on PATH. Don't fail if
           # the package isn't installed yet.
           "${androidSdkRoot}/platform-tools/adb" uninstall com.example.tagnet_app || true
+          # Re-sync the Android entrypoint (shared with the Linux build).
+          ${syncAndroidEntrypoint}
           # Rebuild the native .so into jniLibs before running: a fresh install
           # (or a cleaned tree) has no bundled library, and `flutter run` alone
           # does not build it, so the app would crash with
@@ -263,7 +297,7 @@
 
           # The Linux POC entrypoint attaches to the running daemon over IPC
           # (it does NOT start its own engine, unlike the Android template).
-          cp tagnet-bridge/app-template/lib/main_linux.dart app/lib/main.dart
+          ${syncLinuxEntrypoint}
         '';
 
         # Build the desktop daemon binary (the process that owns the DB and
@@ -280,6 +314,11 @@
         # there is no separate 'build-native' step here as there is for Android.
         # The daemon must already be running (it owns the control socket).
         runLinuxBody = ''
+          # Re-sync the Linux entrypoint every run: app/lib/main.dart is shared
+          # with the Android build, so a prior create-app / run-app may have
+          # left the in-process-engine entrypoint in place. See
+          # syncLinuxEntrypoint.
+          ${syncLinuxEntrypoint}
           ( cd app && flutter run -d linux )
         '';
       in {
