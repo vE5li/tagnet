@@ -97,6 +97,9 @@
           cargo-expand
           # Gradle (Flutter's Android build) needs a JDK.
           jdk
+          # Used by run-app to pick the first android device id out of
+          # `flutter devices --machine` (there is no stable "android" alias).
+          jq
         ];
 
         # Tools the Flutter **Linux desktop** build needs (plan sections 6-7,
@@ -201,9 +204,24 @@
             build --release -p tagnet-bridge --features generated
         '';
 
-        # Step 6: build/run on a connected device.
+        # Step 6: build/run on a connected device. Flutter's `-d` matches a
+        # device *id/name*, not a platform, and android device ids are serial
+        # numbers (no stable "android" alias), so resolve the first connected
+        # android device from `flutter devices --machine` and target it
+        # explicitly (mirrors how run-linux uses `-d linux`).
+        pickAndroidDevice = ''
+          device="$(
+            flutter devices --machine \
+              | jq -r 'map(select(.targetPlatform | startswith("android"))) | .[0].id // empty'
+          )"
+          if [ -z "$device" ]; then
+            echo "No android device found. Connect a device (adb devices) and retry." >&2
+            exit 1
+          fi
+        '';
         runAppBody = ''
-          ( cd app && flutter run --release )
+          ${pickAndroidDevice}
+          ( cd app && flutter run --release -d "$device" )
         '';
 
         # Like run-app, but wipes the app's local data first by uninstalling the
@@ -224,7 +242,8 @@
           # does not build it, so the app would crash with
           # "libtagnet_bridge.so not found".
           ${buildNativeBody}
-          ( cd app && flutter run --release )
+          ${pickAndroidDevice}
+          ( cd app && flutter run --release -d "$device" )
         '';
 
         # --- Linux desktop (two-process topology, plan sections 6-7) ---------

@@ -114,12 +114,22 @@ class _TagnetPocState extends State<TagnetPoc> {
         _status = 'tagnet running';
       });
 
+      // Subscribe BEFORE the initial fetch. Peer connection and reconciliation
+      // run asynchronously in the background runtime, so changes can land at
+      // any moment after `start()`. If we fetched first and subscribed second,
+      // any change applied in that gap would be emitted before the subscription
+      // existed and thus missed entirely — the broadcast stream only delivers
+      // to subscribers present when an event is sent. The UI would then sit on
+      // stale/empty state until a manual refresh. Subscribing first closes that
+      // race; the initial `_refresh()` below then captures whatever is already
+      // there, and every subsequent event re-fetches.
+      final events = await app.subscribe();
+
       await _refresh();
 
       // Live-update the file/tag lists as changes stream in from peers. The
       // event payload is ignored here (best-effort); any event just triggers a
       // re-fetch of current state, which is exactly what `Resynced` asks for.
-      final events = await app.subscribe();
       while (mounted) {
         final event = await events.next();
         if (event == null) break; // stream closed (engine shut down)
