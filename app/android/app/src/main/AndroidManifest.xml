@@ -13,10 +13,13 @@
         android:label="tagnet"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- launchMode="singleTask" is recommended by receive_sharing_intent:
+             it reuses the existing activity/task for share intents instead of
+             spawning a new instance each time a file is shared. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
@@ -33,6 +36,21 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- tagnet: appear in the Android share sheet as an upload target.
+                 A single shared item (ACTION_SEND) or several at once
+                 (ACTION_SEND_MULTIPLE); "*/*" accepts any file type. The
+                 receive_sharing_intent plugin reads the EXTRA_STREAM URI(s)
+                 and hands them to Dart, which uploads via TagnetApp.uploadFile. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="*/*"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="*/*"/>
             </intent-filter>
         </activity>
         <!-- tagnet: foreground service hosting the native runtime. Not

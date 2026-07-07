@@ -301,8 +301,10 @@ impl Api {
         }
         // A locally-originated mutation is stamped with our wall clock now; the
         // timestamp then rides the change unchanged to peers for LWW.
+        // Hex form (matches the CLI's default and the Flutter app's palette),
+        // so tags created with an empty color render consistently everywhere.
         let color = if color.trim().is_empty() {
-            "red".to_owned()
+            "#F44336".to_owned()
         } else {
             color
         };

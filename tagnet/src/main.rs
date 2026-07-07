@@ -377,6 +377,10 @@ enum Commands {
         /// unambiguous short-id prefix of it (as shown by `list-tags`).
         #[arg(long = "tag", value_name = "TAG_ID")]
         tags: Vec<String>,
+        /// Keep the local file after uploading (by default it is deleted
+        /// once the upload has succeeded).
+        #[arg(long = "keep")]
+        keep: bool,
     },
     /// List all tags known to the daemon.
     #[command(visible_alias = "lt")]
@@ -398,7 +402,9 @@ enum Commands {
     #[command(visible_alias = "ct")]
     CreateTag {
         name: String,
-        #[arg(long, default_value = "red")]
+        // Hex form (matches the Flutter app's palette, kTagColorPalette), so
+        // CLI- and app-created tags render identically.
+        #[arg(long, default_value = "#F44336")]
         color: String,
     },
     /// List the files carrying a tag (the v1 single-tag search).
@@ -581,7 +587,7 @@ async fn run(
     output: OutputMode,
 ) -> Result<(), String> {
     match command {
-        Commands::Upload { path, tags } => {
+        Commands::Upload { path, tags, keep } => {
             let content = std::fs::read(&path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             let path_name = path
@@ -601,6 +607,17 @@ async fn run(
                 .upload_file(path_name, content, resolved_tags)
                 .await
                 .map_err(|error| error.to_string())?;
+
+            if !keep {
+                std::fs::remove_file(&path).map_err(|error| {
+                    format!(
+                        "uploaded as file {}, but failed to delete {}: {error}",
+                        file_id.to_string(),
+                        path.display()
+                    )
+                })?;
+            }
+
             match output {
                 OutputMode::Human => println!("Uploaded as file {}", file_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "id": file_id })),
@@ -995,39 +1012,14 @@ async fn download_file(
         file_name.to_owned()
     };
 
-    let destination = downloads_dir()?.join(&file_name);
-    std::fs::write(&destination, &bytes)
-        .map_err(|error| format!("failed to write {}: {error}", destination.display()))?;
+    std::fs::write(&file_name, &bytes)
+        .map_err(|error| format!("failed to write {}: {error}", file_name))?;
 
     match output {
-        OutputMode::Human => println!("Downloaded to {}", destination.display()),
-        OutputMode::Json => {
-            print_json(&json!({ "id": file_id, "path": destination.to_string_lossy() }))
-        }
+        OutputMode::Human => println!("Downloaded to {}", file_name),
+        OutputMode::Json => print_json(&json!({ "id": file_id, "path": file_name })),
     }
     Ok(())
-}
-
-/// Resolve the directory downloads should be written to.
-///
-/// Follows the XDG user-dirs convention: prefer `$XDG_DOWNLOAD_DIR`, then fall
-/// back to `$HOME/Downloads`. The directory is created if it does not exist.
-fn downloads_dir() -> Result<PathBuf, String> {
-    let dir = if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| "cannot locate downloads directory: $HOME is not set".to_owned())?;
-        PathBuf::from(home).join("Downloads")
-    };
-
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        format!(
-            "failed to create downloads directory {}: {error}",
-            dir.display()
-        )
-    })?;
-    Ok(dir)
 }
 
 /// Open `path` in the user's `$EDITOR` (falling back to `vi`), blocking until it

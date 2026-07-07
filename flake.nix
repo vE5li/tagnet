@@ -97,7 +97,7 @@
           cargo-expand
           # Gradle (Flutter's Android build) needs a JDK.
           jdk
-          # Used by run-app to pick the first android device id out of
+          # Used by run-android to pick the first android device id out of
           # `flutter devices --machine` (there is no stable "android" alias).
           jq
         ];
@@ -146,9 +146,11 @@
           pkgs.lib.concatStringsSep "\n"
           (pkgs.lib.mapAttrsToList (name: value: "export ${name}=${pkgs.lib.escapeShellArg value}") androidEnv);
 
+        # Turn a bash body into a `nix run`-able app named `tagnet-<name>`, with
+        # the toolchains on PATH and the shared env exported.
         mkApp = name: body: let
           script = pkgs.writeShellApplication {
-            inherit name;
+            name = "tagnet-${name}";
             # Both tool sets are on PATH: the Android steps ignore the desktop
             # tools and vice versa, but the Linux desktop apps (`run-linux`)
             # need CMake/Ninja/clang/GTK from `linuxDesktopTools`.
@@ -172,58 +174,29 @@
           };
         in {
           type = "app";
-          program = "${script}/bin/${name}";
+          program = "${script}/bin/tagnet-${name}";
         };
 
-        # Steps 1-3 of tagnet-bridge/android/README.md: create the Flutter app
-        # tree, add the Dart deps, and merge the Android glue. Skips if `app/`
-        # already exists (idempotent).
-        createAppBody = ''
-          if [ -d app ]; then
-            echo "app/ already exists; skipping 'flutter create'."
-          else
-            flutter create --platforms=android --project-name tagnet_app app
-            ( cd app && flutter pub add path_provider flutter_rust_bridge )
+        # Build the `apps` output from an attrset of `{ <name> = <bash body>; }`,
+        # deriving each app's derivation name (`tagnet-<name>`) from its attr key
+        # so the two never drift.
+        mkApps = pkgs.lib.mapAttrs mkApp;
 
-            manifest=app/android/app/src/main/AndroidManifest.xml
-            echo "NOTE: merge tagnet-bridge/android/manifest/AndroidManifest.xml"
-            echo "      (permissions + <service>) into $manifest,"
-            echo "      copy tagnet-bridge/android/service/TagnetService.kt into"
-            echo "      app/android/app/src/main/kotlin/<package>/, and set"
-            echo "      minSdkVersion 26 in app/android/app/build.gradle."
-          fi
+        # The Flutter app tree (app/) — including the Dart sources under app/lib/
+        # (minus the generated app/lib/rust/) and the hand-merged Android glue —
+        # is tracked in git and is the source of truth. It is never regenerated;
+        # the one-time scaffolding is documented in tagnet-bridge/android/README.md.
 
-          # The POC entrypoint is always (re)synced from the template.
-          ${syncAndroidEntrypoint}
-        '';
-
-        # Sync the correct platform entrypoint into app/lib/main.dart.
-        #
-        # Android and Linux desktop use DIFFERENT entrypoints (the Android one
-        # starts an in-process engine + shows the device public key; the Linux
-        # one attaches to the daemon over IPC), but Flutter only reads a single
-        # app/lib/main.dart. Because both platforms share that one file, the
-        # *run* commands must (re)sync their own template every time — otherwise
-        # whichever platform's template was copied last silently sticks, and you
-        # get, e.g., the Linux IPC-attach entrypoint running on Android (which
-        # then fails to reach the non-existent Unix daemon socket).
-        syncAndroidEntrypoint = ''
-          cp tagnet-bridge/app-template/lib/main.dart app/lib/main.dart
-        '';
-        syncLinuxEntrypoint = ''
-          cp tagnet-bridge/app-template/lib/main_linux.dart app/lib/main.dart
-        '';
-
-        # Step 4: generate the Dart <-> Rust bindings.
+        # Generate the Dart <-> Rust bindings.
         codegenBody = ''
           flutter_rust_bridge_codegen generate \
             --config-file flutter_rust_bridge.yaml
         '';
 
-        # Step 5: cross-compile the native .so(s) into the app's jniLibs.
-        # Override the ABIs with TAGNET_ANDROID_ABIS (space-separated).
-        buildNativeBody = ''
-          abis="''${TAGNET_ANDROID_ABIS:-arm64-v8a}"
+        # Cross-compile the native .so(s) into the app's jniLibs for a given set
+        # of ABIs. `$abis` (space-separated cargo-ndk ABI names, e.g.
+        # "arm64-v8a x86_64") must be set by the caller; helper only.
+        buildNativeForAbisBody = ''
           targets=()
           for abi in $abis; do targets+=("-t" "$abi"); done
           cargo ndk "''${targets[@]}" \
@@ -231,95 +204,103 @@
             build --release -p tagnet-bridge --features generated
         '';
 
-        # Step 6: build/run on a connected device. Flutter's `-d` matches a
+        # Standalone build step: cross-compile for a fixed ABI set. Defaults to
+        # arm64-v8a (physical devices); override with TAGNET_ANDROID_ABIS
+        # (space-separated) e.g. to produce a multi-ABI release build.
+        buildNativeAndroidBody = ''
+          abis="''${TAGNET_ANDROID_ABIS:-arm64-v8a}"
+          ${buildNativeForAbisBody}
+        '';
+
+        # Resolve the target android device AND its ABI. Flutter's `-d` matches a
         # device *id/name*, not a platform, and android device ids are serial
         # numbers (no stable "android" alias), so resolve the first connected
-        # android device from `flutter devices --machine` and target it
-        # explicitly (mirrors how run-linux uses `-d linux`).
+        # android device from `flutter devices --machine`. We also read its
+        # `targetPlatform` (e.g. "android-x64") and map it to the matching
+        # cargo-ndk ABI, so the native build targets exactly the device we run
+        # on — an x86_64 emulator otherwise silently runs against a stale/absent
+        # x86_64 .so while only arm64-v8a was (re)built, and frb then misreads
+        # the mismatched wire format ("Bad state: ...").
         pickAndroidDevice = ''
-          device="$(
+          # `.[0] // empty` yields no output when there is no android device, so
+          # `read` sees EOF and leaves both vars empty (the `|| true` keeps
+          # `set -e` from aborting on read's EOF non-zero exit).
+          read -r device platform < <(
             flutter devices --machine \
-              | jq -r 'map(select(.targetPlatform | startswith("android"))) | .[0].id // empty'
-          )"
+              | jq -r 'map(select(.targetPlatform | startswith("android"))) | (.[0] // empty) | "\(.id) \(.targetPlatform)"'
+          ) || true
           if [ -z "$device" ]; then
             echo "No android device found. Connect a device (adb devices) and retry." >&2
             exit 1
           fi
-        '';
-        runAppBody = ''
-          # Re-sync the Android entrypoint every run: app/lib/main.dart is
-          # shared with the Linux desktop build, so a prior create-linux-app /
-          # run-linux may have left the IPC-attach entrypoint in place, which
-          # crashes on Android. See syncAndroidEntrypoint.
-          ${syncAndroidEntrypoint}
-          ${pickAndroidDevice}
-          ( cd app && flutter run --release -d "$device" )
+          case "$platform" in
+            android-arm64) device_abi="arm64-v8a" ;;
+            android-x64)   device_abi="x86_64" ;;
+            android-arm)   device_abi="armeabi-v7a" ;;
+            android-x86)   device_abi="x86" ;;
+            *)
+              echo "Unknown android targetPlatform '$platform'; defaulting ABI to arm64-v8a." >&2
+              device_abi="arm64-v8a"
+              ;;
+          esac
         '';
 
-        # Like run-app, but wipes the app's local data first by uninstalling the
+        # Fast path: pick the device and launch, no native rebuild. Assumes the
+        # .so for the device's ABI is already current (see launch-android).
+        launchAndroidBody = ''
+          ${pickAndroidDevice}
+          # Select the in-process-engine backend at build time.
+          ( cd app && flutter run --release -d "$device" \
+              --dart-define=TAGNET_BACKEND=android )
+        '';
+
+        # Full path: pick the device, build the native .so for exactly THAT
+        # device's ABI, then launch. Building the device's own ABI (rather than a
+        # fixed default) is what keeps an x86_64 emulator from running against a
+        # stale/absent x86_64 .so while only arm64-v8a was rebuilt.
+        runAndroidLaunchBody = ''
+          ${pickAndroidDevice}
+          abis="$device_abi"
+          ${buildNativeForAbisBody}
+          ( cd app && flutter run --release -d "$device" \
+              --dart-define=TAGNET_BACKEND=android )
+        '';
+
+        # Like run-android, but wipes the app's local data first by uninstalling the
         # existing package. `flutter run`/`flutter install -r` only *replace* the
         # APK and keep app-private storage (the DB *and* identity.key under
         # filesDir), so an explicit uninstall is the only way to start from a
         # clean slate. This regenerates the device identity (new public key) and
         # an empty database on next launch. The package id matches
         # app/android/app/build.gradle.kts (applicationId).
-        runAppCleanBody = ''
+        runAndroidCleanBody = ''
           echo "Uninstalling com.example.tagnet_app to wipe local data..."
           # adb ships with the composed Android SDK's platform-tools; reference
           # it by absolute path rather than assuming it is on PATH. Don't fail if
           # the package isn't installed yet.
           "${androidSdkRoot}/platform-tools/adb" uninstall com.example.tagnet_app || true
-          # Re-sync the Android entrypoint (shared with the Linux build).
-          ${syncAndroidEntrypoint}
-          # Rebuild the native .so into jniLibs before running: a fresh install
-          # (or a cleaned tree) has no bundled library, and `flutter run` alone
-          # does not build it, so the app would crash with
-          # "libtagnet_bridge.so not found".
-          ${buildNativeBody}
-          ${pickAndroidDevice}
-          ( cd app && flutter run --release -d "$device" )
+          # Rebuild the native .so for the device's ABI before running: a fresh
+          # install (or a cleaned tree) has no bundled library, and `flutter run`
+          # alone does not build it, so the app would crash with
+          # "libtagnet_bridge.so not found". Building the device's own ABI also
+          # avoids the stale-.so / frb wire mismatch on x86_64 emulators.
+          ${runAndroidLaunchBody}
         '';
 
         # --- Linux desktop (two-process topology, plan sections 6-7) ---------
 
-        # Add the Linux platform to the Flutter app tree and sync the Linux POC
-        # entrypoint. Assumes `app/` already exists (created by create-app for
-        # Android, or by `flutter create` directly). `flutter create` is
-        # idempotent and only fills in the missing `app/linux/` runner.
-        createLinuxAppBody = ''
-          if [ ! -d app ]; then
-            echo "app/ does not exist; run 'nix run .#create-app' first." >&2
-            exit 1
-          fi
-          # Adds app/linux/ (the CMake + GTK runner) without touching existing
-          # platforms. path_provider/flutter_rust_bridge already support Linux.
-          ( cd app && flutter create --platforms=linux --project-name tagnet_app . )
-
-          # The Linux POC entrypoint attaches to the running daemon over IPC
-          # (it does NOT start its own engine, unlike the Android template).
-          ${syncLinuxEntrypoint}
-        '';
-
-        # Build the desktop daemon binary (the process that owns the DB and
-        # serves the control socket). The user runs it separately; this just
-        # produces the artifact for convenience.
-        buildDaemonBody = ''
-          cargo build --release -p tagnetd
-          echo "Daemon built at target/release/tagnetd."
-          echo "It serves the control socket at /run/tagnet/tagnet.sock."
-        '';
-
-        # Build/run the Flutter Linux desktop app. The native .so is built and
-        # bundled by the runner's CMake hook (app/linux/CMakeLists.txt), so
-        # there is no separate 'build-native' step here as there is for Android.
-        # The daemon must already be running (it owns the control socket).
-        runLinuxBody = ''
-          # Re-sync the Linux entrypoint every run: app/lib/main.dart is shared
-          # with the Android build, so a prior create-app / run-app may have
-          # left the in-process-engine entrypoint in place. See
-          # syncLinuxEntrypoint.
-          ${syncLinuxEntrypoint}
-          ( cd app && flutter run -d linux )
+        # Build/run the Flutter Linux desktop app. Unlike Android, the native
+        # library is built and bundled by the runner's CMake hook
+        # (app/linux/CMakeLists.txt) during `flutter run`, so there is no
+        # separate native-build step here. The daemon (tagnetd) is a separate,
+        # long-lived process the user runs via systemd or cargo; the flake does
+        # not build or manage it, and the app attaches to its control socket at
+        # launch.
+        launchLinuxBody = ''
+          # Select the daemon-attach backend at build time (the Dart sources are
+          # shared with Android; only this define differs).
+          ( cd app && flutter run -d linux \
+              --dart-define=TAGNET_BACKEND=linux )
         '';
       in {
         formatter = pkgs.alejandra;
@@ -330,33 +311,41 @@
           default = tagnet;
         };
 
-        apps = {
-          create-app = mkApp "tagnet-create-app" createAppBody;
-          codegen = mkApp "tagnet-codegen" codegenBody;
-          build-native = mkApp "tagnet-build-native" buildNativeBody;
-          run-app = mkApp "tagnet-run-app" runAppBody;
-          # Like run-app but uninstalls first to wipe local data (new identity +
-          # empty DB). Use after a schema change or to reset a device.
-          run-app-clean = mkApp "tagnet-run-app-clean" runAppCleanBody;
-          # End-to-end: everything in sequence. Safe to re-run.
-          poc = mkApp "tagnet-poc" ''
-            ${createAppBody}
+        apps = mkApps {
+          # Shared across platforms.
+          codegen = codegenBody;
+
+          # --- Android apps --------------------------------------------------
+          # Full build-and-run: regenerate bindings, rebuild the native .so for
+          # the connected device's ABI, then launch. The safe default; safe to
+          # re-run.
+          run-android = ''
             ${codegenBody}
-            ${buildNativeBody}
-            ${runAppBody}
+            ${runAndroidLaunchBody}
           '';
+          # Fast path: just `flutter run`, assuming codegen + the native .so are
+          # already up to date. Use for a tight edit-Dart/re-run loop; if you
+          # changed the Rust API or the .so is missing, use run-android instead.
+          launch-android = launchAndroidBody;
+          # Like run-android but uninstalls first to wipe local data (new
+          # identity + empty DB). Use after a schema change or to reset a device.
+          run-android-clean = runAndroidCleanBody;
+          # Individual build step, exposed for manual use / overriding ABIs
+          # (defaults to arm64-v8a; set TAGNET_ANDROID_ABIS for a release build).
+          build-native-android = buildNativeAndroidBody;
 
           # --- Linux desktop apps (two-process topology) ---------------------
-          create-linux-app = mkApp "tagnet-create-linux-app" createLinuxAppBody;
-          build-daemon = mkApp "tagnet-build-daemon" buildDaemonBody;
-          run-linux = mkApp "tagnet-run-linux" runLinuxBody;
-          # End-to-end desktop: add the linux platform, regenerate bindings,
-          # then run against the already-running daemon. Safe to re-run.
-          poc-linux = mkApp "tagnet-poc-linux" ''
-            ${createLinuxAppBody}
+          # Full build-and-run: regenerate bindings, then launch (the native
+          # library is built by the CMake hook during `flutter run`). Safe to
+          # re-run.
+          run-linux = ''
             ${codegenBody}
-            ${runLinuxBody}
+            ${launchLinuxBody}
           '';
+          # Fast path: just `flutter run`, assuming codegen is up to date. Use
+          # for a tight edit-Dart/re-run loop; re-run codegen (or use run-linux)
+          # after a Rust API change.
+          launch-linux = launchLinuxBody;
         };
 
         devShell =

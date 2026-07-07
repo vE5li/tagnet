@@ -59,6 +59,25 @@ impl From<FileInfo> for FileEntry {
     }
 }
 
+/// Mirror of [`SubtagRule`] so `flutter_rust_bridge` generates it as a real
+/// Dart *enum* (not an opaque handle), letting the UI construct and pass it.
+///
+/// `SubtagRule` is defined in `tagnetd` (a foreign crate), so frb cannot see
+/// its variants to generate an enum directly; the `frb(mirror(...))` attribute
+/// re-declares the same shape here and tells frb to treat the foreign type as
+/// this enum. The variants MUST stay in sync with `tagnetd::database::SubtagRule`.
+///
+/// Semantics (see `FileDatabase::file_ids_for_tag`):
+///   * `Include` — recurse into subtags (files carrying this tag *or* any of
+///     its transitive subtags),
+///   * `Exclude` — direct members only (no subtag recursion).
+#[cfg(feature = "flutter_rust_bridge")]
+#[flutter_rust_bridge::frb(mirror(SubtagRule))]
+pub enum _SubtagRule {
+    Include,
+    Exclude,
+}
+
 /// A tag flattened into primitive fields for the Dart UI (see [`FileEntry`]).
 pub struct TagEntry {
     pub tag_id: String,
@@ -195,6 +214,17 @@ impl TagnetApp {
         self.try_backend()?.resolve_file_id(prefix).await
     }
 
+    /// Resolve a full-or-short tag id `prefix` (as shown by `list_tag_entries`)
+    /// to a single [`TagId`]. Errors with `NotFound` if nothing matches or
+    /// `Ambiguous` if several do. The tag counterpart of [`resolve_file_id`].
+    ///
+    /// This is how the Dart UI turns a `TagEntry.tag_id` string back into the
+    /// opaque [`TagId`] that the write/query methods (`delete_tag`, `tag_file`,
+    /// `untag_file`, `files_for_tag`) require.
+    pub async fn resolve_tag_id(&self, prefix: String) -> Result<TagId, ApiError> {
+        self.try_backend()?.resolve_tag_id(prefix).await
+    }
+
     /// List the tags applied to `file_id`.
     pub async fn tags_for_file(
         &self,
@@ -213,6 +243,47 @@ impl TagnetApp {
         subtag_rule: SubtagRule,
     ) -> Result<Vec<FileId>, ApiError> {
         self.try_backend()?.files_for_tag(tag_id, subtag_rule).await
+    }
+
+    // --- String-id query helpers for the Dart UI -----------------------------
+    //
+    // `tags_for_file` / `files_for_tag` return *opaque* id handles, which the
+    // Dart UI cannot render or match against the string ids in its DTOs
+    // (FileEntry/TagEntry). These variants take and return the canonical id
+    // *strings* instead, so the UI can drive tag<->file queries end to end
+    // without ever touching an opaque handle. `file_id` / `tag_id` accept the
+    // full-or-short prefix forms resolved by `resolve_file_id`/`resolve_tag_id`.
+
+    /// The string ids of the tags applied to the file identified by `file_id`.
+    pub async fn tag_ids_for_file_string(
+        &self,
+        file_id: String,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<String>, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(backend
+            .tags_for_file(file_id, subtag_rule)
+            .await?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect())
+    }
+
+    /// The string ids of the files carrying the tag identified by `tag_id`.
+    pub async fn file_ids_for_tag_string(
+        &self,
+        tag_id: String,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<String>, ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        Ok(backend
+            .files_for_tag(tag_id, subtag_rule)
+            .await?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect())
     }
 
     // --- Write API (plan 5.4) ------------------------------------------------
