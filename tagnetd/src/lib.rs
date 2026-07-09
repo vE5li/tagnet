@@ -788,8 +788,15 @@ async fn run_peer_session<S>(
                         break;
                     }
                 };
-                let text = message.to_string();
-                let frame: Frame = match serde_json::from_str(&text) {
+                // Ignore WebSocket control frames (ping/pong/close); only
+                // data frames carry a `Frame`. Peer `Frame`s are MessagePack
+                // (see `send_frame`).
+                let payload = match &message {
+                    Message::Binary(bytes) => bytes.as_ref(),
+                    Message::Text(text) => text.as_bytes(),
+                    _ => continue,
+                };
+                let frame: Frame = match rmp_serde::from_slice(payload) {
                     Ok(frame) => frame,
                     Err(error) => {
                         log::error!(
@@ -1025,9 +1032,12 @@ async fn send_frame<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let text = serde_json::to_string(frame).map_err(|e| format!("serialize: {e}"))?;
+    // Peer `Frame`s are encoded as MessagePack and sent as binary WebSocket
+    // frames. This avoids serde_json's `Vec<u8>` -> array-of-integers blowup
+    // (~4x on the wire), which dominated the payload for file transfers.
+    let bytes = rmp_serde::to_vec_named(frame).map_err(|e| format!("serialize: {e}"))?;
     outgoing
-        .send(Message::text(text))
+        .send(Message::binary(bytes))
         .await
         .map_err(|e| format!("send: {e}"))
 }
