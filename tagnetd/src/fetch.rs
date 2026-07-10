@@ -37,7 +37,10 @@ use tagnet_core::{
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 
-use crate::{bus::FetchError, configuration::RuntimeConfiguration};
+use crate::{
+    bus::FetchError, configuration::RuntimeConfiguration, file_bytes::FileBytes,
+    transfer::ChunkSource,
+};
 
 /// How long any single hop waits for its children before concluding the subtree
 /// does not have the content. The originating CLI applies its own (larger)
@@ -48,7 +51,7 @@ pub const HOP_TIMEOUT: Duration = Duration::from_secs(8);
 enum ReplyTarget {
     /// This request originated locally (from the ingest bus / CLI). Resolve the
     /// waiting caller directly.
-    Local(oneshot::Sender<Result<Vec<u8>, FetchError>>),
+    Local(oneshot::Sender<Result<FileBytes, FetchError>>),
     /// This request was relayed from a peer; the answer must be sent back to
     /// that peer (identified by public key).
     Peer(String),
@@ -65,6 +68,39 @@ struct PendingFetch {
     children_outstanding: HashSet<String>,
 }
 
+/// What the caller (the peer session, which owns the transfer machinery) should
+/// do after the fetch engine processes an inbound `FetchFound`.
+///
+/// `FetchFound` is content-less: the bytes are pulled over a transfer. The
+/// engine resolves the routing but cannot open transfers itself (inbound
+/// transfer frames are demuxed by the peer session), so it returns this action
+/// for the session to execute.
+pub enum FoundAction {
+    /// Open a receiver transfer against `from_peer` for `file_id`/`expected_hash`
+    /// and, once the bytes arrive (a hash-verified temp file), do `then`.
+    Receive {
+        from_peer: String,
+        file_id: FileId,
+        expected_hash: String,
+        then: FoundThen,
+    },
+}
+
+/// What to do with the bytes once a fetch transfer completes.
+pub enum FoundThen {
+    /// Deliver to the local waiter (CLI/ingest bus).
+    DeliverLocal(oneshot::Sender<Result<FileBytes, FetchError>>),
+    /// This node is a relay: cache the received bytes so a subsequent
+    /// `TransferStart` from the parent can serve them, then forward the
+    /// (content-less) `FetchFound` up to `parent_peer`.
+    RelayUp {
+        parent_peer: String,
+        request_id: RequestId,
+        file_id: FileId,
+        content_hash: String,
+    },
+}
+
 /// The fetch subsystem: the shared table of in-flight fetches (keyed by
 /// `request_id`) plus the peer runtime it routes frames through.
 ///
@@ -76,7 +112,22 @@ struct PendingFetch {
 pub struct PendingFetches {
     inner: Arc<Mutex<HashMap<RequestId, PendingFetch>>>,
     runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
+    /// Files a relay node has received for an in-flight fetch and is holding to
+    /// serve upward. Keyed by `(file_id, content_hash)`. Populated when a relay
+    /// finishes receiving; consulted by the `TransferStart` sender path when the
+    /// file is not in any sync directory; evicted once served.
+    fetch_cache: Arc<Mutex<HashMap<(FileId, String), FileBytes>>>,
+    /// Content a local client (the CLI) is temporarily providing on demand,
+    /// keyed by `(file_id, content_hash)`. A `TransferStart` the sync
+    /// directories cannot satisfy is served by streaming chunks from the
+    /// registered [`ProviderSource`] (which round-trips to the client). Entries
+    /// are registered while an upload/edit is in flight and removed when the
+    /// client releases the file.
+    providers: Arc<Mutex<ProviderRegistry>>,
 }
+
+/// Temporary chunk providers keyed by `(file_id, content_hash)`.
+type ProviderRegistry = HashMap<(FileId, String), Arc<dyn ChunkSource>>;
 
 /// Reference to a peer's outbound frame queue plus its public key.
 struct PeerOutbound {
@@ -89,7 +140,75 @@ impl PendingFetches {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             runtime_configuration,
+            fetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            providers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register a temporary chunk provider (the CLI) for `file_id`/`content_hash`.
+    /// A `TransferStart` for this file that no sync directory can serve will
+    /// stream chunks from `source`.
+    pub async fn register_provider(
+        &self,
+        file_id: FileId,
+        content_hash: String,
+        source: Arc<dyn ChunkSource>,
+    ) {
+        self.providers
+            .lock()
+            .await
+            .insert((file_id, content_hash), source);
+    }
+
+    /// Remove a temporary provider (the client released the file).
+    pub async fn unregister_provider(&self, file_id: FileId, content_hash: &str) {
+        self.providers
+            .lock()
+            .await
+            .remove(&(file_id, content_hash.to_owned()));
+    }
+
+    /// Look up a registered provider for `file_id`/`content_hash`. Returns a
+    /// clone (the `ProviderSource` is a cheap channel handle) so the transfer
+    /// sender can stream from it without holding the registry lock.
+    pub async fn provider_for(
+        &self,
+        file_id: FileId,
+        content_hash: &str,
+    ) -> Option<Arc<dyn ChunkSource>> {
+        self.providers
+            .lock()
+            .await
+            .get(&(file_id, content_hash.to_owned()))
+            .cloned()
+    }
+
+    /// Register a relay-held file so a subsequent `TransferStart` from the
+    /// parent can serve it (see [`Self::take_fetch_cached`]).
+    pub async fn cache_relay_file(
+        &self,
+        file_id: FileId,
+        content_hash: String,
+        content: FileBytes,
+    ) {
+        self.fetch_cache
+            .lock()
+            .await
+            .insert((file_id, content_hash), content);
+    }
+
+    /// Take (removing) a relay-held file matching `file_id`/`content_hash`, if
+    /// present. Eviction-on-serve: the entry is consumed so no stale bytes
+    /// linger. Returns the temp `FileBytes` for the sender to stream from.
+    pub async fn take_fetch_cached(
+        &self,
+        file_id: FileId,
+        content_hash: &str,
+    ) -> Option<FileBytes> {
+        self.fetch_cache
+            .lock()
+            .await
+            .remove(&(file_id, content_hash.to_owned()))
     }
 
     /// Snapshot every connected peer's outbound sender, optionally excluding one
@@ -122,24 +241,12 @@ impl PendingFetches {
     }
 
     /// Begin a fetch that originated locally (from the ingest bus / CLI).
-    ///
-    /// `have_local` is a hash-gated check against local sync directories: if it
-    /// returns `Some(bytes)`, the file is already here and we resolve
-    /// immediately. Otherwise we flood `FetchRequest` to all connected peers and
-    /// register a pending entry; if there are no peers, we resolve
-    /// `NotAvailable` at once.
     pub async fn start_local_fetch(
         &self,
         file_id: FileId,
         expected_hash: String,
-        have_local: Option<Vec<u8>>,
-        respond_to: oneshot::Sender<Result<Vec<u8>, FetchError>>,
+        respond_to: oneshot::Sender<Result<FileBytes, FetchError>>,
     ) {
-        if let Some(bytes) = have_local {
-            let _ = respond_to.send(Ok(bytes));
-            return;
-        }
-
         let peers = self.connected_peers(None).await;
         if peers.is_empty() {
             let _ = respond_to.send(Err(FetchError::NotAvailable));
@@ -176,7 +283,9 @@ impl PendingFetches {
 
     /// Handle an inbound `FetchRequest` relayed from `from_public_key`.
     ///
-    /// If `have_local` matches, answer `FetchFound` straight back to the sender.
+    /// If `have_local` is true, answer a content-less `FetchFound` straight back
+    /// to the sender (the sender then pulls the bytes from us over a transfer,
+    /// served from our sync directories by the standard `TransferStart` path).
     /// Otherwise forward to all peers except the sender and register a pending
     /// entry keyed by the request's own `request_id`. With no other peers to
     /// try, answer `FetchMissing` immediately.
@@ -186,15 +295,14 @@ impl PendingFetches {
         request_id: RequestId,
         file_id: FileId,
         expected_hash: String,
-        have_local: Option<Vec<u8>>,
+        have_local: bool,
     ) {
-        if let Some(content) = have_local {
+        if have_local {
             let content_hash = expected_hash.clone();
             if let Some(sender) = self.peer_outbound(from_public_key).await {
                 let _ = sender.send(Frame::Sync(SyncMessage::FetchFound {
                     request_id,
                     file_id,
-                    content,
                     content_hash,
                 }));
             }
@@ -234,50 +342,53 @@ impl PendingFetches {
         self.arm_hop_timeout(request_id);
     }
 
-    /// Handle an inbound `FetchFound`. First-wins: resolve and remove the
-    /// pending entry, delivering the bytes to its `reply_to`. Late duplicates
-    /// find no entry and are dropped.
+    /// Handle an inbound content-less `FetchFound` from `from_public_key`.
+    ///
+    /// First-wins: resolve and remove the pending entry. Returns a
+    /// [`FoundAction`] telling the caller to open a receiver transfer against
+    /// the child that answered (`from_public_key`) and, on completion, either
+    /// deliver the bytes locally or relay upward. Late duplicates (no entry) and
+    /// hash mismatches return `None`.
     pub async fn handle_incoming_found(
         &self,
+        from_public_key: &str,
         request_id: RequestId,
         file_id: FileId,
-        content: Vec<u8>,
         content_hash: String,
-    ) {
+    ) -> Option<FoundAction> {
         let entry = {
             let mut table = self.inner.lock().await;
             table.remove(&request_id)
         };
-        let Some(entry) = entry else {
-            return;
-        };
+        let entry = entry?;
 
-        // Defensive: only accept content that matches what this request expected.
+        // Defensive: only accept an answer matching what this request expected.
         if content_hash != entry.expected_hash {
             log::warn!(
-                "FetchFound for {} carried hash {} but {} was expected; dropping",
+                "FetchFound for {} announced hash {} but {} was expected; dropping",
                 request_id,
                 content_hash,
                 entry.expected_hash
             );
-            return;
+            return None;
         }
 
-        match entry.reply_to {
-            ReplyTarget::Local(sender) => {
-                let _ = sender.send(Ok(content));
-            }
-            ReplyTarget::Peer(parent_public_key) => {
-                if let Some(sender) = self.peer_outbound(&parent_public_key).await {
-                    let _ = sender.send(Frame::Sync(SyncMessage::FetchFound {
-                        request_id,
-                        file_id,
-                        content,
-                        content_hash,
-                    }));
-                }
-            }
-        }
+        let then = match entry.reply_to {
+            ReplyTarget::Local(sender) => FoundThen::DeliverLocal(sender),
+            ReplyTarget::Peer(parent_public_key) => FoundThen::RelayUp {
+                parent_peer: parent_public_key,
+                request_id,
+                file_id,
+                content_hash: content_hash.clone(),
+            },
+        };
+
+        Some(FoundAction::Receive {
+            from_peer: from_public_key.to_owned(),
+            file_id,
+            expected_hash: content_hash,
+            then,
+        })
     }
 
     /// Handle an inbound `FetchMissing` from `from_public_key`. Removes that
@@ -341,5 +452,64 @@ impl PendingFetches {
                 this.report_missing(request_id, entry).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configuration::{Configuration, RuntimeConfiguration};
+
+    fn engine() -> PendingFetches {
+        let configuration = Configuration {
+            sync_directories: Vec::new(),
+            listen_port: None,
+            peers: Vec::new(),
+            tags: Vec::new(),
+        };
+        let runtime = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
+        PendingFetches::new(runtime)
+    }
+
+    #[tokio::test]
+    async fn fetch_cache_take_evicts() {
+        let engine = engine();
+        let file_id = FileId::new();
+        engine
+            .cache_relay_file(
+                file_id,
+                "hash".to_owned(),
+                FileBytes::InMemory(b"x".to_vec()),
+            )
+            .await;
+
+        // First take returns the file; second take finds nothing (evicted).
+        assert!(engine.take_fetch_cached(file_id, "hash").await.is_some());
+        assert!(engine.take_fetch_cached(file_id, "hash").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_cache_take_requires_matching_hash() {
+        let engine = engine();
+        let file_id = FileId::new();
+        engine
+            .cache_relay_file(
+                file_id,
+                "right".to_owned(),
+                FileBytes::InMemory(b"x".to_vec()),
+            )
+            .await;
+        assert!(engine.take_fetch_cached(file_id, "wrong").await.is_none());
+        // The mismatched take does not evict the real entry.
+        assert!(engine.take_fetch_cached(file_id, "right").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn found_for_unknown_request_is_none() {
+        let engine = engine();
+        let action = engine
+            .handle_incoming_found("peer", RequestId::new(), FileId::new(), "hash".to_owned())
+            .await;
+        assert!(action.is_none());
     }
 }

@@ -61,6 +61,37 @@ impl Paths {
             .unwrap_or_else(|| "unnamed".to_owned());
         self.data_dir.join(format!("{name}.db"))
     }
+
+    /// Directory holding daemon-owned temp files produced by on-demand fetches
+    /// (`fetch_file`).
+    ///
+    /// A completed fetch materializes its bytes here and hands the caller the
+    /// path with **move semantics**: the caller (the local CLI or the in-process
+    /// UI, both co-located with the daemon and sharing this filesystem) must
+    /// consume the file by renaming it into place or deleting it. If a caller
+    /// crashes before consuming, the file is orphaned; [`Self::clean_fetch_temp_dir`]
+    /// sweeps such leftovers on daemon start.
+    ///
+    /// It lives under `data_dir` (rather than the system temp dir) so the daemon
+    /// owns and can clean it, and so a fetch temp and a download destination
+    /// under the same data root tend to share a filesystem (cheap rename).
+    pub fn fetch_temp_dir(&self) -> PathBuf {
+        self.data_dir.join("fetch-temp")
+    }
+
+    /// Remove any orphaned files left in the fetch-temp directory by callers
+    /// that crashed before consuming their fetched file, then ensure the
+    /// directory exists. Best-effort: called on daemon start.
+    pub async fn clean_fetch_temp_dir(&self) -> std::io::Result<()> {
+        let dir = self.fetch_temp_dir();
+        // Remove the whole directory (clearing any orphans) and recreate it.
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        tokio::fs::create_dir_all(&dir).await
+    }
 }
 
 /// The daemon's local control socket (portability plan section 7).

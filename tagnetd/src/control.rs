@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use tagnet_core::{FileId, FileInfo, TagId};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
 };
 use tokio_tungstenite::{
     WebSocketStream, tungstenite::client::IntoClientRequest, tungstenite::protocol::Message,
@@ -123,20 +123,27 @@ pub enum ControlRequest {
         tag_id: TagId,
         color: String,
     },
+    /// Upload a file the client provides on demand. The client does *not* send
+    /// the bytes; it sends the logical name, the precomputed BLAKE3
+    /// `content_hash`, and tags, then serves chunks via the provider protocol
+    /// (see [`ControlFrame::ProviderChunkRequest`]). Answered with
+    /// [`ControlResponse::FileId`] once the upload has been handed off to every
+    /// connected storing peer (or there were none to serve).
     UploadFile {
         path_name: String,
-        content: Vec<u8>,
+        content_hash: String,
         tags: Vec<TagId>,
     },
-    /// Replace an existing file's content. Answered with
-    /// [`ControlResponse::Ok`].
+    /// Replace an existing file's content, provided on demand like
+    /// [`ControlRequest::UploadFile`]. Answered with [`ControlResponse::Ok`]
+    /// once the new content has been handed off.
     EditFile {
         file_id: FileId,
-        content: Vec<u8>,
+        content_hash: String,
     },
-    /// Fetch a file's bytes on demand (from a peer if not local). Answered with
-    /// [`ControlResponse::FileContent`] or an error. `expected_hash` gates which
-    /// content is accepted.
+    /// Fetch a file's content on demand (from a peer if not local). Answered
+    /// with [`ControlResponse::FilePath`] or an error. `expected_hash` gates
+    /// which content is accepted.
     FetchFile {
         file_id: FileId,
         expected_hash: String,
@@ -188,8 +195,13 @@ pub enum ControlResponse {
     FileIds(Vec<FileId>),
     TagId(TagId),
     FileId(FileId),
-    /// The bytes of a fetched file (answer to [`ControlRequest::FetchFile`]).
-    FileContent(Vec<u8>),
+    /// Path to a daemon-owned temp file holding a fetched file's content
+    /// (answer to [`ControlRequest::FetchFile`]).
+    ///
+    /// The client and daemon are co-located and share this filesystem; the
+    /// client consumes the temp file with move semantics (rename into place or
+    /// delete). No file bytes cross the socket.
+    FilePath(PathBuf),
     /// A file's absolute on-disk path, or `None` if not present locally (answer
     /// to [`ControlRequest::LocalPathForFile`]).
     LocalPath(Option<PathBuf>),
@@ -215,6 +227,20 @@ pub enum ControlFrame {
     /// Daemon -> client: an unsolicited event on a subscribed connection
     /// (plan 5.5).
     Event(ApiEvent),
+
+    // --- Provider protocol (daemon pulls chunks from the client) -------------
+    //
+    // Reverse-direction request/reply used while the client is serving an
+    // upload/edit's bytes on demand. Correlated by `chunk_id` (per connection).
+    /// Daemon -> client: send the chunk of the in-flight upload/edit at
+    /// `offset` (the client knows which file it is currently providing).
+    ProviderChunkRequest { chunk_id: u64, offset: u64 },
+    /// Client -> daemon: the requested chunk. `last` marks end of file.
+    ProviderChunkReply {
+        chunk_id: u64,
+        bytes: Vec<u8>,
+        last: bool,
+    },
 }
 
 // --- Daemon side -------------------------------------------------------------
@@ -308,6 +334,20 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
     // un-subscribed connection never wakes on the event branch.
     let mut events: Option<EventStream> = None;
 
+    // Provider protocol state for this connection. A `ProviderSource` (held by
+    // the transfer subsystem) asks for a chunk by sending `(offset, reply)` on
+    // `provider_req`; we assign a `chunk_id`, remember the reply oneshot, and
+    // send a `ProviderChunkRequest` to the client. The client's
+    // `ProviderChunkReply` resolves it. `active_provider` records what this
+    // connection is currently serving so we can unregister it on disconnect.
+    let (provider_req_tx, mut provider_req_rx) =
+        mpsc::unbounded_channel::<crate::transfer::ProviderChunkRequest>();
+    let (provider_done_tx, mut provider_done_rx) = mpsc::unbounded_channel::<()>();
+    let mut provider_pending: HashMap<u64, crate::transfer::ProviderChunkReply> = HashMap::new();
+    let mut next_chunk_id: u64 = 0;
+    // (file_id, content_hash) currently registered as a provider on this conn.
+    let mut active_provider: Option<(FileId, String)> = None;
+
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -332,6 +372,40 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
                     }
                 }
             }
+            // A provider source wants a chunk from the client: forward it as a
+            // `ProviderChunkRequest` and remember where to route the reply.
+            request = provider_req_rx.recv() => {
+                let Some((offset, reply)) = request else { continue; };
+                let chunk_id = next_chunk_id;
+                next_chunk_id += 1;
+                provider_pending.insert(chunk_id, reply);
+                if let Err(error) = send_control(
+                    &mut outgoing,
+                    &ControlFrame::ProviderChunkRequest { chunk_id, offset },
+                )
+                .await
+                {
+                    log::debug!("Failed to send provider chunk request: {error}");
+                    break;
+                }
+            }
+            // A transfer of the provided file completed: tell the client it may
+            // release the file (via an event), and unregister the provider.
+            done = provider_done_rx.recv() => {
+                if done.is_none() { continue; }
+                if let Some((file_id, content_hash)) = active_provider.take() {
+                    api.unregister_provider(file_id, &content_hash).await;
+                    if let Err(error) = send_control(
+                        &mut outgoing,
+                        &ControlFrame::Event(ApiEvent::ProviderReleased { file_id }),
+                    )
+                    .await
+                    {
+                        log::debug!("Failed to send provider-released event: {error}");
+                        break;
+                    }
+                }
+            }
             inbound = incoming.next() => {
                 let Some(message) = inbound else {
                     log::debug!("Control client closed the connection");
@@ -348,29 +422,57 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
                 if message.is_ping() || message.is_pong() || message.is_close() {
                     continue;
                 }
-                let text = message.to_string();
-                let frame: ControlFrame = match serde_json::from_str(&text) {
+                let frame: ControlFrame = match decode_frame(&message) {
                     Ok(frame) => frame,
                     Err(error) => {
-                        log::warn!("Malformed control frame: {error}");
-                        continue;
+                        // A frame we cannot decode means the stream is out of
+                        // sync (or the peer is buggy). Continuing to read would
+                        // misinterpret subsequent bytes; close the connection so
+                        // the client reconnects cleanly instead of hanging on a
+                        // request whose response never comes.
+                        log::warn!("Malformed control frame: {error}; closing connection");
+                        break;
                     }
                 };
-                let ControlFrame::Request { id, request } = frame else {
-                    // Clients only ever send `Request`s; ignore anything else.
-                    log::warn!("Control client sent a non-request frame; ignoring");
-                    continue;
-                };
-
-                let response = dispatch(&api, request, &mut events).await;
-                if let Err(error) =
-                    send_control(&mut outgoing, &ControlFrame::Response { id, response }).await
-                {
-                    log::debug!("Failed to send control response: {error}");
-                    break;
+                match frame {
+                    ControlFrame::ProviderChunkReply { chunk_id, bytes, last } => {
+                        if let Some(reply) = provider_pending.remove(&chunk_id) {
+                            let _ = reply.send(Ok((bytes, last)));
+                        } else {
+                            log::warn!("Provider reply for unknown chunk id {chunk_id}");
+                        }
+                    }
+                    ControlFrame::Request { id, request } => {
+                        // Uploads/edits register a provider for this connection;
+                        // capture the provider source + what it serves.
+                        let response = dispatch(
+                            &api,
+                            request,
+                            &mut events,
+                            &provider_req_tx,
+                            &provider_done_tx,
+                            &mut active_provider,
+                        )
+                        .await;
+                        if let Err(error) =
+                            send_control(&mut outgoing, &ControlFrame::Response { id, response }).await
+                        {
+                            log::debug!("Failed to send control response: {error}");
+                            break;
+                        }
+                    }
+                    other => {
+                        log::warn!("Control client sent an unexpected frame: {other:?}; ignoring");
+                    }
                 }
             }
         }
+    }
+
+    // Connection closing: drop any provider we registered so stale entries do
+    // not linger.
+    if let Some((file_id, content_hash)) = active_provider.take() {
+        api.unregister_provider(file_id, &content_hash).await;
     }
 
     log::debug!("Control client disconnected");
@@ -385,10 +487,14 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
 /// into the daemon), so this function is `async`. Nothing holds a
 /// `&FileDatabase` across an `.await`. `Subscribe` mutates the caller's `events`
 /// slot.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     api: &Api,
     request: ControlRequest,
     events: &mut Option<EventStream>,
+    provider_req_tx: &mpsc::UnboundedSender<crate::transfer::ProviderChunkRequest>,
+    provider_done_tx: &mpsc::UnboundedSender<()>,
+    active_provider: &mut Option<(FileId, String)>,
 ) -> ControlResponse {
     match request {
         ControlRequest::ListTags => match api.list_tags() {
@@ -453,21 +559,46 @@ async fn dispatch(
         },
         ControlRequest::UploadFile {
             path_name,
-            content,
+            content_hash,
             tags,
-        } => match api.upload_file(path_name, content, tags) {
-            Ok(file_id) => ControlResponse::FileId(file_id),
-            Err(error) => ControlResponse::Error(error),
-        },
-        ControlRequest::EditFile { file_id, content } => match api.edit_file(file_id, content) {
-            Ok(()) => ControlResponse::Ok,
+        } => {
+            match api.upload_file(path_name, content_hash.clone(), tags) {
+                Ok(file_id) => {
+                    // Register this connection as the temporary provider so
+                    // peers can pull the bytes on demand.
+                    let source = std::sync::Arc::new(crate::transfer::ProviderSource::new(
+                        provider_req_tx.clone(),
+                        provider_done_tx.clone(),
+                    ));
+                    api.register_provider(file_id, content_hash.clone(), source)
+                        .await;
+                    *active_provider = Some((file_id, content_hash));
+                    ControlResponse::FileId(file_id)
+                }
+                Err(error) => ControlResponse::Error(error),
+            }
+        }
+        ControlRequest::EditFile {
+            file_id,
+            content_hash,
+        } => match api.edit_file(file_id, content_hash.clone()) {
+            Ok(()) => {
+                let source = std::sync::Arc::new(crate::transfer::ProviderSource::new(
+                    provider_req_tx.clone(),
+                    provider_done_tx.clone(),
+                ));
+                api.register_provider(file_id, content_hash.clone(), source)
+                    .await;
+                *active_provider = Some((file_id, content_hash));
+                ControlResponse::Ok
+            }
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::FetchFile {
             file_id,
             expected_hash,
         } => match api.fetch_file(file_id, expected_hash).await {
-            Ok(content) => ControlResponse::FileContent(content),
+            Ok(path) => ControlResponse::FilePath(path),
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::LocalPathForFile { file_id } => {
@@ -516,13 +647,34 @@ async fn dispatch(
     }
 }
 
+/// Encode a [`ControlFrame`] to a binary WebSocket message.
+///
+/// The control protocol uses **binary msgpack** (via `rmp_serde`), not JSON
+/// text. This matters for the provider protocol: JSON encodes a `Vec<u8>` chunk
+/// as an array of decimal numbers (~4-6x blow-up), producing multi-hundred-KB
+/// frames that are both slow and fragile; msgpack encodes bytes compactly and
+/// unambiguously. It also mirrors the peer `Frame` wire format (also `rmp`).
+fn encode_frame(frame: &ControlFrame) -> Result<Message, String> {
+    let bytes = rmp_serde::to_vec_named(frame).map_err(|error| format!("serialize: {error}"))?;
+    Ok(Message::binary(bytes))
+}
+
+/// Decode a [`ControlFrame`] from an inbound WebSocket message.
+///
+/// Accepts binary (msgpack) frames. Non-data frames (ping/pong/close) are
+/// filtered by callers before this is reached.
+fn decode_frame(message: &Message) -> Result<ControlFrame, String> {
+    rmp_serde::from_slice(&message.clone().into_data())
+        .map_err(|error| format!("deserialize: {error}"))
+}
+
 async fn send_control(
     outgoing: &mut SplitSink<WebSocketStream<UnixStream>, Message>,
     frame: &ControlFrame,
 ) -> Result<(), String> {
-    let text = serde_json::to_string(frame).map_err(|error| format!("serialize: {error}"))?;
+    let message = encode_frame(frame)?;
     outgoing
-        .send(Message::text(text))
+        .send(message)
         .await
         .map_err(|error| format!("send: {error}"))
 }
@@ -546,6 +698,41 @@ pub struct IpcClientBackend {
     inner: Arc<IpcClientInner>,
 }
 
+/// Read the chunk of `path` starting at `offset` (bounded by the transfer chunk
+/// size), returning the bytes and whether it reached end-of-file. Client side
+/// of the provider protocol.
+async fn read_provider_chunk(path: &Path, offset: u64) -> (Vec<u8>, bool) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let chunk_size = crate::transfer::CHUNK_SIZE;
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) => {
+            log::warn!("Provider: failed to open {}: {error}", path.display());
+            return (Vec::new(), true);
+        }
+    };
+    let total = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let mut file = file;
+    if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+        return (Vec::new(), true);
+    }
+    let mut buffer = vec![0u8; chunk_size];
+    let mut filled = 0;
+    while filled < chunk_size {
+        match file.read(&mut buffer[filled..]).await {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) => {
+                log::warn!("Provider: read error on {}: {error}", path.display());
+                return (Vec::new(), true);
+            }
+        }
+    }
+    buffer.truncate(filled);
+    let last = offset + filled as u64 >= total;
+    (buffer, last)
+}
+
 struct IpcClientInner {
     /// Write half of the control socket, behind a mutex so concurrent API
     /// calls serialise their frames without interleaving bytes.
@@ -556,6 +743,10 @@ struct IpcClientInner {
     next_id: AtomicU64,
     /// Broadcast of events received on this connection. `subscribe` taps it.
     events: tokio::sync::broadcast::Sender<ApiEvent>,
+    /// The local file this client is currently serving as a temporary provider
+    /// (an in-flight upload/edit). The reader task answers the daemon's
+    /// `ProviderChunkRequest`s by reading chunks from this path.
+    provider_path: Mutex<Option<PathBuf>>,
 }
 
 impl IpcClientBackend {
@@ -597,6 +788,7 @@ impl IpcClientBackend {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             events: events.clone(),
+            provider_path: Mutex::new(None),
         });
 
         // Reader task: demultiplex responses (to waiters) and events (to the
@@ -615,12 +807,14 @@ impl IpcClientBackend {
                 if message.is_ping() || message.is_pong() || message.is_close() {
                     continue;
                 }
-                let text = message.to_string();
-                let frame: ControlFrame = match serde_json::from_str(&text) {
+                let frame: ControlFrame = match decode_frame(&message) {
                     Ok(frame) => frame,
                     Err(error) => {
-                        log::warn!("Malformed control frame from daemon: {error}");
-                        continue;
+                        // Out-of-sync stream: stop reading so pending waiters are
+                        // failed (below) rather than left hanging on a response
+                        // that will never be correctly decoded.
+                        log::warn!("Malformed control frame from daemon: {error}; closing");
+                        break;
                     }
                 };
                 match frame {
@@ -635,8 +829,38 @@ impl IpcClientBackend {
                         // Best-effort (plan 5.5): if no one is subscribed, drop.
                         let _ = reader_inner.events.send(event);
                     }
-                    ControlFrame::Request { .. } => {
-                        log::warn!("Daemon sent a request frame to a client; ignoring");
+                    // The daemon is pulling a chunk of the file we're currently
+                    // providing (an in-flight upload/edit). Read it from the
+                    // local file and reply.
+                    ControlFrame::ProviderChunkRequest { chunk_id, offset } => {
+                        let path = reader_inner.provider_path.lock().await.clone();
+                        let (bytes, last) = match path {
+                            Some(path) => read_provider_chunk(&path, offset).await,
+                            None => {
+                                log::warn!("Provider chunk requested but no active provider file");
+                                (Vec::new(), true)
+                            }
+                        };
+                        let reply = ControlFrame::ProviderChunkReply {
+                            chunk_id,
+                            bytes,
+                            last,
+                        };
+                        let message = match encode_frame(&reply) {
+                            Ok(message) => message,
+                            Err(error) => {
+                                log::warn!("serialize provider chunk reply: {error}");
+                                continue;
+                            }
+                        };
+                        let mut writer = reader_inner.writer.lock().await;
+                        if let Err(error) = writer.send(message).await {
+                            log::debug!("Failed to send provider chunk reply: {error}");
+                            break;
+                        }
+                    }
+                    ControlFrame::Request { .. } | ControlFrame::ProviderChunkReply { .. } => {
+                        log::warn!("Daemon sent an unexpected frame to a client; ignoring");
                     }
                 }
             }
@@ -672,12 +896,12 @@ impl IpcClientBackend {
         self.inner.pending.lock().await.insert(id, sender);
 
         let frame = ControlFrame::Request { id, request };
-        let text = serde_json::to_string(&frame)
+        let message = encode_frame(&frame)
             .map_err(|error| ApiError::Transport(format!("serialize request: {error}")))?;
         {
             let mut writer = self.inner.writer.lock().await;
             writer
-                .send(Message::text(text))
+                .send(message)
                 .await
                 .map_err(|error| ApiError::Transport(format!("send request: {error}")))?;
         }
@@ -685,6 +909,52 @@ impl IpcClientBackend {
         receiver.await.map_err(|_| {
             ApiError::Transport("control connection closed before response".to_owned())
         })
+    }
+}
+
+/// Stream `path` to compute its BLAKE3 hex digest without loading it into
+/// memory.
+pub async fn hash_file(path: &Path) -> Result<String, ApiError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| ApiError::Transport(format!("open {}: {error}", path.display())))?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| ApiError::Transport(format!("read {}: {error}", path.display())))?;
+
+        if read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Block until the daemon reports `file_id` has been handed off
+/// ([`ApiEvent::ProviderReleased`]), or the event stream ends.
+async fn wait_for_release(
+    events: &mut tokio::sync::broadcast::Receiver<ApiEvent>,
+    file_id: FileId,
+) {
+    loop {
+        match events.recv().await {
+            Ok(ApiEvent::ProviderReleased { file_id: released }) if released == file_id => {
+                return;
+            }
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
     }
 }
 
@@ -833,40 +1103,68 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
+    /// Upload a file by serving it as a temporary chunk provider (no bytes are
+    /// loaded into memory or sent up front). Computes the content hash by
+    /// streaming `path`, registers `path` as the file this connection serves,
+    /// sends the metadata upload request, then blocks until the daemon reports
+    /// the content has been handed off (a peer completed pulling it), or the
+    /// connection ends.
     async fn upload_file(
         &self,
+        path: PathBuf,
         path_name: String,
-        content: Vec<u8>,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
-        match self
+        let content_hash = hash_file(&path).await?;
+        // Subscribe before sending so we cannot miss the release event.
+        let mut events = self.inner.events.subscribe();
+        *self.inner.provider_path.lock().await = Some(path);
+
+        let file_id = match self
             .call(ControlRequest::UploadFile {
                 path_name,
-                content,
+                content_hash,
                 tags,
             })
             .await?
         {
-            ControlResponse::FileId(file_id) => Ok(file_id),
-            other => Err(unexpected(other)),
-        }
+            ControlResponse::FileId(file_id) => file_id,
+            other => return Err(unexpected(other)),
+        };
+
+        wait_for_release(&mut events, file_id).await;
+        *self.inner.provider_path.lock().await = None;
+        Ok(file_id)
     }
 
-    async fn edit_file(&self, file_id: FileId, content: Vec<u8>) -> Result<(), ApiError> {
+    /// Edit (replace) a file's content, serving the new bytes as a temporary
+    /// provider. Same handoff semantics as [`Self::upload_file`].
+    async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
+        let content_hash = hash_file(&path).await?;
+        let mut events = self.inner.events.subscribe();
+        *self.inner.provider_path.lock().await = Some(path);
+
         match self
-            .call(ControlRequest::EditFile { file_id, content })
+            .call(ControlRequest::EditFile {
+                file_id,
+                content_hash,
+            })
             .await?
         {
-            ControlResponse::Ok => Ok(()),
-            other => Err(unexpected(other)),
+            ControlResponse::Ok => {}
+            other => return Err(unexpected(other)),
         }
+
+        wait_for_release(&mut events, file_id).await;
+        *self.inner.provider_path.lock().await = None;
+        Ok(())
     }
 
     async fn fetch_file(
         &self,
         file_id: FileId,
         expected_hash: String,
-    ) -> Result<Vec<u8>, ApiError> {
+    ) -> Result<PathBuf, ApiError> {
         match self
             .call(ControlRequest::FetchFile {
                 file_id,
@@ -874,7 +1172,7 @@ impl TransportBackend for IpcClientBackend {
             })
             .await?
         {
-            ControlResponse::FileContent(content) => Ok(content),
+            ControlResponse::FilePath(path) => Ok(path),
             other => Err(unexpected(other)),
         }
     }
@@ -957,5 +1255,75 @@ impl TransportBackend for IpcClientBackend {
 
     fn subscribe(&self) -> EventStream {
         EventStream::Ipc(self.inner.events.subscribe())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every control frame must round-trip through the binary codec unchanged.
+    /// The provider chunk reply is the one that broke the old JSON framing (a
+    /// `Vec<u8>` serialized as a giant number-array), so it is exercised
+    /// explicitly at a realistic chunk size.
+    #[test]
+    fn frames_round_trip_through_binary_codec() {
+        let file_id = FileId::new();
+
+        let frames = vec![
+            ControlFrame::Request {
+                id: 7,
+                request: ControlRequest::EditFile {
+                    file_id,
+                    content_hash: "deadbeef".to_owned(),
+                },
+            },
+            ControlFrame::Request {
+                id: 8,
+                request: ControlRequest::UploadFile {
+                    path_name: "notes.txt".to_owned(),
+                    content_hash: "cafef00d".to_owned(),
+                    tags: vec![TagId::new()],
+                },
+            },
+            ControlFrame::Response {
+                id: 7,
+                response: ControlResponse::FileId(file_id),
+            },
+            ControlFrame::ProviderChunkRequest {
+                chunk_id: 3,
+                offset: 65536,
+            },
+            ControlFrame::ProviderChunkReply {
+                chunk_id: 3,
+                bytes: vec![0xABu8; crate::transfer::CHUNK_SIZE],
+                last: true,
+            },
+        ];
+
+        for frame in frames {
+            let message = encode_frame(&frame).expect("encode");
+            let decoded = decode_frame(&message).expect("decode");
+            // Compare via debug repr (ControlFrame has no PartialEq).
+            assert_eq!(format!("{frame:?}"), format!("{decoded:?}"));
+        }
+    }
+
+    /// A large chunk reply must not be mis-decoded as another variant (the
+    /// original bug surfaced as "missing field content_hash" when a big frame
+    /// was parsed against a request shape). msgpack is length-prefixed and
+    /// self-describing, so a reply decodes only as a reply.
+    #[test]
+    fn large_chunk_reply_does_not_alias_a_request() {
+        let reply = ControlFrame::ProviderChunkReply {
+            chunk_id: 0,
+            bytes: vec![0x00u8; 475_000],
+            last: false,
+        };
+        let message = encode_frame(&reply).expect("encode");
+        match decode_frame(&message).expect("decode") {
+            ControlFrame::ProviderChunkReply { .. } => {}
+            other => panic!("large chunk reply decoded as {other:?}"),
+        }
     }
 }

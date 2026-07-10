@@ -32,9 +32,12 @@ use tagnet_core::{
 };
 use tokio::sync::{broadcast, mpsc::UnboundedSender, oneshot};
 
-use crate::bus::{DaemonMessage, FetchError};
+use crate::bus::{DaemonMessage, FetchError, Ingest};
 use crate::database::{DatabaseError, FileDatabase, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
+use crate::fetch::PendingFetches;
+use crate::transfer::ChunkSource;
+use std::sync::Arc;
 
 /// Errors surfaced to the UI (plan 5.5).
 ///
@@ -124,6 +127,10 @@ pub enum ApiEvent {
     Resynced,
     /// A change was applied to the store.
     Changed(Change),
+    /// A file this connection was temporarily providing (an upload/edit) has
+    /// been handed off (a peer completed pulling it); the client may release
+    /// the local file. Produced by the control layer, not the change bus.
+    ProviderReleased { file_id: FileId },
 }
 
 /// The transport-agnostic UI-facing API handle.
@@ -141,6 +148,14 @@ pub struct Api {
     /// `change_sender` and the `handle_changes` pipeline.
     command_sender: UnboundedSender<SyncDirectoryCommand>,
     events: broadcast::Sender<Change>,
+    /// Fetch/transfer subsystem, used by the control layer to register a
+    /// temporary chunk provider for an upload/edit (the client serves the bytes
+    /// on demand).
+    pending_fetches: PendingFetches,
+    /// Directory for daemon-owned temp files produced by `fetch_file`. A
+    /// completed fetch materializes here and the path is handed to the caller
+    /// with move semantics. See [`crate::paths::Paths::fetch_temp_dir`].
+    fetch_temp_dir: PathBuf,
 }
 
 impl Api {
@@ -158,12 +173,16 @@ impl Api {
         change_sender: UnboundedSender<DaemonMessage>,
         command_sender: UnboundedSender<SyncDirectoryCommand>,
         events: broadcast::Sender<Change>,
+        pending_fetches: PendingFetches,
+        fetch_temp_dir: PathBuf,
     ) -> Self {
         Self {
             main_db_path,
             change_sender,
             command_sender,
             events,
+            pending_fetches,
+            fetch_temp_dir,
         }
     }
 
@@ -184,7 +203,7 @@ impl Api {
     fn enqueue(&self, change: Change) -> Result<(), ApiError> {
         self.change_sender
             .send(DaemonMessage::Change(
-                change,
+                Ingest::from_change(change),
                 ChangeOrigin::Local {
                     directory_path: PathBuf::new(),
                 },
@@ -350,45 +369,67 @@ impl Api {
         })
     }
 
-    /// Upload a file. `content` is passed in memory as `Vec<u8>` (v1; streaming
-    /// large media is deferred). Mints a fresh `FileId`, computes the blake3
-    /// content hash exactly as the directory manager does, and enqueues
-    /// `Change::FileAdded`. Returns the id immediately.
+    /// Upload a file whose bytes the client provides on demand.
+    ///
+    /// The client has already computed `content_hash` (by streaming its own
+    /// file) and will serve the bytes chunk-by-chunk as a temporary provider;
+    /// no bytes are passed here. Mints a `FileId`, records the file + version,
+    /// and announces a metadata-only `FileMetadataAdded` to peers, which then
+    /// pull the content from the provider the control layer registers.
     pub fn upload_file(
         &self,
         path_name: String,
-        content: Vec<u8>,
+        content_hash: String,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
         if path_name.trim().is_empty() {
             return Err(ApiError::InvalidArgument("path is empty".to_owned()));
         }
         let file_id = FileId::new();
-        let content_hash = blake3::hash(&content).to_hex().to_string();
-        // A caller-supplied name is a logical path directly (the user is naming
-        // the file, not pointing at an on-disk location in a sync directory).
-        self.enqueue(Change::FileAdded {
-            file_id,
-            logical_path: LogicalPath::new(path_name),
-            content,
-            content_hash,
-            tags,
-        })?;
+        self.change_sender
+            .send(DaemonMessage::AnnounceProvided {
+                file_id,
+                logical_path: Some(LogicalPath::new(path_name)),
+                content_hash,
+                tags,
+            })
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
         Ok(file_id)
     }
 
-    /// Replace the content of an existing file. Computes the blake3 hash (as the
-    /// directory manager does) and enqueues `Change::FileChanged`. Fire-and-
-    /// forget: returns once enqueued, persistence is asynchronous.
-    ///
-    /// Used by `tagnet edit` to write back edited bytes.
-    pub fn edit_file(&self, file_id: FileId, content: Vec<u8>) -> Result<(), ApiError> {
-        let content_hash = blake3::hash(&content).to_hex().to_string();
-        self.enqueue(Change::FileChanged {
-            file_id,
-            content,
-            content_hash,
-        })
+    /// Register a temporary chunk provider for a file the client is serving on
+    /// demand. Delegates to the transfer subsystem's provider registry.
+    pub async fn register_provider(
+        &self,
+        file_id: FileId,
+        content_hash: String,
+        source: Arc<dyn ChunkSource>,
+    ) {
+        self.pending_fetches
+            .register_provider(file_id, content_hash, source)
+            .await;
+    }
+
+    /// Remove a temporary provider (the client released the file).
+    pub async fn unregister_provider(&self, file_id: FileId, content_hash: &str) {
+        self.pending_fetches
+            .unregister_provider(file_id, content_hash)
+            .await;
+    }
+
+    /// Replace the content of an existing file, provided on demand by the client
+    /// (see [`Self::upload_file`]). Records the new version and announces a
+    /// metadata-only `FileMetadataChanged` to peers, which pull from the
+    /// provider.
+    pub fn edit_file(&self, file_id: FileId, content_hash: String) -> Result<(), ApiError> {
+        self.change_sender
+            .send(DaemonMessage::AnnounceProvided {
+                file_id,
+                logical_path: None,
+                content_hash,
+                tags: Vec::new(),
+            })
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))
     }
 
     /// Delete a file. Enqueues `Change::FileDeleted`.
@@ -413,7 +454,8 @@ impl Api {
     /// out and report before this outer deadline fires.
     const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// Fetch a file's bytes on demand, from a peer if not present locally.
+    /// Fetch a file's content on demand, from a peer if not present locally,
+    /// and return the path to a **daemon-owned temp file** holding it.
     ///
     /// Enqueues a [`DaemonMessage::Fetch`] onto the ingest bus; `handle_changes`
     /// checks the local sync directories first (hash-gated) and, failing that,
@@ -421,11 +463,17 @@ impl Api {
     /// the reply with an overall timeout. `expected_hash` gates which content is
     /// accepted; the caller obtains it from the file's known metadata
     /// (`FileInfo::content_hash`).
+    ///
+    /// The returned path lives under [`crate::paths::Paths::fetch_temp_dir`] and
+    /// is handed to the caller with **move semantics**: the caller must consume
+    /// it (rename into place or delete). The whole file is never buffered into
+    /// memory — a peer transfer already lands as a temp file on disk, and a
+    /// locally-held copy is streamed into the fetch temp dir.
     pub async fn fetch_file(
         &self,
         file_id: FileId,
         expected_hash: String,
-    ) -> Result<Vec<u8>, ApiError> {
+    ) -> Result<PathBuf, ApiError> {
         let (respond_to, response) = oneshot::channel();
         self.change_sender
             .send(DaemonMessage::Fetch {
@@ -435,13 +483,22 @@ impl Api {
             })
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
 
-        match tokio::time::timeout(Self::FETCH_TIMEOUT, response).await {
-            Ok(Ok(Ok(bytes))) => Ok(bytes),
-            Ok(Ok(Err(fetch_error))) => Err(fetch_error.into()),
+        let content = match tokio::time::timeout(Self::FETCH_TIMEOUT, response).await {
+            Ok(Ok(Ok(file_bytes))) => file_bytes,
+            Ok(Ok(Err(fetch_error))) => return Err(fetch_error.into()),
             // The responder was dropped without sending — treat as shutdown.
-            Ok(Err(_recv_error)) => Err(ApiError::Internal(FetchError::ShuttingDown.to_string())),
-            Err(_elapsed) => Err(ApiError::Internal(FetchError::TimedOut.to_string())),
-        }
+            Ok(Err(_recv_error)) => {
+                return Err(ApiError::Internal(FetchError::ShuttingDown.to_string()));
+            }
+            Err(_elapsed) => return Err(ApiError::Internal(FetchError::TimedOut.to_string())),
+        };
+
+        // Materialize into a fresh daemon-owned temp file the caller consumes.
+        let dest = self.fetch_temp_dir.join(uuid::Uuid::new_v4().to_string());
+        content.materialize_to(&dest).await.map_err(|error| {
+            ApiError::Internal(format!("failed to stage fetched file: {error}"))
+        })?;
+        Ok(dest)
     }
 
     /// Resolve `file_id` to the absolute on-disk path where its bytes currently

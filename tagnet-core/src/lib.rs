@@ -77,7 +77,7 @@ pub mod state {
     use serde::{Deserialize, Serialize};
 
     use crate::{
-        FileId, LogicalPath, RequestId, TagId,
+        FileId, LogicalPath, RequestId, TagId, TransferId,
         tag::{MetadataFormat, MetadataValues},
     };
 
@@ -96,31 +96,38 @@ pub mod state {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum Change {
         // The client can't know the Id of the file initially.
-        FileAdded {
+        //
+        // `FileMetadataAdded` / `FileMetadataChanged` are named to make it
+        // explicit that they are **metadata-only announcements** carrying no
+        // file bytes — a receiver pulls the content over a separate transfer.
+        FileMetadataAdded {
             file_id: FileId,
             /// The file's logical identity. Receivers store this in the main
             /// database and each derive their own on-disk placement from it.
             logical_path: LogicalPath,
             // encoding: ,
-            content: Vec<u8>,
-            /// BLAKE3 hex digest of `content`. The receiver records this in
-            /// `file_versions` so the version chain is authoritative without
-            /// the receiver having to re-hash the bytes.
+            /// BLAKE3 hex digest of the file's content. `FileMetadataAdded` is a
+            /// metadata-only announcement: it carries no bytes. A receiver that
+            /// does not already hold this hash pulls the bytes over a separate
+            /// transfer (keyed by `file_id` + this hash). The hash is recorded
+            /// in `file_versions` so the version chain is authoritative.
             content_hash: String,
             // TODO: Bundle metadata with the tag.
             tags: Vec<TagId>,
         },
         FileMoved {
             file_id: FileId,
-            /// The file's new logical identity. As with `FileAdded`, each
+            /// The file's new logical identity. As with `FileMetadataAdded`, each
             /// receiving sync directory derives its own physical placement.
             logical_path: LogicalPath,
         },
-        FileChanged {
+        FileMetadataChanged {
             file_id: FileId,
             // encoding: ,
-            content: Vec<u8>,
-            /// BLAKE3 hex digest of `content`. See `FileAdded::content_hash`.
+            /// BLAKE3 hex digest of the file's new content. Like
+            /// `FileMetadataAdded`, `FileMetadataChanged` is metadata-only and
+            /// carries no bytes; the receiver pulls them over a separate
+            /// transfer. See `FileMetadataAdded::content_hash`.
             content_hash: String,
         },
         FileDeleted {
@@ -206,11 +213,30 @@ pub mod state {
     /// latest version on the announcing side. The receiver uses it only as a
     /// tiebreaker when histories have diverged (neither side's latest hash
     /// appears in the other's history).
+    ///
+    /// `logical_path` carries the file's placement identity so the receiver
+    /// can *place* a file it has never seen before (the offline-creation
+    /// catch-up case). Without it, connect-time reconciliation would only
+    /// work for files both sides already know locally — a file created
+    /// while the two peers were disconnected would be stranded until its
+    /// metadata was re-announced via a live `Change::FileMetadataAdded`.
+    ///
+    /// Tags are deliberately **not** carried here: they are authoritatively
+    /// reconciled via [`Sync::TagManifest`] / [`RelationshipManifestEntry`]
+    /// (which are LWW with `modified_at`). Duplicating the file→tag edges
+    /// in this manifest would create a second, unversioned source of truth
+    /// that could resurrect stale associations. When a file's tags arrive
+    /// (whether before or after the bytes materialize), the local
+    /// `FileTagged` handler runs `reconcile_tag_placement`, which re-places
+    /// the file into any newly-matching TagBased sync directories using the
+    /// already-materialized bytes as a source. This gives us the desired
+    /// order-independence without enforcing manifest ordering.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ManifestEntry {
         pub file_id: FileId,
         pub history: Vec<(i64, String)>,
         pub latest_observed_at: i64,
+        pub logical_path: LogicalPath,
     }
 
     /// What a tag relationship attaches a tag to. Mirrors the daemon's
@@ -256,11 +282,12 @@ pub mod state {
     /// 1. After the public-key handshake, both sides send their `Manifest`
     ///    unprompted.
     /// 2. The receiver compares each entry against its local `file_versions`
-    ///    table. For entries where it determines the peer has bytes it
-    ///    doesn't, it sends back `Request`.
-    /// 3. The peer answers each `Request` with a `Change::FileAdded` carrying
-    ///    the current bytes and `content_hash` (re-using the live wire
-    ///    format), or `NotFound` if the file is no longer locally available.
+    ///    table. For entries where it determines the peer has bytes it doesn't,
+    ///    it opens a pull transfer (`TransferStart`, keyed by a fresh
+    ///    `TransferId`) against that peer to fetch the bytes. There is no
+    ///    request/response step: bytes always move over the pull transfer
+    ///    protocol below, and `Change::FileMetadataAdded`/`FileMetadataChanged`
+    ///    are metadata-only announcements that carry no content.
     ///
     /// The `Fetch*` variants are a distinct, on-demand mechanism (used by
     /// `tagnet edit`): a recursive request for a *specific* file's bytes
@@ -270,19 +297,11 @@ pub mod state {
     /// `expected_hash`) unwinds back along the request path to the origin. A
     /// node reports `FetchMissing` only once every child it forwarded to has
     /// reported `FetchMissing` (or timed out). The `request_id` correlates
-    /// replies with the pending request at each hop. Kept separate from the
-    /// manifest-driven `Request`/`NotFound` above so that reconciliation is
-    /// untouched.
+    /// replies with the pending request at each hop.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum Sync {
         Manifest {
             entries: Vec<ManifestEntry>,
-        },
-        Request {
-            file_id: FileId,
-        },
-        NotFound {
-            file_id: FileId,
         },
 
         /// Ask peers for the bytes of `file_id` whose content hashes to
@@ -293,11 +312,13 @@ pub mod state {
             expected_hash: String,
         },
         /// A peer holds bytes for `file_id` matching the request's
-        /// `expected_hash`. Unwinds back toward the origin.
+        /// `expected_hash`. Content-less control signal: it announces "I have
+        /// it, the hash matches" and unwinds back toward the origin. The bytes
+        /// themselves are then pulled over a separate transfer (each hop opens a
+        /// transfer against the child that answered).
         FetchFound {
             request_id: RequestId,
             file_id: FileId,
-            content: Vec<u8>,
             content_hash: String,
         },
         /// This subtree does not have the requested content (all children
@@ -306,10 +327,62 @@ pub mod state {
             request_id: RequestId,
         },
 
+        // --- File transfer (pull-based bulk byte movement) --------------------
+        //
+        // Bytes are moved over a link by a *pull* protocol: the **receiver**
+        // drives, the **sender** only ever replies. This gives fair
+        // interleaving with other traffic for free (the sender never emits a
+        // chunk unprompted) and inherent backpressure (the receiver asks for the
+        // next chunk only when ready). All four messages are correlated by a
+        // fresh per-link [`TransferId`].
+        //
+        // Flow:
+        // 1. Receiver → `TransferStart { transfer_id, file_id, content_hash }`.
+        // 2. Receiver → `TransferChunkRequest { transfer_id, offset }` for each
+        //    chunk it wants (it may keep a small window of these in flight).
+        // 3. Sender  → `TransferChunk { transfer_id, offset, bytes, last }` in
+        //    reply to each request; `last` marks the final chunk.
+        // 4. Either side → `TransferAbort { transfer_id, reason }` to cancel
+        //    (sender: file gone / read error; receiver: hash mismatch / timeout
+        //    / no longer wanted).
+        //
+        // The receiver verifies the accumulated BLAKE3 against `content_hash`
+        // when it sees `last`; a mismatch is an abort, never a commit.
+        /// Receiver opens a transfer: "I want `file_id` whose content hashes to
+        /// `content_hash`." The sender resolves the file and either begins
+        /// answering chunk requests or replies `TransferAbort` if it cannot
+        /// serve it.
+        TransferStart {
+            transfer_id: TransferId,
+            file_id: FileId,
+            content_hash: String,
+        },
+        /// Receiver asks for the chunk beginning at `offset`. The chunk length
+        /// is chosen by the sender (bounded).
+        TransferChunkRequest {
+            transfer_id: TransferId,
+            offset: u64,
+        },
+        /// Sender's reply to a `TransferChunkRequest`: the bytes at `offset`.
+        /// `last` is true for the final chunk of the file (which may be empty
+        /// for a zero-length file).
+        TransferChunk {
+            transfer_id: TransferId,
+            offset: u64,
+            bytes: Vec<u8>,
+            last: bool,
+        },
+        /// Abort an in-flight transfer from either side.
+        TransferAbort {
+            transfer_id: TransferId,
+            reason: String,
+        },
+
         /// Tag reconciliation, sent unprompted right after `Manifest` at
         /// connection time (and driving offline catch-up the same way).
         ///
-        /// Flow, mirroring the file `Manifest`/`Request` split:
+        /// Unlike file reconciliation (which pulls bytes over a transfer), tag
+        /// definitions are small, so they use an explicit request/response:
         /// 1. Each side sends its `TagManifest` (lightweight: per-tag id +
         ///    `modified_at`, plus every relationship as a full
         ///    `RelationshipManifestEntry`).
@@ -319,8 +392,7 @@ pub mod state {
         ///    applied directly by last-writer-wins with no request needed.
         /// 3. The peer answers each `TagRequest` with a `Change::TagAdded`
         ///    carrying the full current definition (name/color/metadata +
-        ///    `modified_at`), re-using the live wire format exactly as
-        ///    `Sync::Request` is answered with `Change::FileAdded`. If the tag no
+        ///    `modified_at`), re-using the live wire format. If the tag no
         ///    longer exists locally it answers `TagNotFound`.
         TagManifest {
             definitions: Vec<TagManifestEntry>,
@@ -464,6 +536,36 @@ impl std::fmt::Display for RequestId {
 }
 
 impl Default for RequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A transient identifier for a single **file transfer over one peer link**
+/// (`Sync::Transfer*`). Like [`RequestId`] it is never persisted; it exists only
+/// to correlate the messages of one pull-driven transfer (start, chunk
+/// requests, chunk replies, abort) on a single link.
+///
+/// It is deliberately *per-hop*: in a relayed fetch each hop runs its own
+/// transfer with its own `TransferId`, so a relay node maps the parent-side id
+/// to the child-side id rather than reusing one id end-to-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct TransferId(Uuid);
+
+impl TransferId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl std::fmt::Display for TransferId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl Default for TransferId {
     fn default() -> Self {
         Self::new()
     }

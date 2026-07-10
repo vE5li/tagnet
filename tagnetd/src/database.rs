@@ -20,9 +20,10 @@ use tagnet_core::{
 pub type VersionHistory = Vec<(i64, String)>;
 
 /// One row of [`FileDatabase::manifest_entries`]: a file id, its full
-/// [`VersionHistory`], and the unix-millis timestamp of its latest version.
+/// [`VersionHistory`], the unix-millis timestamp of its latest version, and
+/// the file's logical path.
 /// Maps directly onto a `state::ManifestEntry`.
-pub type ManifestRow = (FileId, VersionHistory, i64);
+pub type ManifestRow = (FileId, VersionHistory, i64, LogicalPath);
 
 /// A single recorded version of a file's content.
 ///
@@ -507,22 +508,24 @@ impl FileDatabase {
     /// them during reconciliation. When the tombstone design lands, this is
     /// where deletes will start being included again.
     pub fn manifest_entries(&self) -> Result<Vec<ManifestRow>, DatabaseError> {
-        // First fetch the file_ids we still know about, then for each fetch
-        // its history. Two-stage to keep the SQL straightforward; manifest
-        // construction is a one-shot at connect time so the N+1 here is
-        // acceptable.
+        // First fetch the file rows we still know about, then for each fetch
+        // its history and tags. Two-stage to keep the SQL straightforward;
+        // manifest construction is a one-shot at connect time so the N+1 here
+        // is acceptable.
         let mut id_statement = self
             .connection
-            .prepare("SELECT id FROM files")
+            .prepare("SELECT id, logical_path FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let file_ids: Vec<FileId> = id_statement
-            .query_map([], |row| row.get::<_, FileId>(0))
+        let file_rows: Vec<(FileId, LogicalPath)> = id_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, FileId>(0)?, row.get::<_, LogicalPath>(1)?))
+            })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        let mut entries = Vec::with_capacity(file_ids.len());
-        for file_id in file_ids {
+        let mut entries = Vec::with_capacity(file_rows.len());
+        for (file_id, logical_path) in file_rows {
             let history = self.version_history(file_id)?;
             // Files in `files` should always have at least one version
             // (every add/change path records one), but be defensive.
@@ -537,7 +540,7 @@ impl FileDatabase {
                 .latest_version(file_id)?
                 .map(|version| version.observed_at)
                 .unwrap_or(0);
-            entries.push((file_id, history, latest_observed_at));
+            entries.push((file_id, history, latest_observed_at, logical_path));
         }
         Ok(entries)
     }
@@ -678,8 +681,8 @@ impl FileDatabase {
     }
 
     /// Cheap existence check for a `file_id` in the `files` table. Used by
-    /// `handle_changes` to decide whether an inbound `FileAdded` should be
-    /// treated as new or as an idempotent re-announcement.
+    /// `handle_changes` to decide whether an inbound `FileMetadataAdded` should
+    /// be treated as new or as an idempotent re-announcement.
     pub fn file_exists(&self, file_id: FileId) -> Result<bool, DatabaseError> {
         let count: i64 = self
             .connection
@@ -1706,6 +1709,45 @@ mod tests {
         assert_eq!(info.logical_path, LogicalPath::new("a.txt"));
         assert_eq!(info.content_hash, "hash-v2");
         assert_eq!(info.version_number, v2);
+    }
+
+    #[test]
+    fn reverting_to_an_old_hash_becomes_the_new_latest_version() {
+        // Regression: reverting a file's content back to a hash it held earlier
+        // must record a *new* latest version with that hash — not be treated as
+        // a duplicate/no-op. The change-ingest path keys "do we already hold
+        // this?" off `latest_version`, so this is the invariant it relies on:
+        // an old hash reappearing is the current version again only after a new
+        // version row is recorded.
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+
+        database.record_version(file_id, "hash-A", "local").unwrap();
+        database.record_version(file_id, "hash-B", "local").unwrap();
+        // Current version is B, but A is still in history.
+        assert_eq!(
+            database
+                .latest_version(file_id)
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "hash-B"
+        );
+
+        // Revert to A: a new version whose hash is the old A.
+        let reverted = database.record_version(file_id, "hash-A", "local").unwrap();
+        let latest = database.latest_version(file_id).unwrap().unwrap();
+        assert_eq!(latest.content_hash, "hash-A");
+        assert_eq!(latest.version_number, reverted);
+        // History now has three entries: A, B, A.
+        let history = database.version_history(file_id).unwrap();
+        assert_eq!(
+            history.iter().map(|(_, h)| h.as_str()).collect::<Vec<_>>(),
+            vec!["hash-A", "hash-B", "hash-A"]
+        );
     }
 
     #[test]

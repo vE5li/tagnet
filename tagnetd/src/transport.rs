@@ -136,28 +136,41 @@ pub trait TransportBackend {
         color: String,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
-    /// Upload a file (in-memory `Vec<u8>` in v1); returns the freshly-minted id.
+    /// Upload a file from a path on disk; returns the freshly-minted id.
+    ///
+    /// The bytes are never buffered whole: the backend hashes `path` by
+    /// streaming it and then serves the content chunk-by-chunk on demand (the
+    /// IPC backend over the control socket; the in-process backend straight from
+    /// disk). `path_name` is the file's logical identity; `path` is where the
+    /// bytes currently live.
     fn upload_file(
         &self,
+        path: PathBuf,
         path_name: String,
-        content: Vec<u8>,
         tags: Vec<TagId>,
     ) -> impl Future<Output = Result<FileId, ApiError>> + Send;
 
-    /// Replace the content of an existing file.
+    /// Replace the content of an existing file with the bytes at `path`, served
+    /// on demand exactly like [`upload_file`](Self::upload_file).
     fn edit_file(
         &self,
         file_id: FileId,
-        content: Vec<u8>,
+        path: PathBuf,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
-    /// Fetch a file's bytes on demand (from a peer if not present locally).
-    /// `expected_hash` gates which content is accepted.
+    /// Fetch a file's content on demand (from a peer if not present locally)
+    /// and return the path to a temp file holding it. `expected_hash` gates
+    /// which content is accepted.
+    ///
+    /// The path is handed to the caller with **move semantics**: it points at a
+    /// daemon-owned temp file (both backends run co-located with the daemon and
+    /// share its filesystem) that the caller must consume by renaming it into
+    /// place or deleting it. The content is never buffered whole in memory.
     fn fetch_file(
         &self,
         file_id: FileId,
         expected_hash: String,
-    ) -> impl Future<Output = Result<Vec<u8>, ApiError>> + Send;
+    ) -> impl Future<Output = Result<PathBuf, ApiError>> + Send;
 
     /// Resolve a file's absolute on-disk path if present locally, else `None`.
     fn local_path_for_file(
@@ -289,6 +302,12 @@ impl InProcessBackend {
     }
 }
 
+/// Map a [`FileBytes::hash`](crate::file_bytes::FileBytes::hash) failure (an I/O
+/// error reading the local upload source) into an [`ApiError`].
+fn hash_error(error: crate::file_bytes::FileBytesError) -> ApiError {
+    ApiError::Transport(format!("hashing upload source: {error}"))
+}
+
 impl TransportBackend for InProcessBackend {
     async fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
         self.api.list_tags()
@@ -356,22 +375,41 @@ impl TransportBackend for InProcessBackend {
 
     async fn upload_file(
         &self,
+        path: PathBuf,
         path_name: String,
-        content: Vec<u8>,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
-        self.api.upload_file(path_name, content, tags)
+        // Hash by streaming the file, announce the upload, then register the
+        // on-disk path as a `FileToCopy` chunk provider so peers pull the bytes
+        // on demand straight from disk (never buffering the whole file). This is
+        // the same provider mechanism the IPC/CLI path uses, sourced from the
+        // local filesystem instead of the control socket.
+        let source = crate::file_bytes::FileBytes::FileToCopy(path);
+        let content_hash = source.hash().await.map_err(hash_error)?;
+        let file_id = self
+            .api
+            .upload_file(path_name, content_hash.clone(), tags)?;
+        self.api
+            .register_provider(file_id, content_hash, std::sync::Arc::new(source))
+            .await;
+        Ok(file_id)
     }
 
-    async fn edit_file(&self, file_id: FileId, content: Vec<u8>) -> Result<(), ApiError> {
-        self.api.edit_file(file_id, content)
+    async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
+        let source = crate::file_bytes::FileBytes::FileToCopy(path);
+        let content_hash = source.hash().await.map_err(hash_error)?;
+        self.api.edit_file(file_id, content_hash.clone())?;
+        self.api
+            .register_provider(file_id, content_hash, std::sync::Arc::new(source))
+            .await;
+        Ok(())
     }
 
     async fn fetch_file(
         &self,
         file_id: FileId,
         expected_hash: String,
-    ) -> Result<Vec<u8>, ApiError> {
+    ) -> Result<PathBuf, ApiError> {
         self.api.fetch_file(file_id, expected_hash).await
     }
 
@@ -544,20 +582,20 @@ impl TransportBackend for Backend {
 
     async fn upload_file(
         &self,
+        path: PathBuf,
         path_name: String,
-        content: Vec<u8>,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
         match self {
-            Backend::InProcess(backend) => backend.upload_file(path_name, content, tags).await,
-            Backend::Ipc(backend) => backend.upload_file(path_name, content, tags).await,
+            Backend::InProcess(backend) => backend.upload_file(path, path_name, tags).await,
+            Backend::Ipc(backend) => backend.upload_file(path, path_name, tags).await,
         }
     }
 
-    async fn edit_file(&self, file_id: FileId, content: Vec<u8>) -> Result<(), ApiError> {
+    async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
         match self {
-            Backend::InProcess(backend) => backend.edit_file(file_id, content).await,
-            Backend::Ipc(backend) => backend.edit_file(file_id, content).await,
+            Backend::InProcess(backend) => backend.edit_file(file_id, path).await,
+            Backend::Ipc(backend) => backend.edit_file(file_id, path).await,
         }
     }
 
@@ -565,7 +603,7 @@ impl TransportBackend for Backend {
         &self,
         file_id: FileId,
         expected_hash: String,
-    ) -> Result<Vec<u8>, ApiError> {
+    ) -> Result<PathBuf, ApiError> {
         match self {
             Backend::InProcess(backend) => backend.fetch_file(file_id, expected_hash).await,
             Backend::Ipc(backend) => backend.fetch_file(file_id, expected_hash).await,

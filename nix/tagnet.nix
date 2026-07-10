@@ -6,10 +6,10 @@ rustPlatform.buildRustPackage {
   pname = "tagnet";
   version = "0.1.0";
 
-  src = lib.cleanSource ./.;
+  src = lib.cleanSource ../.;
 
   cargoLock = {
-    lockFile = ./Cargo.lock;
+    lockFile = ../Cargo.lock;
   };
 
   cargoBuildFlags = ["--package" "tagnet"];

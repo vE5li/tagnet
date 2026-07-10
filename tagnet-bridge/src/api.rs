@@ -298,15 +298,19 @@ impl TagnetApp {
         self.try_backend()?.delete_tag(tag_id).await
     }
 
-    /// Upload a file (in-memory `Vec<u8>` in v1); returns the freshly-minted id.
+    /// Upload a file from a path on disk; returns the freshly-minted id.
+    ///
+    /// The bytes are streamed (hashed and then served on demand), never buffered
+    /// whole. `path_name` is the file's logical identity; `path` is where the
+    /// bytes currently live (e.g. the shared-file path the platform hands us).
     pub async fn upload_file(
         &self,
+        path: String,
         path_name: String,
-        content: Vec<u8>,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
         self.try_backend()?
-            .upload_file(path_name, content, tags)
+            .upload_file(std::path::PathBuf::from(path), path_name, tags)
             .await
     }
 

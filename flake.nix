@@ -30,11 +30,11 @@
   }:
     {
       overlays.default = final: prev: {
-        tagnetd = final.callPackage ./tagnetd.nix {};
-        tagnet = final.callPackage ./tagnet.nix {};
+        tagnetd = final.callPackage ./nix/tagnetd.nix {};
+        tagnet = final.callPackage ./nix/tagnet.nix {};
       };
 
-      nixosModules.default = import ./module.nix self;
+      nixosModules.default = import ./nix/module.nix self;
     }
     // flake-utils.lib.eachDefaultSystem (
       system: let

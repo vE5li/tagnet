@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tagnet_core::{FileId, LogicalPath, PhysicalPath, TagId, state::Frame};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::bus::PeerCommand;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     /// IP address and port of the peer. None to let the peer establish the connection.
@@ -59,6 +61,33 @@ pub struct SyncDirectory {
     pub sync_type: SyncType,
 }
 
+/// A tag declared in the configuration file so its *definition* is guaranteed
+/// to exist on startup — the counterpart to referencing a `TagId` from a
+/// [`SyncType::TagBased`] directory.
+///
+/// Tags are otherwise only minted at runtime (UI/API `create_tag`, or
+/// reconciled from a peer), which forces an operator to create a tag elsewhere
+/// and copy its opaque id into the config by hand. Declaring the tag here — with
+/// its id chosen by the operator — makes a `TagBased` directory's `tags`
+/// self-contained and lets the *same* tag converge across devices (they all
+/// declare the same id).
+///
+/// Semantics are a last-writer-wins **floor**, not an override: on startup each
+/// declaration is replayed as a `Change::TagAdded` stamped with a very low
+/// `modified_at`, so it *creates* the tag when absent but never clobbers a newer
+/// rename/recolor made through the UI or reconciled from a peer. Config declares
+/// existence and initial values; it does not enforce them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagDeclaration {
+    /// The tag's id, chosen by the operator (not minted). The same id must be
+    /// used on every device that should share this tag.
+    pub id: TagId,
+    pub name: String,
+    /// Hex color (e.g. `#F44336`). Empty is allowed and normalized downstream.
+    #[serde(default)]
+    pub color: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Configuration {
     /// Synchronized directories on the device itself.
@@ -69,6 +98,12 @@ pub struct Configuration {
     /// Port to listen on. None for not listening.
     pub listen_port: Option<u16>,
     pub peers: Vec<Peer>,
+    /// Tags that must exist on startup, so a [`SyncType::TagBased`] directory can
+    /// reference them by id without the operator first creating them through the
+    /// UI. See [`TagDeclaration`] for the last-writer-wins-floor semantics.
+    /// Defaults to empty so pre-existing config files keep parsing.
+    #[serde(default)]
+    pub tags: Vec<TagDeclaration>,
 }
 
 /// Why a [`Configuration`] could not be produced from its serialized form.
@@ -150,6 +185,7 @@ impl Configuration {
                     sync_type: SyncType::TagBased { tags: Vec::new() },
                 },
             ],
+            tags: Vec::new(),
         }
     }
 
@@ -221,10 +257,15 @@ pub struct RuntimePeer {
     /// Sender into the outbound WebSocket task for this peer.
     /// `None` when no connection is currently established.
     ///
-    /// Carries `Frame` (not raw `Change`) because reconciliation messages
-    /// (`Sync::Request`, `Sync::NotFound`, ...) share the same outbound queue
-    /// as live changes. `forward_to_peers` wraps in `Frame::Change`.
+    /// Carries `Frame` (not raw `Change`) because reconciliation and transfer
+    /// messages (`Sync::Manifest`, `Sync::TransferStart`, ...) share the same
+    /// outbound queue as live changes. `forward_to_peers` wraps in
+    /// `Frame::Change`.
     pub outbound: Option<UnboundedSender<Frame>>,
+    /// Command channel into this peer's live session, used by `handle_changes`
+    /// to trigger a byte pull for a change this peer just announced. `None` when
+    /// no session is established. Registered/cleared alongside `outbound`.
+    pub commands: Option<UnboundedSender<PeerCommand>>,
 }
 
 impl Default for RuntimePeer {
@@ -240,6 +281,7 @@ impl RuntimePeer {
             sync_type: None,
             statistics: ConnectionStatistics {},
             outbound: None,
+            commands: None,
         }
     }
 }
@@ -257,5 +299,76 @@ impl RuntimeConfiguration {
             .collect();
 
         Self { peers }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    /// A config file predating the `tags` field still parses (the field
+    /// defaults to empty).
+    #[test]
+    fn config_without_tags_field_parses() {
+        let json = r#"{
+            "sync_directories": [],
+            "listen_port": null,
+            "peers": []
+        }"#;
+        let configuration = Configuration::from_str(json).unwrap();
+        assert!(configuration.tags.is_empty());
+    }
+
+    /// Declared tags parse, including the id (a transparent UUID string) and an
+    /// omitted color (defaults to empty, normalized downstream).
+    #[test]
+    fn config_with_declared_tags_parses() {
+        let tag_id = TagId::new();
+        let json = format!(
+            r##"{{
+                "sync_directories": [],
+                "listen_port": null,
+                "peers": [],
+                "tags": [
+                    {{ "id": "{}", "name": "work", "color": "#00FF00" }},
+                    {{ "id": "{}", "name": "photos" }}
+                ]
+            }}"##,
+            tag_id.to_string(),
+            TagId::new().to_string()
+        );
+        let configuration = Configuration::from_str(&json).unwrap();
+        assert_eq!(configuration.tags.len(), 2);
+        assert_eq!(configuration.tags[0].id, tag_id);
+        assert_eq!(configuration.tags[0].name, "work");
+        assert_eq!(configuration.tags[0].color, "#00FF00");
+        // Omitted color defaults to empty (normalization happens at replay).
+        assert_eq!(configuration.tags[1].color, "");
+    }
+
+    /// A `TagBased` sync directory can reference a declared tag's id, which is
+    /// the whole point: the reference is self-contained within the config.
+    #[test]
+    fn tag_based_directory_can_reference_declared_tag() {
+        let tag_id = TagId::new();
+        let json = format!(
+            r##"{{
+                "sync_directories": [
+                    {{ "path": "/tmp/x", "sync_type": {{ "TagBased": {{ "tags": ["{}"] }} }} }}
+                ],
+                "listen_port": null,
+                "peers": [],
+                "tags": [ {{ "id": "{}", "name": "work", "color": "#00FF00" }} ]
+            }}"##,
+            tag_id.to_string(),
+            tag_id.to_string()
+        );
+        let configuration = Configuration::from_str(&json).unwrap();
+        let SyncType::TagBased { tags } = &configuration.sync_directories[0].sync_type else {
+            panic!("expected a TagBased directory");
+        };
+        assert_eq!(tags, &vec![tag_id]);
+        assert_eq!(configuration.tags[0].id, tag_id);
     }
 }

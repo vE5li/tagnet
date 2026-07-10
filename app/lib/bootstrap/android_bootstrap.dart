@@ -8,7 +8,6 @@
 // Selected at build time via --dart-define=TAGNET_BACKEND=android (see main).
 
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/widgets.dart';
 import 'package:path_provider/path_provider.dart';
@@ -99,9 +98,10 @@ class AndroidBootstrap extends TagnetBootstrap {
     });
   }
 
-  /// Read each shared file's bytes and hand them to the sync engine via
-  /// [tagnet.TagnetApp.uploadFile]. v1 loads the whole file into memory
-  /// (content as a byte list), matching the CLI's upload path.
+  /// Hand each shared file's *path* to the sync engine via
+  /// [tagnet.TagnetApp.uploadFile]. The engine streams the bytes from disk
+  /// (hash then serve-on-demand); they are never buffered whole, matching the
+  /// CLI's upload path.
   Future<void> _uploadSharedFiles(
     tagnet.TagnetApp app,
     List<SharedMediaFile> files,
@@ -113,12 +113,10 @@ class AndroidBootstrap extends TagnetBootstrap {
     var uploaded = 0;
     for (final shared in files) {
       try {
-        final file = File(shared.path);
-        final bytes = await file.readAsBytes();
         // Derive a display/logical name from the source path. The engine treats
         // this as the file's logical identity at the ingestion boundary.
         final name = shared.path.split('/').last;
-        await app.uploadFile(pathName: name, content: bytes, tags: const []);
+        await app.uploadFile(path: shared.path, pathName: name, tags: const []);
         uploaded++;
       } catch (error) {
         showMessage('Failed to upload ${shared.path}: $error');
