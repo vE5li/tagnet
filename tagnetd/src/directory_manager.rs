@@ -91,9 +91,12 @@ pub enum SyncDirectoryCommand {
     /// file lands in the TagBased directories it belongs to. Idempotent: a
     /// no-op when placement is already correct.
     ///
-    /// If no directory yet holds the file (bytes not materialized), there is
-    /// nothing to source, so newly-matching directories are left for the
-    /// eventual `Materialize` to populate.
+    /// If a TagBased directory now matches the file but no local copy exists to
+    /// source the bytes from, placement cannot complete locally. In that case
+    /// `respond_to` receives `true` ("deferred: needs bytes") and the caller is
+    /// expected to fetch the bytes over the network (by the file's latest
+    /// catalog version hash) and re-drive placement via `Materialize`. Otherwise
+    /// (placement resolved, or nothing to place) it receives `false`.
     ReconcileTagPlacement {
         file_id: FileId,
         /// The file's logical path, used to derive each TagBased directory's
@@ -102,6 +105,9 @@ pub enum SyncDirectoryCommand {
         /// The file's current tag set (from the main `FileDatabase`), against
         /// which each TagBased directory's tags are matched.
         file_tags: Vec<TagId>,
+        /// `true` if a TagBased directory should hold the file but no local copy
+        /// exists to source the bytes (the caller must fetch); `false` otherwise.
+        respond_to: tokio::sync::oneshot::Sender<bool>,
     },
     /// Read the bytes for `file_id` from whichever sync directory currently
     /// holds it and respond on `respond_to`. Used by peer connection tasks to
@@ -791,17 +797,22 @@ impl SyncDirectoryManager {
     /// subset of `file_tags`) but does not, create it there sourcing the bytes
     /// from any directory that already holds the file; if it holds the file but
     /// should not, remove it. Universal directories are skipped. Idempotent.
+    ///
+    /// Returns `true` if a TagBased directory should hold the file but no local
+    /// copy exists to source the bytes from — i.e. placement was *deferred* and
+    /// the caller must fetch the bytes over the network. `false` otherwise.
     async fn reconcile_tag_placement(
         &self,
         file_id: FileId,
         logical_path: &LogicalPath,
         file_tags: &[TagId],
-    ) -> Result<(), SyncDirectoryError> {
+    ) -> Result<bool, SyncDirectoryError> {
         // Source path lazily: we only need it if some directory must gain the
         // file. Find the on-disk path in the first directory that already holds
         // it. We keep the *path* (not `FileBytes`) so each destination can build
         // its own `FileToCopy`, which leaves the source in place for the next.
         let mut source_path: Option<PathBuf> = None;
+        let mut deferred = false;
 
         for sync_directory in &self.sync_directories {
             let SyncType::TagBased {
@@ -819,9 +830,8 @@ impl SyncDirectoryManager {
             match (should_hold, currently_holds) {
                 (true, false) => {
                     // Newly matching: place the file here. Source the bytes from
-                    // a directory that already holds it; if none does, the file
-                    // has not been materialized yet and the eventual
-                    // `Materialize` will place it — nothing to do now.
+                    // a directory that already holds it; if none does, report the
+                    // deferral so the caller fetches the bytes over the network.
                     if source_path.is_none() {
                         source_path = self.first_holding_path(file_id);
                     }
@@ -829,10 +839,11 @@ impl SyncDirectoryManager {
                     let Some(source_path) = &source_path else {
                         log::debug!(
                             "ReconcileTagPlacement: no source copy of {} yet; \
-                             deferring placement into {}",
+                             deferring placement into {} (caller will fetch)",
                             file_id.to_string(),
                             sync_directory.path.to_string_lossy()
                         );
+                        deferred = true;
                         continue;
                     };
 
@@ -911,7 +922,7 @@ impl SyncDirectoryManager {
             }
         }
 
-        Ok(())
+        Ok(deferred)
     }
 
     /// The on-disk path of `file_id`'s bytes in the first sync directory that
@@ -946,6 +957,27 @@ impl SyncDirectoryManager {
             } => {
                 let sync_directory = self.sync_directory_for_path(&sync_directory_path)?;
 
+                // Idempotency: several placement triggers can legitimately fire
+                // for the same file (each `FileTagged` relationship reconcile,
+                // plus the connect-time placement sweep), each potentially
+                // fetching the bytes and emitting a `Materialize` -> `CreateFile`.
+                // If this directory already tracks the file at the same physical
+                // path, the bytes are already correctly placed; treat the repeat
+                // as a no-op success rather than letting the duplicate insert hit
+                // the per-directory DB primary key (which surfaced as
+                // `FailedAddingFile` and dropped the file).
+                if let Ok(existing) = sync_directory.database.get_file(file_id)
+                    && existing.physical_path == physical_path
+                {
+                    log::debug!(
+                        "CreateFile: {} already present in {} at {}; skipping (idempotent)",
+                        file_id.to_string(),
+                        sync_directory.path.to_string_lossy(),
+                        physical_path.as_str()
+                    );
+                    return Ok(());
+                }
+
                 // `physical_path` was already resolved from the file's logical
                 // path via `SyncType::physical_for` by the caller, so it is the
                 // correct on-disk name for this directory type (the file_id for
@@ -964,14 +996,20 @@ impl SyncDirectoryManager {
                 // self-caused. The watcher may surface it as a `Create` or, when
                 // the materialize is a rename into place, as a `Move`-in — the
                 // path-keyed record matches either.
-                let content_hash = content
-                    .hash()
-                    .await
-                    .map_err(|_| SyncDirectoryError::FailedAddingFile)?;
+                let content_hash = content.hash().await.map_err(|error| {
+                    log::error!(
+                        "CreateFile: failed to HASH content for {} at {} (source {:?}): {error}",
+                        file_id.to_string(),
+                        file_path.display(),
+                        content.path(),
+                    );
+                    SyncDirectoryError::FailedAddingFile
+                })?;
 
                 content.materialize_to(&file_path).await.map_err(|error| {
                     log::error!(
-                        "Failed to materialize file at {}: {error}",
+                        "CreateFile: failed to MATERIALIZE {} at {}: {error}",
+                        file_id.to_string(),
                         file_path.display()
                     );
                     SyncDirectoryError::FailedAddingFile
@@ -980,7 +1018,15 @@ impl SyncDirectoryManager {
                 sync_directory
                     .database
                     .add_file(file_id, &physical_path)
-                    .map_err(|_| SyncDirectoryError::FailedAddingFile)?;
+                    .map_err(|error| {
+                        log::error!(
+                            "CreateFile: failed to INSERT DB row for {} at {}: {:?}",
+                            file_id.to_string(),
+                            physical_path.as_str(),
+                            error
+                        );
+                        SyncDirectoryError::FailedAddingFile
+                    })?;
 
                 self.record_self_write(file_path, Some(content_hash));
             }
@@ -1105,7 +1151,28 @@ impl SyncDirectoryManager {
                     }
                 };
 
-                std::fs::remove_file(&file_path).expect("failed to remove file");
+                // Tolerate the file already being gone: a same-content duplicate
+                // can leave two file_ids pointing at the same physical path, so a
+                // second `RemoveFile` for that path finds nothing on disk. That is
+                // not an error — we still want to clean up this file_id's DB row
+                // below. Any other IO error is logged but must not crash the sole
+                // sync-directory thread.
+                match std::fs::remove_file(&file_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        log::debug!(
+                            "RemoveFile: {} already gone; cleaning up DB row only",
+                            file_path.to_string_lossy()
+                        );
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "RemoveFile: failed to remove {}: {error}",
+                            file_path.to_string_lossy()
+                        );
+                        return Err(SyncDirectoryError::FailedRemovingFile);
+                    }
+                }
 
                 // If the removed file was in a directory that is now empty, we want to remove the
                 // directory as well.
@@ -1127,9 +1194,13 @@ impl SyncDirectoryManager {
                 file_id,
                 logical_path,
                 file_tags,
+                respond_to,
             } => {
-                self.reconcile_tag_placement(file_id, &logical_path, &file_tags)
+                let deferred = self
+                    .reconcile_tag_placement(file_id, &logical_path, &file_tags)
                     .await?;
+                // Best-effort: the caller may have dropped the receiver.
+                let _ = respond_to.send(deferred);
             }
             SyncDirectoryCommand::LocalPath {
                 file_id,
@@ -1640,6 +1711,51 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"doc-bytes");
     }
 
+    /// A repeated `CreateFile` for a file the directory already holds at the
+    /// same physical path is a no-op success, not a `FailedAddingFile` error.
+    /// Several placement triggers (per-`FileTagged` reconciles + the connect
+    /// sweep) can legitimately fetch and re-place the same file; the sink must
+    /// tolerate the duplicate rather than dropping the file on a PK violation.
+    #[tokio::test]
+    async fn create_file_is_idempotent_for_same_file() {
+        let data_dir = temp_dir("idem-data");
+        let sync_dir = temp_dir("idem-sync");
+        let mut manager = universal_manager(&data_dir, &sync_dir).await;
+
+        let external = temp_dir("idem-external");
+        let source = external.join("doc.txt");
+        std::fs::write(&source, b"doc-bytes").unwrap();
+
+        let file_id = FileId::new();
+        let physical_path = PhysicalPath::new(file_id.to_string());
+        let destination = sync_dir.join(physical_path.as_str());
+
+        let create = |content| SyncDirectoryCommand::CreateFile {
+            file_id,
+            physical_path: physical_path.clone(),
+            content,
+            sync_directory_path: sync_dir.clone(),
+        };
+
+        manager
+            .handle_command(create(FileBytes::FileToCopy(source.clone())))
+            .await
+            .expect("first CreateFile must succeed");
+
+        // Second CreateFile for the same file_id + physical path: must be a
+        // no-op success, not an error.
+        manager
+            .handle_command(create(FileBytes::FileToCopy(source.clone())))
+            .await
+            .expect("repeated CreateFile must be an idempotent no-op, not an error");
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"doc-bytes",
+            "the file must still be present after the repeated create"
+        );
+    }
+
     /// `ChangeFile` carrying a `FileToCopy` overwrites the existing bytes at the
     /// file's on-disk location.
     #[tokio::test]
@@ -1927,6 +2043,66 @@ mod tests {
         SyncDirectoryManager::new(configuration, &paths, change_sender, command_receiver).await
     }
 
+    /// Regression: when one materialized file fans out to multiple sync
+    /// directories, the fan-out gives earlier targets a `FileToCopy` and the
+    /// last target a `FileToMove` (no eager source delete). Both destinations
+    /// must end up with the bytes, and the move must consume the shared source.
+    /// The previous code eagerly deleted the move source right after enqueuing
+    /// the (asynchronously processed) copies, so the copies raced a deleted
+    /// source and failed with `FailedAddingFile`, dropping the file everywhere.
+    #[tokio::test]
+    async fn fan_out_copy_then_move_places_into_all_directories() {
+        let data_dir = temp_dir("fanout-data");
+        let universal_dir = temp_dir("fanout-universal");
+        let tagged_dir = temp_dir("fanout-tagged");
+        let tag = TagId::new();
+        let mut manager = mixed_manager(&data_dir, &universal_dir, &tagged_dir, vec![tag]).await;
+
+        let file_id = FileId::new();
+        // A single shared source, as a completed transfer's temp file would be.
+        let external = temp_dir("fanout-external");
+        let source = external.join("transfer-temp");
+        std::fs::write(&source, b"shared-bytes").unwrap();
+
+        // Mirror the fan-out command sequence for two targets: the earlier
+        // target copies (source preserved), the last target moves (source
+        // consumed). Commands are processed in order.
+        manager
+            .handle_command(SyncDirectoryCommand::CreateFile {
+                file_id,
+                physical_path: PhysicalPath::new(file_id.to_string()),
+                content: FileBytes::FileToCopy(source.clone()),
+                sync_directory_path: universal_dir.clone(),
+            })
+            .await
+            .expect("copy target must succeed while the source still exists");
+
+        manager
+            .handle_command(SyncDirectoryCommand::CreateFile {
+                file_id,
+                physical_path: PhysicalPath::new("photo.jpg"),
+                content: FileBytes::FileToMove(source.clone()),
+                sync_directory_path: tagged_dir.clone(),
+            })
+            .await
+            .expect("move target must succeed and consume the source");
+
+        assert_eq!(
+            std::fs::read(universal_dir.join(file_id.to_string())).unwrap(),
+            b"shared-bytes",
+            "the copy target must have the bytes"
+        );
+        assert_eq!(
+            std::fs::read(tagged_dir.join("photo.jpg")).unwrap(),
+            b"shared-bytes",
+            "the move target must have the bytes"
+        );
+        assert!(
+            !source.exists(),
+            "the trailing move must consume the shared source"
+        );
+    }
+
     /// Regression for the tag-vs-content reconciliation race (STREAMING_FOLLOWUPS
     /// §1.3): a peer transfer materialized a file before its tags were applied,
     /// so it landed only in the Universal directory (which has no tag filter).
@@ -1967,14 +2143,20 @@ mod tests {
         );
 
         // Tags arrive: the file now matches the TagBased directory.
+        let (respond_to, deferred) = tokio::sync::oneshot::channel();
         manager
             .handle_command(SyncDirectoryCommand::ReconcileTagPlacement {
                 file_id,
                 logical_path: logical_path.clone(),
                 file_tags: vec![tag],
+                respond_to,
             })
             .await
             .unwrap();
+        assert!(
+            !deferred.await.unwrap(),
+            "a local source copy exists, so placement must complete (not defer)"
+        );
 
         // The file now lives in the TagBased dir under its logical path, with
         // the correct bytes, and remains in the Universal dir.
@@ -2042,6 +2224,10 @@ mod tests {
                 file_id,
                 logical_path,
                 file_tags: Vec::new(),
+                respond_to: {
+                    let (respond_to, _) = tokio::sync::oneshot::channel();
+                    respond_to
+                },
             })
             .await
             .unwrap();
@@ -2063,9 +2249,9 @@ mod tests {
         );
     }
 
-    /// When no directory yet holds the file (bytes not materialized), a
-    /// reconcile that would add it is a no-op: placement is deferred to the
-    /// eventual `Materialize`.
+    /// When no directory yet holds the file, a reconcile that would add it
+    /// reports the deferral (so the caller fetches the bytes over the network)
+    /// and creates nothing locally.
     #[tokio::test]
     async fn reconcile_defers_when_no_source_copy_exists() {
         let data_dir = temp_dir("reconcile-defer-data");
@@ -2077,18 +2263,24 @@ mod tests {
         let file_id = FileId::new();
         let logical_path = LogicalPath::new("photo.jpg");
 
+        let (respond_to, deferred) = tokio::sync::oneshot::channel();
         manager
             .handle_command(SyncDirectoryCommand::ReconcileTagPlacement {
                 file_id,
                 logical_path: logical_path.clone(),
                 file_tags: vec![tag],
+                respond_to,
             })
             .await
             .unwrap();
 
         assert!(
+            deferred.await.unwrap(),
+            "with no source copy, placement must report deferred so the caller fetches"
+        );
+        assert!(
             !tagged_dir.join(logical_path.as_str()).exists(),
-            "with no source copy, placement must be deferred (no file created)"
+            "with no source copy, no file is created locally (bytes fetched by caller)"
         );
         assert!(
             manager.sync_directories[1]

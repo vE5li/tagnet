@@ -112,22 +112,43 @@ pub enum DaemonMessage {
     /// Bytes for `file_id` have arrived over a peer transfer and should be
     /// written into this device's matching sync directories.
     ///
-    /// The file's *logical* identity was recorded when the peer announced the
-    /// change (`FileMetadataAdded` inserts the `files` row; `FileMetadataChanged`
-    /// needs no new row). The **version** is recorded *here*, on
-    /// materialization, so
-    /// `file_versions` only ever holds versions whose bytes we actually have —
-    /// this keeps `tagnet ls` honest and lets reconciliation re-request
-    /// anything not yet received.
+    /// Both the file's logical identity and its **version** were recorded when
+    /// the announcement was handled (`FileMetadataAdded`/`Changed` or `Manifest`
+    /// reconcile), because `file_versions` is the byte-independent *catalog* of
+    /// versions we know exist — not a record of bytes we hold. `Materialize` is
+    /// therefore purely about placing the arrived bytes; it neither records a
+    /// version nor forwards the announcement (both already happened).
     Materialize {
         file_id: FileId,
         content: FileBytes,
-        /// The hash the bytes were verified against by the transfer receiver;
-        /// recorded as the file's version here.
+        /// The hash the bytes were verified against by the transfer receiver.
         content_hash: String,
-        /// Which peer announced this (for the `file_versions.origin` column).
+        /// Which peer announced this. Retained for context/logging; no longer
+        /// used to record a version (that happened at announce time).
         origin: ChangeOrigin,
         placement: MaterializePlacement,
+    },
+    /// Re-evaluate `file_id`'s TagBased placement (and fetch its bytes on demand
+    /// if a sync directory now wants it but we do not hold them). Enqueued by a
+    /// peer session's connect-time reconciliation sweep so the fetch runs inside
+    /// `handle_changes` rather than blocking the session's frame loop (the fetch
+    /// needs that loop to relay `FetchRequest`/`FetchFound`). Fire-and-forget.
+    ReconcilePlacement { file_id: FileId },
+    /// Record a file + version into the catalog (`files` + `file_versions`) on
+    /// behalf of a peer session's `Manifest` reconciliation. The session decides
+    /// *what* to catalog (its divergence/LWW logic stays there) but must not
+    /// write the main DB itself — `handle_changes` is the sole writer — so it
+    /// hands the write here. Fire-and-forget. Inserts the `files` row if absent
+    /// and appends the version; the byte pull happens separately on the session
+    /// link.
+    CatalogFile {
+        file_id: FileId,
+        /// The file's logical identity, used to insert the `files` row when the
+        /// file is not yet known locally.
+        logical_path: LogicalPath,
+        content_hash: String,
+        /// The announcing peer (stored in `file_versions.origin`).
+        origin: ChangeOrigin,
     },
     /// A locally-provided upload/edit: the client (CLI) holds the bytes and
     /// serves them on demand (a temporary provider), so there is nothing to

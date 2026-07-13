@@ -435,6 +435,7 @@ pub async fn run(
         pending_fetches.clone(),
         database,
         change_receiver,
+        change_sender.clone(),
         command_sender.clone(),
         event_sender,
         shutdown.token().child_token(),
@@ -819,7 +820,9 @@ async fn run_peer_session<S>(
     // function does the awaits separately.
     //
     // The database path is supplied by the caller (originally derived from
-    // `Paths::main_db_path`).
+    // `Paths::main_db_path`). This connection is READ-ONLY: the session makes
+    // reconciliation decisions from it but routes every write through
+    // `change_sender` to `handle_changes`, the sole main-DB writer.
     let database = match FileDatabase::initialize(main_db_path) {
         Ok(database) => database,
         Err(error) => {
@@ -1210,7 +1213,17 @@ async fn run_peer_session<S>(
                             continue;
                         }
 
+                        // Capture the announced file_ids before `reconcile_peer_manifest`
+                        // consumes `entries`; used for the placement sweep below.
+                        let announced_file_ids: Vec<FileId> =
+                            entries.iter().map(|entry| entry.file_id).collect();
+
                         let wanted = reconcile_peer_manifest(peer_name, entries, &database);
+                        // Files we are pulling as a result of catalog reconciliation
+                        // (below); excluded from the placement sweep so we do not
+                        // double-fetch them.
+                        let pulling: HashSet<FileId> =
+                            wanted.iter().map(|wanted| wanted.file_id).collect();
                         // Start a pull transfer for each wanted file: we are the
                         // receiver/driver, the peer serves via its own sender
                         // when it sees our `TransferStart`. `placement` is
@@ -1223,24 +1236,48 @@ async fn run_peer_session<S>(
                             placement,
                         } in wanted
                         {
-                            // For a `Create` placement the `files` row does
-                            // not yet exist locally; insert it *before* the
-                            // pull so that when `Materialize` records the
-                            // version, the FK from `file_versions` -> `files`
-                            // resolves. Mirrors the live `FileMetadataAdded`
-                            // handler which does the same synchronous
-                            // `add_file` before requesting the pull.
-                            if let bus::MaterializePlacement::Create {
-                                logical_path, ..
-                            } = &placement
-                                && let Err(error) = database.add_file(file_id, logical_path)
-                            {
+                            // Resolve the file's logical identity for the catalog
+                            // write: from the placement for a `Create` (the file
+                            // is new to us), or from the DB for a `Change` (we
+                            // already know it). A missing logical path for a
+                            // `Change` should not happen, but if it does we skip.
+                            let logical_path = match &placement {
+                                bus::MaterializePlacement::Create { logical_path, .. } => {
+                                    logical_path.clone()
+                                }
+                                bus::MaterializePlacement::Change => {
+                                    match database.logical_path_for_file_id(file_id) {
+                                        Ok(logical_path) => logical_path,
+                                        Err(error) => {
+                                            log::error!(
+                                                "Reconciliation: no logical path for known \
+                                                 file {} ({error:?}); skipping",
+                                                file_id.to_string()
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+
+                            // Hand the catalog write (files row + version) to
+                            // `handle_changes`, the sole main-DB writer, rather
+                            // than writing on this session's own connection. The
+                            // byte pull below is a transfer, not a DB write, so it
+                            // stays here. `file_versions` is byte-independent, so
+                            // cataloging happens whether or not the pull completes.
+                            if let Err(error) = change_sender.send(DaemonMessage::CatalogFile {
+                                file_id,
+                                logical_path,
+                                content_hash: content_hash.clone(),
+                                origin: ChangeOrigin::Peer {
+                                    public_key: peer_public_key.to_owned(),
+                                },
+                            }) {
                                 log::error!(
-                                    "Reconciliation: failed to add file {} ({}) \
-                                     announced by {peer_name}: {error:?}; \
-                                     skipping pull",
-                                    file_id.to_string(),
-                                    logical_path
+                                    "Reconciliation: failed to enqueue catalog write for {} \
+                                     announced by {peer_name}: {error}",
+                                    file_id.to_string()
                                 );
                                 continue;
                             }
@@ -1256,6 +1293,40 @@ async fn run_peer_session<S>(
                                 start_pull(file_id, content_hash, purpose);
                             transfers.insert(transfer_id, inbound);
                         }
+
+                        // Placement sweep: for every announced file whose catalog
+                        // version already matched (so it was NOT in `wanted` and no
+                        // pull was started), ask `handle_changes` to re-run tag
+                        // placement. If a local TagBased sync directory now wants
+                        // the file but we do not hold the bytes, that fetches them
+                        // on demand — the connect-time counterpart to the live
+                        // `FileTagged` recovery path. Files we are already pulling
+                        // are skipped to avoid double-fetching.
+                        //
+                        // We deliberately hand this to `handle_changes` via the bus
+                        // rather than fetching here: the fetch floods
+                        // `FetchRequest`s and awaits `FetchFound` replies that
+                        // arrive as inbound frames on *this* session's select loop.
+                        // Awaiting inline would block that loop and deadlock the
+                        // fetch. Note: tag relationships from the peer's
+                        // `TagManifest` apply asynchronously, so files not yet
+                        // tagged are covered later by the live `FileTagged`
+                        // handler; this sweep proactively covers files already
+                        // tagged locally (e.g. from a prior session).
+                        for file_id in announced_file_ids {
+                            if pulling.contains(&file_id) {
+                                continue;
+                            }
+                            if let Err(error) = change_sender
+                                .send(DaemonMessage::ReconcilePlacement { file_id })
+                            {
+                                log::error!(
+                                    "Reconciliation: failed to enqueue placement sweep \
+                                     for {}: {error}",
+                                    file_id.to_string()
+                                );
+                            }
+                        }
                     }
                     Frame::Sync(SyncMessage::FetchRequest {
                         request_id,
@@ -1268,6 +1339,12 @@ async fn run_peer_session<S>(
                         // the bytes themselves are pulled over a transfer later.
                         let have_local =
                             local_hash_matches(&command_sender, file_id, &expected_hash).await;
+                        log::debug!(
+                            "FetchRequest from {peer_name} for {} (expected_hash {}): \
+                             have_local={have_local}",
+                            file_id.to_string(),
+                            expected_hash,
+                        );
                         pending_fetches
                             .handle_incoming_request(
                                 peer_public_key,
@@ -1400,6 +1477,17 @@ async fn run_peer_session<S>(
                             break;
                         }
                         let read_result = response.await.ok().flatten();
+                        log::debug!(
+                            "TransferStart {transfer_id} from {peer_name} for {} \
+                             (content_hash {}): local read {}",
+                            file_id.to_string(),
+                            content_hash,
+                            match &read_result {
+                                Some((_, _, local_hash)) =>
+                                    format!("hash {local_hash}"),
+                                None => "absent".to_owned(),
+                            },
+                        );
                         // Resolve who serves the bytes, in priority order:
                         //   1. a matching file in our sync directories
                         //   2. a temporary provider (a local client serving on
@@ -1415,16 +1503,28 @@ async fn run_peer_session<S>(
                             _ => None,
                         };
                         let inbound = if let Some(content) = sync_content {
+                            log::debug!(
+                                "TransferStart {transfer_id}: serving {} from a sync directory",
+                                file_id.to_string()
+                            );
                             Some(spawn_sender(transfer_id, content, our_sender.clone(), Frame::Sync))
                         } else if let Some(provider) =
                             pending_fetches.provider_for(file_id, &content_hash).await
                         {
+                            log::debug!(
+                                "TransferStart {transfer_id}: serving {} from a local provider",
+                                file_id.to_string()
+                            );
                             Some(spawn_sender(transfer_id, provider, our_sender.clone(), Frame::Sync))
                         } else {
                             pending_fetches
                                 .take_fetch_cached(file_id, &content_hash)
                                 .await
                                 .map(|content| {
+                                    log::debug!(
+                                        "TransferStart {transfer_id}: serving {} from the fetch cache",
+                                        file_id.to_string()
+                                    );
                                     spawn_sender(transfer_id, content, our_sender.clone(), Frame::Sync)
                                 })
                         };
@@ -1882,10 +1982,28 @@ async fn local_hash_matches(
     {
         return false;
     }
-    matches!(
-        response.await,
-        Ok(Some((_physical_path, _content, content_hash))) if content_hash == expected_hash
-    )
+    match response.await {
+        Ok(Some((_physical_path, _content, content_hash))) => {
+            let matches = content_hash == expected_hash;
+            if !matches {
+                log::debug!(
+                    "local_hash_matches: {} held locally but hash {} != expected {}",
+                    file_id.to_string(),
+                    content_hash,
+                    expected_hash,
+                );
+            }
+            matches
+        }
+        Ok(None) => {
+            log::debug!(
+                "local_hash_matches: {} not held in any sync directory",
+                file_id.to_string()
+            );
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Build our local tag manifest: lightweight definition entries (id +
@@ -2083,6 +2201,41 @@ fn contains_all_tags(sync_directory_tags: &[TagId], file_tags: &[TagId]) -> bool
         .all(|tag_id| file_tags.contains(tag_id))
 }
 
+/// The effective tag set to use when deciding `Create` placement for a
+/// materialized file: the union of the tags carried on the placement and the
+/// file's current tags in the database.
+///
+/// The carried tags cover a live `FileMetadataAdded` whose `FileTagged`
+/// relationships may not be applied yet; the DB tags cover a `Manifest`
+/// reconcile pull, which carries empty tags (it cannot know them at pull time)
+/// but whose `FileTagged` changes have been applied by the time the pull's
+/// `Materialize` runs. Using the union places the file correctly in both cases.
+fn effective_placement_tags(carried: &[TagId], db_tags: &[TagId]) -> Vec<TagId> {
+    let mut effective = carried.to_vec();
+    for tag_id in db_tags {
+        if !effective.contains(tag_id) {
+            effective.push(*tag_id);
+        }
+    }
+    effective
+}
+
+/// Owned data a deferred tag placement needs to fetch and materialize a file's
+/// bytes. Produced by the synchronous [`reconcile_tag_placement`] DB step and
+/// consumed by the async [`fetch_and_place_deferred`]. Deliberately holds no
+/// `!Send` `&FileDatabase` borrow so the fetch future stays `Send`.
+struct DeferredPlacement {
+    file_id: FileId,
+    logical_path: LogicalPath,
+    file_tags: Vec<TagId>,
+    /// The file's latest catalog version hash, or `None` if the file has no
+    /// recorded version (in which case there is nothing to fetch by).
+    latest_hash: Option<String>,
+    /// Resolves to `true` if the manager deferred placement (wants the file but
+    /// has no local bytes to source), `false` otherwise.
+    deferred: tokio::sync::oneshot::Receiver<bool>,
+}
+
 /// Ask the sync-directory manager to re-evaluate `file_id`'s TagBased placement
 /// against its current tag set. Called whenever the file's tags change
 /// (`FileTagged` / `FileUntagged`), so a file that gained a directory's tags is
@@ -2090,14 +2243,17 @@ fn contains_all_tags(sync_directory_tags: &[TagId], file_tags: &[TagId]) -> bool
 /// the tag-vs-content reconciliation race (see
 /// `SyncDirectoryCommand::ReconcileTagPlacement`).
 ///
-/// Reads the file's current tags and logical path from the main database and
-/// hands both to the manager. Best-effort: a file with no logical path (never
-/// added locally) or a closed command channel is logged and skipped.
+/// This is the **synchronous** DB step: it does all `&FileDatabase` reads and
+/// sends the command, returning a [`DeferredPlacement`] for the caller to
+/// `await` via [`fetch_and_place_deferred`]. Splitting it this way keeps the
+/// caller's future `Send` — no `!Send` database borrow is held across an
+/// `.await`. Returns `None` when there is nothing further to do (read error /
+/// closed channel).
 fn reconcile_tag_placement(
     command_sender: &UnboundedSender<SyncDirectoryCommand>,
     database: &FileDatabase,
     file_id: FileId,
-) {
+) -> Option<DeferredPlacement> {
     let logical_path = match database.logical_path_for_file_id(file_id) {
         Ok(logical_path) => logical_path,
         Err(error) => {
@@ -2106,7 +2262,7 @@ fn reconcile_tag_placement(
                 file_id.to_string(),
                 error
             );
-            return;
+            return None;
         }
     };
 
@@ -2118,17 +2274,162 @@ fn reconcile_tag_placement(
                 file_id.to_string(),
                 error
             );
+            return None;
+        }
+    };
+
+    // Read the latest catalog version hash now, alongside the other DB reads, so
+    // the async follow-up needs no database access (and thus no `!Send` borrow
+    // across an await). `None` = no recorded version (nothing to fetch by).
+    let latest_hash = match database.latest_version(file_id) {
+        Ok(version) => version.map(|version| version.content_hash),
+        Err(error) => {
+            log::error!(
+                "reconcile_tag_placement: failed to read latest version for {}: {:?}",
+                file_id.to_string(),
+                error
+            );
+            None
+        }
+    };
+
+    let (respond_to, deferred) = tokio::sync::oneshot::channel();
+    if let Err(error) = command_sender.send(SyncDirectoryCommand::ReconcileTagPlacement {
+        file_id,
+        logical_path: logical_path.clone(),
+        file_tags: file_tags.clone(),
+        respond_to,
+    }) {
+        log::error!(
+            "reconcile_tag_placement: command channel closed for {}: {error}",
+            file_id.to_string()
+        );
+        return None;
+    }
+
+    Some(DeferredPlacement {
+        file_id,
+        logical_path,
+        file_tags,
+        latest_hash,
+        deferred,
+    })
+}
+
+/// The async follow-up to [`reconcile_tag_placement`]. If the manager deferred
+/// placement (a TagBased directory wants the file but no local copy exists to
+/// source its bytes), fetch the bytes on demand — keyed by the file's latest
+/// catalog version hash — and enqueue a [`DaemonMessage::Materialize`] to place
+/// them. This is the fix for "adding the tags a sync directory requires doesn't
+/// pull a file that isn't local yet".
+///
+/// Takes only owned, `Send` data so the enclosing future can be spawned.
+async fn fetch_and_place_deferred(
+    pending_fetches: &PendingFetches,
+    change_sender: &UnboundedSender<DaemonMessage>,
+    placement: DeferredPlacement,
+) {
+    let DeferredPlacement {
+        file_id,
+        logical_path,
+        file_tags,
+        latest_hash,
+        deferred,
+    } = placement;
+
+    // Placement fully resolved locally (or the manager task went away): done.
+    match deferred.await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            log::warn!(
+                "reconcile_tag_placement: manager dropped responder for {}; \
+                 cannot tell if a fetch is needed",
+                file_id.to_string()
+            );
+            return;
+        }
+    }
+
+    // A TagBased directory wants this file but we hold no local copy. Fetch the
+    // bytes on demand using the file's latest catalog version hash. Because the
+    // catalog is byte-independent, this hash is present for any file we know
+    // about even though its bytes are not (yet) local.
+    let Some(expected_hash) = latest_hash else {
+        // No version has ever been recorded. Nothing to fetch by; a future
+        // announcement / materialize will place it. Soft deferral.
+        log::debug!(
+            "reconcile_tag_placement: no recorded version for {}; \
+             leaving placement for a future announcement",
+            file_id.to_string()
+        );
+        return;
+    };
+
+    // Drive the fetch directly against the fetch engine rather than routing a
+    // `DaemonMessage::Fetch` back onto the ingest bus: we are *inside* the
+    // single-threaded `handle_changes` consumer, so awaiting a reply to a
+    // message we enqueue onto our own channel would deadlock. `start_local_fetch`
+    // floods the live peer tree and resolves the oneshot when the bytes arrive.
+    log::debug!(
+        "reconcile_tag_placement: fetching {} at catalog hash {} to place it locally",
+        file_id.to_string(),
+        expected_hash,
+    );
+    let (fetch_respond, fetch_result) = tokio::sync::oneshot::channel();
+    pending_fetches
+        .start_local_fetch(file_id, expected_hash.clone(), fetch_respond)
+        .await;
+
+    let content = match fetch_result.await {
+        Ok(Ok(content)) => {
+            log::debug!(
+                "reconcile_tag_placement: fetch of {} succeeded; materializing",
+                file_id.to_string()
+            );
+            content
+        }
+        Ok(Err(error)) => {
+            // No peer had the bytes (or it timed out). Soft deferral: a later
+            // reconnect / announcement retries placement.
+            log::debug!(
+                "reconcile_tag_placement: fetch of {} failed ({error:?}); \
+                 placement deferred until a peer can serve it",
+                file_id.to_string()
+            );
+            return;
+        }
+        Err(_) => {
+            log::warn!(
+                "reconcile_tag_placement: fetch engine dropped responder for {}",
+                file_id.to_string()
+            );
             return;
         }
     };
 
-    if let Err(error) = command_sender.send(SyncDirectoryCommand::ReconcileTagPlacement {
+    // Place the fetched bytes via the normal materialize pipeline, which creates
+    // the file in every matching sync directory (tag-filtered). Fire-and-forget
+    // onto our own bus: processed on a later loop iteration, so this does not
+    // block or deadlock the current one.
+    if let Err(error) = change_sender.send(DaemonMessage::Materialize {
         file_id,
-        logical_path,
-        file_tags,
+        content,
+        content_hash: expected_hash,
+        // Bytes sourced by our own on-demand fetch, not a specific announcing
+        // peer. `Materialize` no longer records a version or forwards, so the
+        // origin is only a sentinel here.
+        origin: ChangeOrigin::Local {
+            directory_path: std::path::PathBuf::new(),
+        },
+        placement: bus::MaterializePlacement::Create {
+            logical_path,
+            tags: file_tags,
+        },
     }) {
         log::error!(
-            "reconcile_tag_placement: command channel closed for {}: {error}",
+            "reconcile_tag_placement: change channel closed; cannot materialize \
+             fetched bytes for {}: {error}",
             file_id.to_string()
         );
     }
@@ -2146,6 +2447,7 @@ async fn handle_changes(
     pending_fetches: PendingFetches,
     mut database: FileDatabase,
     mut change_receiver: tokio::sync::mpsc::UnboundedReceiver<DaemonMessage>,
+    change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
     event_sender: tokio::sync::broadcast::Sender<Change>,
     shutdown: CancellationToken,
@@ -2235,13 +2537,31 @@ async fn handle_changes(
                 let _ = command_sender.send(target.into_command(content));
             }
             _ => {
-                // Multiple destinations: a destructive move can be honored only
-                // once, so hand every directory a copy instead. If the intent
-                // was to move (source should not survive), remove the source
-                // after dispatching all copies.
-                for target in targets {
+                // Multiple destinations. A destructive move can be honored by
+                // exactly one consumer, so give the earlier targets a
+                // `FileToCopy` and the LAST target a `FileToMove` (when the
+                // source may be discarded), consuming the source.
+                //
+                // We must NOT eagerly delete the move source here: `CreateFile`
+                // commands are processed asynchronously by the sync-directory
+                // manager, so a delete issued now would race ahead of the copies
+                // and leave them reading a missing file (observed as
+                // `FailedAddingFile`, dropping the file everywhere). Commands are
+                // processed in FIFO order, so the copies read the source while it
+                // still exists and the trailing move consumes it last. If the
+                // content was not a move (`FileToCopy`/`InMemory`), no consumer
+                // deletes the source and the producer keeps ownership.
+                let target_count = targets.len();
+                for (index, target) in targets.into_iter().enumerate() {
+                    let is_last = index + 1 == target_count;
                     let per_dir = match &source_path {
-                        Some(path) => FileBytes::FileToCopy(path.clone()),
+                        Some(path) => {
+                            if is_last && move_intent {
+                                FileBytes::FileToMove(path.clone())
+                            } else {
+                                FileBytes::FileToCopy(path.clone())
+                            }
+                        }
                         // No backing path => in-memory: clone the buffer.
                         None => match &content {
                             FileBytes::InMemory(bytes) => FileBytes::InMemory(bytes.clone()),
@@ -2250,16 +2570,6 @@ async fn handle_changes(
                         },
                     };
                     let _ = command_sender.send(target.into_command(per_dir));
-                }
-
-                if move_intent
-                    && let Some(path) = &source_path
-                    && let Err(error) = tokio::fs::remove_file(path).await
-                {
-                    log::warn!(
-                        "Failed to remove move source {} after fan-out: {error}",
-                        path.display()
-                    );
                 }
             }
         }
@@ -2309,10 +2619,6 @@ async fn handle_changes(
                         return;
                     }
 
-                    // NOTE: We intentionally do NOT apply `tags` here anymore.
-                    // File-tag relationships reconcile through their own tag
-                    // manifest. `tags` is retained for local dispatch filtering
-                    // below only.
                     if let Err(error) = database.record_version(
                         file_id,
                         &content_hash,
@@ -2323,6 +2629,47 @@ async fn handle_changes(
                             file_id.to_string(),
                             error
                         );
+                    }
+
+                    // Apply the carried tags for a *locally*-ingested file.
+                    //
+                    // A local `FileAdded` from a TagBased directory carries that
+                    // directory's required tags: they are the ground truth for
+                    // this new file and must become real file-tag relationships,
+                    // both persisted here and propagated to peers as
+                    // `FileTagged` changes (so the relationship reconciles the
+                    // same way an API `tag_file` would). Peer-originated adds are
+                    // NOT tagged here — their relationships arrive via their own
+                    // tag manifest / `FileTagged` changes, so applying `tags`
+                    // again would restamp `modified_at` and clobber LWW state.
+                    //
+                    // `tags` is also used below for local dispatch filtering.
+                    if let ChangeOrigin::Local { .. } = &change_origin {
+                        for tag_id in &tags {
+                            let modified_at = database::now_millis();
+                            if let Err(error) = database.tag_file(*tag_id, file_id, modified_at) {
+                                log::error!(
+                                    "Failed to tag locally-added file {} with {}: {:?}",
+                                    file_id.to_string(),
+                                    tag_id.to_string(),
+                                    error
+                                );
+                                continue;
+                            }
+
+                            forward_to_peers(
+                                configuration,
+                                runtime_configuration,
+                                &Change::FileTagged {
+                                    file_id,
+                                    tag_id: *tag_id,
+                                    metadata: None,
+                                    modified_at,
+                                },
+                                &change_origin,
+                            )
+                            .await;
+                        }
                     }
 
                     let mut targets = Vec::new();
@@ -2628,6 +2975,51 @@ async fn handle_changes(
 
                 continue;
             }
+            DaemonMessage::ReconcilePlacement { file_id } => {
+                // Connect-time placement sweep, handed off from a peer session so
+                // the fetch runs here (not on the session's frame loop). If a
+                // TagBased sync directory wants this file but we lack its bytes,
+                // fetch them on demand and place them.
+                if let Some(deferred) = reconcile_tag_placement(&command_sender, &database, file_id)
+                {
+                    fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                }
+                continue;
+            }
+            DaemonMessage::CatalogFile {
+                file_id,
+                logical_path,
+                content_hash,
+                origin,
+            } => {
+                // A peer session's `Manifest` reconciliation decided to catalog
+                // this file/version. We are the sole main-DB writer, so the
+                // write happens here. Insert the `files` row if new, then append
+                // the version (byte-independent catalog; the bytes are pulled
+                // separately on the session link).
+                if !database.file_exists(file_id).unwrap_or(false) {
+                    if let Err(error) = database.add_file(file_id, &logical_path) {
+                        log::error!(
+                            "CatalogFile: failed to add file {} ({}): {:?}; \
+                             skipping version record",
+                            file_id.to_string(),
+                            logical_path,
+                            error
+                        );
+                        continue;
+                    }
+                }
+                if let Err(error) =
+                    database.record_version(file_id, &content_hash, version_origin(&origin))
+                {
+                    log::error!(
+                        "CatalogFile: failed to record version for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                }
+                continue;
+            }
             DaemonMessage::Materialize {
                 file_id,
                 content,
@@ -2635,44 +3027,56 @@ async fn handle_changes(
                 origin,
                 placement,
             } => {
-                // Bytes arrived over a peer transfer. Record the version *now*
-                // (so `file_versions` reflects only what we actually hold), then
-                // dispatch to the matching sync directories per `placement`.
+                // Bytes arrived over a peer transfer. The version was already
+                // recorded into the catalog when the triggering announcement was
+                // handled (`FileMetadataAdded`/`Changed` or `Manifest`
+                // reconcile), so we do NOT record it here — `Materialize` is now
+                // purely about placing the bytes into matching sync directories.
+                // Forwarding to peers likewise already happened at announce time.
                 log::debug!(
                     "Materializing received content for {} ({})",
                     file_id.to_string(),
                     content_hash
                 );
-                if let Err(error) =
-                    database.record_version(file_id, &content_hash, version_origin(&origin))
-                {
-                    log::error!(
-                        "Materialize: failed to record version for {}: {:?}",
-                        file_id.to_string(),
-                        error
-                    );
-                }
 
-                // Build the local placement targets *and* the metadata-only wire
-                // `Change` to relay onward. We announce to other peers only here,
-                // once the bytes are actually in hand — not when the originating
-                // announcement first arrived. This is what makes a relay node
-                // (e.g. a central hub) propagate a file it acquired by pull to
-                // its *other* peers: `forward_to_peers` skips `origin`, so the
-                // announcement flows down the tree away from where we pulled it,
-                // and every downstream peer that pulls from us finds we can
-                // actually serve the bytes (announce-after-you-have-it).
-                let (targets, wire_change) = match placement {
+                // Build the local placement targets for the arrived bytes.
+                let targets = match placement {
                     bus::MaterializePlacement::Create { logical_path, tags } => {
                         // New file: create it in every matching sync directory,
                         // deriving each directory's physical path from the
                         // logical path.
+                        //
+                        // Tag-filter using the *union* of the carried tags and
+                        // the file's current DB tags. The carried tags cover a
+                        // live `FileMetadataAdded` (whose `FileTagged`
+                        // relationships may not be applied yet); the DB tags
+                        // cover a `Manifest` reconcile pull, which carries empty
+                        // tags because it cannot know them at pull time — but by
+                        // the time this `Materialize` runs, the `TagManifest`'s
+                        // `FileTagged` changes have been applied (they are
+                        // enqueued before the pull's transfer completes), so the
+                        // DB has them. Without this, reconcile-pulled files
+                        // matched no TagBased directory and were dropped.
+                        let db_tags = database
+                            .tag_ids_for_file(file_id, database::SubtagRule::Exclude)
+                            .map(|iter| iter.into_iter().collect::<Vec<TagId>>())
+                            .unwrap_or_else(|error| {
+                                log::error!(
+                                    "Materialize: failed to read tags for {}: {:?}; \
+                                     using carried tags only",
+                                    file_id.to_string(),
+                                    error
+                                );
+                                Vec::new()
+                            });
+                        let effective_tags = effective_placement_tags(&tags, &db_tags);
+
                         let mut targets = Vec::new();
                         for sync_directory in &configuration.sync_directories {
                             if let SyncType::TagBased {
                                 tags: sync_directory_tags,
                             } = &sync_directory.sync_type
-                                && !contains_all_tags(sync_directory_tags, &tags)
+                                && !contains_all_tags(sync_directory_tags, &effective_tags)
                             {
                                 continue;
                             }
@@ -2685,13 +3089,7 @@ async fn handle_changes(
                                 sync_directory_path: sync_directory.path.clone(),
                             });
                         }
-                        let wire_change = Change::FileMetadataAdded {
-                            file_id,
-                            logical_path,
-                            content_hash: content_hash.clone(),
-                            tags,
-                        };
-                        (targets, wire_change)
+                        targets
                     }
                     bus::MaterializePlacement::Change => {
                         // Existing file: overwrite it in the sync directories
@@ -2712,23 +3110,14 @@ async fn handle_changes(
                         let sentinel = ChangeOrigin::Local {
                             directory_path: std::path::PathBuf::new(),
                         };
-                        let targets =
-                            change_targets(&configuration, &sentinel, file_id, &file_tags);
-                        let wire_change = Change::FileMetadataChanged {
-                            file_id,
-                            content_hash: content_hash.clone(),
-                        };
-                        (targets, wire_change)
+                        change_targets(&configuration, &sentinel, file_id, &file_tags)
                     }
                 };
                 dispatch_content_to_sync_directories(&command_sender, targets, content).await;
-                forward_to_peers(
-                    &configuration,
-                    &runtime_configuration,
-                    &wire_change,
-                    &origin,
-                )
-                .await;
+                // No `forward_to_peers` here: the announcement was already
+                // forwarded when it was first handled (announce time). `origin`
+                // is unused now that we neither record nor re-announce here.
+                let _ = origin;
                 continue;
             }
             DaemonMessage::AnnounceProvided {
@@ -2807,19 +3196,20 @@ async fn handle_changes(
         match &change {
             // A metadata-only `FileMetadataAdded` announcement — always from a
             // peer (local ingestion carries bytes and arrives as
-            // `Ingest::Content`). Record the file + version; the bytes are
-            // pulled separately.
+            // `Ingest::Content`). Record the file + version into the catalog and
+            // forward onward; the bytes are pulled separately (and may never be
+            // pulled at all if no local sync directory wants them).
             Change::FileMetadataAdded {
                 file_id,
                 logical_path,
                 content_hash,
                 tags,
             } => {
-                // Metadata-only announcement from a peer. Insert the `files` row
-                // (so we know the file's logical identity) but DO NOT record the
-                // version yet — the version is recorded only once we have the
-                // bytes (in `Materialize`), so `file_versions` reflects what we
-                // actually hold and reconciliation can re-request otherwise.
+                // Metadata-only announcement from a peer. `file_versions` is the
+                // byte-independent *catalog* of versions we know exist in the
+                // network — NOT a record of bytes we hold (that is the
+                // per-sync-directory databases). So we record the version here,
+                // on announcement, regardless of whether we ever pull the bytes.
                 let already_exists = database.file_exists(*file_id).unwrap_or_else(|error| {
                     log::error!(
                         "file_exists check failed for {}: {:?}; assuming new",
@@ -2840,10 +3230,10 @@ async fn handle_changes(
                         continue;
                     }
                 } else {
-                    // As in `FileMetadataChanged`: skip only if this is the
-                    // version we *currently* hold (latest), not merely present
-                    // somewhere in history. A revert to an older hash must still
-                    // be pulled and materialized as a new version.
+                    // Skip only if this is the version we already hold as latest
+                    // in the catalog, not merely present somewhere in history: a
+                    // revert to an older hash is a genuine new version and must
+                    // be appended (and its bytes re-pulled where wanted).
                     let current_hash = database
                         .latest_version(*file_id)
                         .ok()
@@ -2866,14 +3256,35 @@ async fn handle_changes(
                     }
                 }
 
-                // Trigger a byte pull from the announcing peer. The version is
-                // recorded when the transfer completes (`Materialize`), which is
-                // also where we relay this announcement onward to our *other*
-                // peers — announce-after-you-have-the-bytes, so a downstream peer
-                // that pulls from us finds we can actually serve it. We do NOT
-                // forward here: forwarding before the pull completes would let a
-                // downstream peer `TransferStart` against us before we hold the
-                // bytes, forcing an abort with no retry until reconnect.
+                // Record the version into the catalog now, on announcement.
+                if let Err(error) =
+                    database.record_version(*file_id, content_hash, version_origin(&change_origin))
+                {
+                    log::error!(
+                        "FileMetadataAdded: failed to record version for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                }
+
+                // Forward the announcement to our other peers immediately so the
+                // catalog propagates across the whole tree, independent of
+                // whether we pull the bytes. A downstream peer that then
+                // `TransferStart`s against us before (or without) us holding the
+                // bytes gets a graceful `TransferAbort` and fetches elsewhere /
+                // on demand.
+                forward_to_peers(
+                    &configuration,
+                    &runtime_configuration,
+                    &change,
+                    &change_origin,
+                )
+                .await;
+
+                // Trigger a byte pull from the announcing peer to place the file
+                // into any matching local sync directory. If none matches, the
+                // pull still runs today but the bytes are dropped at placement;
+                // that is optimized separately.
                 request_pull_from_origin(
                     &runtime_configuration,
                     &change_origin,
@@ -2887,20 +3298,18 @@ async fn handle_changes(
                 .await;
             }
             // A metadata-only `FileMetadataChanged` announcement — always from a
-            // peer. Pull the new bytes; version recorded on materialization.
+            // peer. Record the new version into the catalog and forward it; pull
+            // the bytes where a local sync directory wants them.
             Change::FileMetadataChanged {
                 file_id,
                 content_hash,
             } => {
-                // Skip the pull only if this hash is the version we *currently*
-                // hold — i.e. the latest recorded version. It is NOT enough for
-                // the hash to appear somewhere in history: we keep only the
-                // newest version's bytes on disk, so a revert back to an older
-                // hash (which is in history but is not current) is a genuine new
-                // change we must pull and materialize as a new version. Checking
-                // the whole history here silently kept the wrong bytes on disk
-                // AND, because no pull fired, never released the CLI provider
-                // (edit hung forever).
+                // Skip only if this hash is already our latest catalog version.
+                // It is NOT enough for the hash to appear somewhere in history: a
+                // revert back to an older hash (present in history but not the
+                // latest) is a genuine new version we must append (and re-pull
+                // the bytes for where wanted). A whole-history check here
+                // previously kept the wrong bytes on disk and hung `edit`.
                 let current_hash = database
                     .latest_version(*file_id)
                     .ok()
@@ -2911,10 +3320,8 @@ async fn handle_changes(
                         "Ignoring no-op FileMetadataChanged for {} (already the current version)",
                         file_id.to_string()
                     );
-                    // We already hold these exact bytes as the current version,
-                    // so no pull will fire (and thus no `Materialize` to relay
-                    // from). Announce onward here so the change still propagates
-                    // the tree.
+                    // Already our latest catalog version. Announce onward so the
+                    // change still propagates the tree.
                     forward_to_peers(
                         &configuration,
                         &runtime_configuration,
@@ -2923,9 +3330,32 @@ async fn handle_changes(
                     )
                     .await;
                 } else {
-                    // Pull the new bytes; the relay to our other peers happens in
-                    // `Materialize` once we actually hold them (announce-after-
-                    // you-have-it), not here.
+                    // Record the new version into the catalog now, on
+                    // announcement (independent of whether we pull the bytes).
+                    if let Err(error) = database.record_version(
+                        *file_id,
+                        content_hash,
+                        version_origin(&change_origin),
+                    ) {
+                        log::error!(
+                            "FileMetadataChanged: failed to record version for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                    }
+
+                    // Forward immediately so the catalog propagates tree-wide
+                    // regardless of whether we pull the bytes.
+                    forward_to_peers(
+                        &configuration,
+                        &runtime_configuration,
+                        &change,
+                        &change_origin,
+                    )
+                    .await;
+
+                    // Pull the new bytes to update any local sync directory that
+                    // holds this file.
                     request_pull_from_origin(
                         &runtime_configuration,
                         &change_origin,
@@ -3194,8 +3624,13 @@ async fn handle_changes(
                 // materialized there. This is also the recovery path for the
                 // tag-vs-content reconciliation race (a peer transfer that
                 // materialized before this `FileTagged` arrived placed the file
-                // only where tags already matched). Re-run placement now.
-                reconcile_tag_placement(&command_sender, &database, *file_id);
+                // only where tags already matched). Re-run placement now, and if
+                // the bytes are not local, fetch them.
+                if let Some(deferred) =
+                    reconcile_tag_placement(&command_sender, &database, *file_id)
+                {
+                    fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                }
 
                 forward_to_peers(
                     &configuration,
@@ -3230,8 +3665,13 @@ async fn handle_changes(
 
                 // The file's tag set changed: a file that just lost a
                 // directory's tags should be dropped from it. Re-run placement
-                // (symmetric with `FileTagged`).
-                reconcile_tag_placement(&command_sender, &database, *file_id);
+                // (symmetric with `FileTagged`). A removal never defers, but use
+                // the same two-step API for consistency.
+                if let Some(deferred) =
+                    reconcile_tag_placement(&command_sender, &database, *file_id)
+                {
+                    fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                }
 
                 forward_to_peers(
                     &configuration,
@@ -3405,5 +3845,37 @@ mod reconcile_tests {
             "known file placement must be Change, got {:?}",
             wanted[0].placement
         );
+    }
+
+    /// A reconcile pull carries empty tags, but by the time it materializes the
+    /// file's tags are in the DB (applied from the TagManifest). The effective
+    /// placement tags must include the DB tags so the file lands in its matching
+    /// TagBased directories on the first materialize (the first-connect fix).
+    #[test]
+    fn effective_tags_include_db_tags_when_carried_is_empty() {
+        let db_a = TagId::new();
+        let db_b = TagId::new();
+
+        let effective = effective_placement_tags(&[], &[db_a, db_b]);
+
+        assert!(effective.contains(&db_a));
+        assert!(effective.contains(&db_b));
+        assert_eq!(effective.len(), 2);
+    }
+
+    /// The carried tags (from a live `FileMetadataAdded`) are preserved even if
+    /// the DB has none yet, and the union deduplicates overlap.
+    #[test]
+    fn effective_tags_union_dedups_carried_and_db() {
+        let shared = TagId::new();
+        let carried_only = TagId::new();
+        let db_only = TagId::new();
+
+        let effective = effective_placement_tags(&[shared, carried_only], &[shared, db_only]);
+
+        assert!(effective.contains(&shared));
+        assert!(effective.contains(&carried_only));
+        assert!(effective.contains(&db_only));
+        assert_eq!(effective.len(), 3, "shared tag must not be duplicated");
     }
 }

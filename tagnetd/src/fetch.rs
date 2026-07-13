@@ -249,12 +249,25 @@ impl PendingFetches {
     ) {
         let peers = self.connected_peers(None).await;
         if peers.is_empty() {
+            log::debug!(
+                "start_local_fetch: {} (hash {}): no connected peers; reporting NotAvailable",
+                file_id.to_string(),
+                expected_hash,
+            );
             let _ = respond_to.send(Err(FetchError::NotAvailable));
             return;
         }
 
         let request_id = RequestId::new();
         let children: HashSet<String> = peers.iter().map(|peer| peer.public_key.clone()).collect();
+
+        log::debug!(
+            "start_local_fetch: {} (hash {}) as request {request_id}; flooding to {} peer(s): {:?}",
+            file_id.to_string(),
+            expected_hash,
+            children.len(),
+            children,
+        );
 
         {
             let mut table = self.inner.lock().await;
@@ -298,6 +311,12 @@ impl PendingFetches {
         have_local: bool,
     ) {
         if have_local {
+            log::debug!(
+                "handle_incoming_request: request {request_id} for {} from {}: \
+                 have it locally; answering FetchFound",
+                file_id.to_string(),
+                from_public_key,
+            );
             let content_hash = expected_hash.clone();
             if let Some(sender) = self.peer_outbound(from_public_key).await {
                 let _ = sender.send(Frame::Sync(SyncMessage::FetchFound {
@@ -311,6 +330,12 @@ impl PendingFetches {
 
         let peers = self.connected_peers(Some(from_public_key)).await;
         if peers.is_empty() {
+            log::debug!(
+                "handle_incoming_request: request {request_id} for {} from {}: \
+                 not local and no other peers to relay to; answering FetchMissing",
+                file_id.to_string(),
+                from_public_key,
+            );
             if let Some(sender) = self.peer_outbound(from_public_key).await {
                 let _ = sender.send(Frame::Sync(SyncMessage::FetchMissing { request_id }));
             }
@@ -318,6 +343,14 @@ impl PendingFetches {
         }
 
         let children: HashSet<String> = peers.iter().map(|peer| peer.public_key.clone()).collect();
+        log::debug!(
+            "handle_incoming_request: request {request_id} for {} from {}: \
+             not local; relaying to {} other peer(s): {:?}",
+            file_id.to_string(),
+            from_public_key,
+            children.len(),
+            children,
+        );
         {
             let mut table = self.inner.lock().await;
             // A duplicate request_id (would only happen on a cyclic graph, which
@@ -360,7 +393,15 @@ impl PendingFetches {
             let mut table = self.inner.lock().await;
             table.remove(&request_id)
         };
-        let entry = entry?;
+        let Some(entry) = entry else {
+            log::debug!(
+                "handle_incoming_found: FetchFound for {} from {} but no pending entry \
+                 (late duplicate or already resolved); ignoring",
+                file_id.to_string(),
+                from_public_key,
+            );
+            return None;
+        };
 
         // Defensive: only accept an answer matching what this request expected.
         if content_hash != entry.expected_hash {
@@ -372,6 +413,13 @@ impl PendingFetches {
             );
             return None;
         }
+
+        log::debug!(
+            "handle_incoming_found: request {request_id} for {} answered by {}; \
+             opening receiver transfer",
+            file_id.to_string(),
+            from_public_key,
+        );
 
         let then = match entry.reply_to {
             ReplyTarget::Local(sender) => FoundThen::DeliverLocal(sender),
@@ -400,13 +448,26 @@ impl PendingFetches {
             match table.get_mut(&request_id) {
                 Some(entry) => {
                     entry.children_outstanding.remove(from_public_key);
+                    log::debug!(
+                        "handle_incoming_missing: {} reported missing for request {request_id}; \
+                         {} child(ren) still outstanding",
+                        from_public_key,
+                        entry.children_outstanding.len(),
+                    );
                     if entry.children_outstanding.is_empty() {
                         table.remove(&request_id)
                     } else {
                         None
                     }
                 }
-                None => None,
+                None => {
+                    log::debug!(
+                        "handle_incoming_missing: {} reported missing for request {request_id} \
+                         but no pending entry (already resolved); ignoring",
+                        from_public_key,
+                    );
+                    None
+                }
             }
         };
 
