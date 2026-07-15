@@ -21,9 +21,6 @@ class _PendingBootstrap extends TagnetBootstrap {
 void main() {
   testWidgets('app renders initial status', (WidgetTester tester) async {
     await tester.pumpWidget(TagnetApp(bootstrap: _PendingBootstrap()));
-    expect(
-      find.text('starting... — 0 file(s), 0 tag(s)'),
-      findsOneWidget,
-    );
+    expect(find.text('tagnet'), findsOneWidget);
   });
 }

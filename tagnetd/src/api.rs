@@ -33,7 +33,7 @@ use tagnet_core::{
 use tokio::sync::{broadcast, mpsc::UnboundedSender, oneshot};
 
 use crate::bus::{DaemonMessage, FetchError, Ingest};
-use crate::database::{DatabaseError, FileDatabase, SubtagRule, Tag};
+use crate::database::{DatabaseError, FileDatabase, QueryTerm, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
 use crate::transfer::ChunkSource;
@@ -112,6 +112,19 @@ impl From<FetchError> for ApiError {
             }
         }
     }
+}
+
+/// The result of a [`Api::run_query`]: the files and tags matching a query.
+///
+/// Both lists are matched by the same conjunction of query terms (see
+/// [`Api::run_query`]); files by their tags/logical path and tags by their
+/// place in the tag hierarchy / their name. Full rows (not bare ids) are
+/// returned so callers can render results without a second listing round-trip —
+/// the daemon does the id→row join once, over just the matched set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryResult {
+    pub files: Vec<FileInfo>,
+    pub tags: Vec<Tag>,
 }
 
 /// A live update delivered on the API event stream (plan 5.5).
@@ -213,19 +226,6 @@ impl Api {
 
     // --- Read API (plan 5.3) -------------------------------------------------
 
-    /// List all tags. Backed by `FileDatabase::get_all_tags`.
-    pub fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
-        let database = self.open_read()?;
-        Ok(database.get_all_tags()?.into_iter().collect())
-    }
-
-    /// List every currently-known file with its latest version info. Backed by
-    /// `FileDatabase::get_all_files`.
-    pub fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
-        let database = self.open_read()?;
-        Ok(database.get_all_files()?)
-    }
-
     /// Resolve a full-or-short file id `prefix` (as displayed by `list_files`'s
     /// short ids, or a pasted full id) to a single [`FileId`]. Backed by
     /// `FileDatabase::resolve_file_id_prefix`.
@@ -263,19 +263,113 @@ impl Api {
             .collect())
     }
 
-    /// List the files carrying `tag_id`. This is the v1 "search": single-tag
-    /// only. `subtag_rule` controls hierarchy traversal. Backed by
-    /// `FileDatabase::file_ids_for_tag`.
-    pub fn files_for_tag(
+    /// Run a free-form query and return both the matching files and tags.
+    ///
+    /// The query is a whitespace-separated list of terms, combined
+    /// conjunctively (a result must satisfy every term):
+    ///
+    /// - `$name` — require the tag whose id/name resolves from `name` (a full or
+    ///   short tag-id prefix). A file matches if it carries the tag; a tag
+    ///   matches if it is a subtag of it.
+    /// - `!name` or `!$name` — exclude that tag (the negation of the above).
+    /// - any other token — a case-insensitive substring match against the
+    ///   file's logical path / the tag's name.
+    ///
+    /// Tag tokens are resolved to [`TagId`]s here, in the daemon, so clients can
+    /// pass the raw string straight through. An unresolvable/ambiguous tag token
+    /// surfaces as [`ApiError::NotFound`] / [`ApiError::Ambiguous`]. An empty
+    /// query matches everything. `subtag_rule` controls hierarchy traversal for
+    /// the tag terms.
+    ///
+    /// Returns full [`FileInfo`]/[`Tag`] rows (not bare ids): the daemon joins
+    /// each matched id to its row here, over just the result set, so callers
+    /// render directly without a second whole-store listing. Backed by
+    /// `FileDatabase::file_ids_for_query`/`tag_ids_for_query` plus
+    /// `file_info_from_id`/`tag_from_id`.
+    pub fn run_query(
         &self,
-        tag_id: TagId,
+        query: &str,
         subtag_rule: SubtagRule,
-    ) -> Result<Vec<FileId>, ApiError> {
+    ) -> Result<QueryResult, ApiError> {
         let database = self.open_read()?;
-        Ok(database
-            .file_ids_for_tag(tag_id, subtag_rule)?
-            .into_iter()
-            .collect())
+        let terms = Self::parse_query(&database, query)?;
+
+        // A matched id may not resolve to a full listable row: `file_ids_for_query`
+        // draws file ids from the tag `entries` table, which can reference a file
+        // that has no `file_versions` row yet (tagged before its content
+        // materialized). Such a file is not listable, so skip it rather than
+        // failing the whole query with `NotFound`. Same tolerance for tags.
+        let mut files = Vec::new();
+        for file_id in database.file_ids_for_query(&terms, subtag_rule)? {
+            match database.file_info_from_id(file_id) {
+                Ok(file) => files.push(file),
+                Err(DatabaseError::MissingFile) => {}
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        let mut tags = Vec::new();
+        for tag_id in database.tag_ids_for_query(&terms, subtag_rule)? {
+            match database.tag_from_id(tag_id) {
+                Ok(tag) => tags.push(tag),
+                Err(DatabaseError::MissingTag) => {}
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        Ok(QueryResult { files, tags })
+    }
+
+    /// Get a single file's [`FileInfo`] by id, or [`ApiError::NotFound`] if no
+    /// such file exists. The by-id read that replaces scanning a full listing
+    /// (used by `tagnet edit`/`download` to find one file's metadata). Backed by
+    /// `FileDatabase::file_info_from_id`.
+    pub fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
+        let database = self.open_read()?;
+        Ok(database.file_info_from_id(file_id)?)
+    }
+
+    /// Get a single tag by id, or [`ApiError::NotFound`] if no such tag exists.
+    /// Backed by `FileDatabase::tag_from_id`.
+    pub fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
+        let database = self.open_read()?;
+        Ok(database.tag_from_id(tag_id)?)
+    }
+
+    /// Parse a free-form query string into resolved [`QueryTerm`]s.
+    ///
+    /// Splits on ASCII whitespace and classifies each token by its leading
+    /// sigil (`$` = require tag, `!` = exclude tag, otherwise a name substring).
+    /// Tag tokens are expanded to the *set* of matching tags via
+    /// `tag_ids_matching_token` (name substring OR id prefix). Empty tag tokens
+    /// (a bare `$` or `!`) are rejected as invalid; a token that simply matches
+    /// no tag yields an empty set, which the query treats as "matches no tag"
+    /// rather than an error.
+    fn parse_query(database: &FileDatabase, query: &str) -> Result<Vec<QueryTerm>, ApiError> {
+        let mut terms = Vec::new();
+        for token in query.split_whitespace() {
+            let term = if let Some(rest) = token.strip_prefix('!') {
+                // `!$foo` and `!foo` both mean "exclude tags matching foo".
+                let name = rest.strip_prefix('$').unwrap_or(rest);
+                if name.is_empty() {
+                    return Err(ApiError::InvalidArgument(
+                        "empty tag in '!' term".to_owned(),
+                    ));
+                }
+                QueryTerm::NotTag(database.tag_ids_matching_token(name)?)
+            } else if let Some(name) = token.strip_prefix('$') {
+                if name.is_empty() {
+                    return Err(ApiError::InvalidArgument(
+                        "empty tag in '$' term".to_owned(),
+                    ));
+                }
+                QueryTerm::HasTag(database.tag_ids_matching_token(name)?)
+            } else {
+                QueryTerm::NameContains(token.to_owned())
+            };
+            terms.push(term);
+        }
+        Ok(terms)
     }
 
     /// List the subtags of `tag_id` (its children in the tag hierarchy).

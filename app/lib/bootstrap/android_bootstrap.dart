@@ -27,9 +27,26 @@ class AndroidBootstrap extends TagnetBootstrap {
 
     // App-private storage: inotify works here with no storage permission
     // (plan section 8). getFilesDir() maps to getApplicationSupportDirectory.
+    // Identity + per-directory DBs live here (not meant to be user-browsable).
     final dir = await getApplicationSupportDirectory();
     final dataDir = dir.path;
     final identityFile = '$dataDir/identity.key';
+
+    // Shared external storage. The engine's authoritative config is built by
+    // the Android foreground service (TagnetService.kt), which resolves the
+    // public Documents directory and points the sync dir at Documents/tagnet so
+    // it is browsable in the Files app. path_provider has no shared-Documents
+    // API, so we mirror that well-known location here for the (dev-only) case
+    // where the Dart side starts the engine. Writing here needs "All files
+    // access", which MainActivity gates the service start on. Falls back to
+    // app-specific external storage if the shared path can't be derived.
+    final externalDir = await getExternalStorageDirectory();
+    // getExternalStorageDirectory() -> /storage/emulated/0/Android/data/<pkg>/files
+    // The shared Documents dir is /storage/emulated/0/Documents.
+    final externalPath = externalDir?.path;
+    final syncRoot = externalPath != null && externalPath.contains('/Android/data/')
+        ? '${externalPath.split('/Android/data/').first}/Documents'
+        : dataDir;
 
     // ---- HARDCODED POC CONFIG (edit this to connect to a peer) --------------
     //
@@ -52,9 +69,22 @@ class AndroidBootstrap extends TagnetBootstrap {
     // The Rust side generates THIS device's identity on first launch; its
     // public key is logged to logcat (`adb logcat -s tagnet`) — hand that to
     // the peer so it can add this phone to its own config.
+    // Browsable sync directory: Documents/phone, shown in the Files app.
+    // Created by the engine on startup (SyncDirectoryManager does
+    // create_dir_all). Kept in sync with TagnetService.kt.
+
     final configJson = '''
 {
-  "sync_directories": [],
+  "sync_directories": [
+    {
+      "path": "$syncRoot/phone",
+      "sync_type": { "TagBased": { "tags": ["467f35d7ae6f4dffb72905ff2bc743c5"] } }
+    },
+    {
+      "path": "$syncRoot/audiobooks",
+      "sync_type": { "TagBased": { "tags": ["b053c022c8a6432eb88acb0452abceb2"] } }
+    }
+  ],
   "listen_port": null,
   "peers": [
     {

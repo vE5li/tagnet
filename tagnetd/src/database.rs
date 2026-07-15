@@ -47,6 +47,27 @@ pub enum SubtagRule {
     Exclude,
 }
 
+/// A single clause of a file search (see [`FileDatabase::file_ids_for_query`]).
+///
+/// Terms are combined conjunctively: a file matches a query only if it matches
+/// *every* term.
+///
+/// A single `$foo`/`!foo` token can match a *set* of tags (every tag whose name
+/// contains `foo` or whose id starts with `foo`), so the tag terms carry a
+/// resolved [`TagId`] set rather than a single id; the set is expanded from the
+/// user's syntax in a higher layer (the daemon's API), keeping this database
+/// primitive free of name/prefix-resolution concerns. An empty set matches no
+/// tag (so `HasTag([])` matches no file and `NotTag([])` excludes nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTerm {
+    /// The file must carry *at least one* tag in this set.
+    HasTag(Vec<TagId>),
+    /// The file must carry *none* of the tags in this set.
+    NotTag(Vec<TagId>),
+    /// The file's logical path must contain this substring (case-insensitive).
+    NameContains(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryType {
     File,
@@ -225,8 +246,7 @@ impl FileDatabase {
                 // `logical_path` is the file's logical identity: its
                 // human-readable path/name (possibly nested, e.g.
                 // `foo/bar/name.txt`), independent of where any individual sync
-                // directory stores the bytes on disk. This is what `list_files`
-                // reports and what is advertised to peers. Contrast with
+                // directory stores the bytes on disk. Contrast with
                 // `SyncDirectoryDatabase.files.physical_path`, which is the
                 // on-disk location within a particular sync directory.
                 "CREATE TABLE IF NOT EXISTS files (
@@ -1184,6 +1204,176 @@ impl FileDatabase {
         Ok(file_ids)
     }
 
+    /// Search files by a conjunction of [`QueryTerm`]s.
+    ///
+    /// A file is returned only if it satisfies every term:
+    /// - [`QueryTerm::HasTag`]: it carries *at least one* tag in the set (subtag
+    ///   traversal governed by `subtag_rule`).
+    /// - [`QueryTerm::NotTag`]: it carries *none* of the tags in the set (same
+    ///   traversal).
+    /// - [`QueryTerm::NameContains`]: its logical path contains the substring,
+    ///   compared case-insensitively.
+    ///
+    /// An empty term list matches every file; an empty tag set inside a term
+    /// matches no tag (so `HasTag([])` matches nothing and `NotTag([])` excludes
+    /// nothing). Composes [`Self::file_ids_for_tag`] and [`Self::get_all_files`];
+    /// no new SQL.
+    pub fn file_ids_for_query(
+        &self,
+        terms: &[QueryTerm],
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = FileId>, DatabaseError> {
+        // The set of files carrying at least one tag in `tag_ids` (the union of
+        // each tag's files). An empty set yields no files.
+        let files_for_any_tag = |tag_ids: &[TagId]| -> Result<BTreeSet<FileId>, DatabaseError> {
+            let mut union = BTreeSet::new();
+            for tag_id in tag_ids {
+                union.extend(self.file_ids_for_tag(*tag_id, subtag_rule)?);
+            }
+            Ok(union)
+        };
+
+        // Seed the candidate set. If there is at least one positive tag term,
+        // start from the intersection of those (each contributing the union of
+        // its matched tags' files); otherwise start from all files.
+        let positive: Vec<&[TagId]> = terms
+            .iter()
+            .filter_map(|term| match term {
+                QueryTerm::HasTag(tag_ids) => Some(tag_ids.as_slice()),
+                _ => None,
+            })
+            .collect();
+
+        let mut candidates: BTreeSet<FileId> = if let Some((first, rest)) = positive.split_first() {
+            let mut set = files_for_any_tag(first)?;
+            for tag_ids in rest {
+                let next = files_for_any_tag(tag_ids)?;
+                set.retain(|file_id| next.contains(file_id));
+            }
+            set
+        } else {
+            self.get_all_files()?
+                .into_iter()
+                .map(|file| file.file_id)
+                .collect()
+        };
+
+        // Subtract every negative tag term (the union of its matched tags' files).
+        for term in terms {
+            if let QueryTerm::NotTag(tag_ids) = term {
+                let excluded = files_for_any_tag(tag_ids)?;
+                candidates.retain(|file_id| !excluded.contains(file_id));
+            }
+        }
+
+        // Apply name-substring filters. These need each candidate's logical
+        // path, so build a lookup from the full listing once.
+        let name_needles: Vec<String> = terms
+            .iter()
+            .filter_map(|term| match term {
+                QueryTerm::NameContains(needle) => Some(needle.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        if !name_needles.is_empty() {
+            let paths: std::collections::BTreeMap<FileId, String> = self
+                .get_all_files()?
+                .into_iter()
+                .map(|file| (file.file_id, file.logical_path.as_str().to_lowercase()))
+                .collect();
+
+            candidates.retain(|file_id| match paths.get(file_id) {
+                Some(path) => name_needles.iter().all(|needle| path.contains(needle)),
+                None => false,
+            });
+        }
+
+        Ok(candidates)
+    }
+
+    /// Search *tags* by the same conjunction of [`QueryTerm`]s used for files,
+    /// mirroring [`Self::file_ids_for_query`] onto the tag hierarchy:
+    ///
+    /// - [`QueryTerm::HasTag`]: the tag must be a subtag of *at least one* tag in
+    ///   the set (subtag traversal governed by `subtag_rule`) — the tag analogue
+    ///   of "a file carries this tag".
+    /// - [`QueryTerm::NotTag`]: the tag must *not* be a subtag of any tag in the
+    ///   set.
+    /// - [`QueryTerm::NameContains`]: the tag's name contains the substring,
+    ///   compared case-insensitively.
+    ///
+    /// An empty term list matches every tag; an empty tag set inside a term
+    /// matches no tag. Composes [`Self::subtag_ids_for_tag`] and
+    /// [`Self::get_all_tags`]; no new SQL.
+    pub fn tag_ids_for_query(
+        &self,
+        terms: &[QueryTerm],
+        subtag_rule: SubtagRule,
+    ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        // The set of tags that are a subtag of at least one tag in `tag_ids`
+        // (the union of each tag's subtags). An empty set yields no tags.
+        let subtags_of_any = |tag_ids: &[TagId]| -> Result<BTreeSet<TagId>, DatabaseError> {
+            let mut union = BTreeSet::new();
+            for tag_id in tag_ids {
+                union.extend(self.subtag_ids_for_tag(*tag_id, subtag_rule)?);
+            }
+            Ok(union)
+        };
+
+        let positive: Vec<&[TagId]> = terms
+            .iter()
+            .filter_map(|term| match term {
+                QueryTerm::HasTag(tag_ids) => Some(tag_ids.as_slice()),
+                _ => None,
+            })
+            .collect();
+
+        let mut candidates: BTreeSet<TagId> = if let Some((first, rest)) = positive.split_first() {
+            let mut set = subtags_of_any(first)?;
+            for tag_ids in rest {
+                let next = subtags_of_any(tag_ids)?;
+                set.retain(|tag_id| next.contains(tag_id));
+            }
+            set
+        } else {
+            self.get_all_tags()?
+                .into_iter()
+                .map(|tag| tag.id)
+                .collect()
+        };
+
+        for term in terms {
+            if let QueryTerm::NotTag(tag_ids) = term {
+                let excluded = subtags_of_any(tag_ids)?;
+                candidates.retain(|tag_id| !excluded.contains(tag_id));
+            }
+        }
+
+        let name_needles: Vec<String> = terms
+            .iter()
+            .filter_map(|term| match term {
+                QueryTerm::NameContains(needle) => Some(needle.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        if !name_needles.is_empty() {
+            let names: std::collections::BTreeMap<TagId, String> = self
+                .get_all_tags()?
+                .into_iter()
+                .map(|tag| (tag.id, tag.name.to_lowercase()))
+                .collect();
+
+            candidates.retain(|tag_id| match names.get(tag_id) {
+                Some(name) => name_needles.iter().all(|needle| name.contains(needle)),
+                None => false,
+            });
+        }
+
+        Ok(candidates)
+    }
+
     /// Get all files that are tagged with the provided tag.
     pub fn tag_ids_for_file(
         &self,
@@ -1372,6 +1562,56 @@ impl FileDatabase {
         Ok(file_id)
     }
 
+    /// Find every tag id a query token `$foo`/`!foo` should match.
+    ///
+    /// A tag matches if **either**:
+    /// - its name contains `token` as a case-insensitive substring (so `foo`
+    ///   matches `foo`, `foobar`, and `barfoo`), **or**
+    /// - its id starts with `token` interpreted as a hex id prefix (so a pasted
+    ///   partial id still works).
+    ///
+    /// Returns all matches (deduplicated); an empty result means nothing matched,
+    /// which callers treat as "matches no tag" rather than an error.
+    pub fn tag_ids_matching_token(&self, token: &str) -> Result<Vec<TagId>, DatabaseError> {
+        let mut ids: BTreeSet<TagId> = BTreeSet::new();
+
+        // Name substring, case-insensitive. Escape LIKE metacharacters in the
+        // user token so `%`/`_` are matched literally; `LIKE` is case-insensitive
+        // for ASCII in SQLite by default.
+        let escaped = token
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM tags WHERE name LIKE ?1 ESCAPE '\\'")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let name_matches = statement
+            .query_map([&pattern], |row| row.get::<_, TagId>(0))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        for id in name_matches {
+            ids.insert(id.map_err(|_| DatabaseError::FailedToExecuteCommand)?);
+        }
+
+        // Id prefix (only when the token is a valid hex id prefix at all).
+        if let Some(prefix) = normalise_id_prefix(token) {
+            let id_pattern = format!("{prefix}%");
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM tags WHERE id LIKE ?1")
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            let id_matches = statement
+                .query_map([&id_pattern], |row| row.get::<_, TagId>(0))
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            for id in id_matches {
+                ids.insert(id.map_err(|_| DatabaseError::FailedToExecuteCommand)?);
+            }
+        }
+
+        Ok(ids.into_iter().collect())
+    }
+
     /// Get the ID of a tag by the name.
     pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
         let mut statement = self
@@ -1407,6 +1647,51 @@ impl FileDatabase {
             .ok_or(DatabaseError::MissingFile)?;
 
         Ok(logical_path)
+    }
+
+    /// Get the [`FileInfo`] for a single `file_id` — the single-file counterpart
+    /// of [`Self::get_all_files`].
+    ///
+    /// Joins the file to its latest version and computes the "short id" length
+    /// with [`Self::shorten_file_id`] (an indexed neighbour lookup, not a full
+    /// scan), so this stays cheap per call. Errors with `MissingFile` if the
+    /// file has no row, or no version yet.
+    pub fn file_info_from_id(&self, file_id: FileId) -> Result<FileInfo, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.logical_path, v.content_hash, v.version_number
+                 FROM files AS f
+                 JOIN file_versions AS v
+                   ON v.file_id = f.id
+                  AND v.version_number = (
+                      SELECT MAX(version_number)
+                      FROM file_versions AS inner
+                      WHERE inner.file_id = f.id
+                  )
+                 WHERE f.id = ?1",
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let mut file = statement
+            .query_map([file_id], |row| {
+                Ok(FileInfo {
+                    file_id,
+                    logical_path: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    version_number: row.get(2)?,
+                    // Filled in below.
+                    short_id_length: 0,
+                })
+            })
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|file| file.unwrap())
+            .next()
+            .ok_or(DatabaseError::MissingFile)?;
+
+        file.short_id_length = self.shorten_file_id(file_id)?;
+
+        Ok(file)
     }
 
     /// List every currently-known file (i.e. with a row in `files`) together
@@ -2284,5 +2569,120 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].modified_at, 111);
         assert_eq!(entries[1].modified_at, 222);
+    }
+
+    #[test]
+    fn tag_ids_matching_token_matches_name_substring_case_insensitively() {
+        let database = memory_db();
+        let foo = TagId::new();
+        let foobar = TagId::new();
+        let barfoo = TagId::new();
+        let unrelated = TagId::new();
+        database.add_tag(foo, "foo", "red", 1).unwrap();
+        database.add_tag(foobar, "foobar", "red", 1).unwrap();
+        database.add_tag(barfoo, "barfoo", "red", 1).unwrap();
+        database.add_tag(unrelated, "baz", "red", 1).unwrap();
+
+        // A different case still matches (case-insensitive substring).
+        let matched: BTreeSet<TagId> = database
+            .tag_ids_matching_token("FOO")
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            matched,
+            BTreeSet::from([foo, foobar, barfoo]),
+            "should match every tag whose name contains 'foo'"
+        );
+    }
+
+    #[test]
+    fn tag_ids_matching_token_empty_when_nothing_matches() {
+        let database = memory_db();
+        database.add_tag(TagId::new(), "alpha", "red", 1).unwrap();
+
+        assert!(
+            database.tag_ids_matching_token("nope").unwrap().is_empty(),
+            "an unmatched token yields an empty set, not an error"
+        );
+    }
+
+    #[test]
+    fn file_ids_for_query_positive_term_unions_all_matching_tags() {
+        let database = memory_db();
+        // Two distinct tags both containing the substring 'foo'.
+        let foo = TagId::new();
+        let foobar = TagId::new();
+        database.add_tag(foo, "foo", "red", 1).unwrap();
+        database.add_tag(foobar, "foobar", "red", 1).unwrap();
+
+        // file_a carries `foo`, file_b carries `foobar`, file_c carries neither.
+        let file_a = FileId::new();
+        let file_b = FileId::new();
+        let file_c = FileId::new();
+        for (id, path) in [(file_a, "a"), (file_b, "b"), (file_c, "c")] {
+            database.add_file(id, &LogicalPath::new(path)).unwrap();
+        }
+        database.tag_file(foo, file_a, 1).unwrap();
+        database.tag_file(foobar, file_b, 1).unwrap();
+
+        // `$foo` should match files carrying either tag (union), not require both.
+        let terms = vec![QueryTerm::HasTag(vec![foo, foobar])];
+        let matched: BTreeSet<FileId> = database
+            .file_ids_for_query(&terms, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(matched, BTreeSet::from([file_a, file_b]));
+    }
+
+    #[test]
+    fn file_ids_for_query_empty_positive_set_matches_nothing() {
+        let database = memory_db();
+        let file = FileId::new();
+        database.add_file(file, &LogicalPath::new("a")).unwrap();
+
+        // A `$foo` term that matched no tag (empty set) matches no file.
+        let terms = vec![QueryTerm::HasTag(vec![])];
+        let matched: Vec<FileId> = database
+            .file_ids_for_query(&terms, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn file_ids_for_query_negative_term_excludes_union_of_matching_tags() {
+        let mut database = memory_db();
+        let foo = TagId::new();
+        let foobar = TagId::new();
+        database.add_tag(foo, "foo", "red", 1).unwrap();
+        database.add_tag(foobar, "foobar", "red", 1).unwrap();
+
+        let file_a = FileId::new();
+        let file_b = FileId::new();
+        let file_c = FileId::new();
+        for (id, path) in [(file_a, "a"), (file_b, "b"), (file_c, "c")] {
+            database.add_file(id, &LogicalPath::new(path)).unwrap();
+            // A negative-only query seeds from all files, which requires each to
+            // have a recorded version to appear in the listing.
+            database.record_version(id, "hash", "test").unwrap();
+        }
+        database.tag_file(foo, file_a, 1).unwrap();
+        database.tag_file(foobar, file_b, 1).unwrap();
+
+        // `!foo` excludes files carrying either matching tag, leaving only file_c.
+        let terms = vec![QueryTerm::NotTag(vec![foo, foobar])];
+        let matched: BTreeSet<FileId> = database
+            .file_ids_for_query(&terms, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(matched, BTreeSet::from([file_c]));
     }
 }

@@ -2980,9 +2980,24 @@ async fn handle_changes(
                 // the fetch runs here (not on the session's frame loop). If a
                 // TagBased sync directory wants this file but we lack its bytes,
                 // fetch them on demand and place them.
+                //
+                // The synchronous DB step (`reconcile_tag_placement`) runs on
+                // this loop, but the follow-up (`fetch_and_place_deferred`) must
+                // NOT be awaited here: it blocks for the whole network fetch, and
+                // it finishes by enqueueing a `DaemonMessage::Materialize` onto
+                // *this* loop's own channel. Awaiting it therefore stalls the
+                // single-threaded consumer so the `Materialize` it produces can
+                // never be dequeued — the file is fetched, "materialized", but
+                // never placed, and the next reconcile re-fetches it forever.
+                // Spawn it instead (it holds only owned, Send data by design) so
+                // the loop stays free to process the resulting `Materialize`.
                 if let Some(deferred) = reconcile_tag_placement(&command_sender, &database, file_id)
                 {
-                    fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                    let pending_fetches = pending_fetches.clone();
+                    let change_sender = change_sender.clone();
+                    tokio::spawn(async move {
+                        fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                    });
                 }
                 continue;
             }

@@ -42,7 +42,7 @@ use tagnet_core::{FileId, TagId, state::Change};
 use tokio::sync::broadcast;
 
 use crate::{
-    api::{Api, ApiError, ApiEvent},
+    api::{Api, ApiError, ApiEvent, QueryResult},
     database::{SubtagRule, Tag},
 };
 use tagnet_core::FileInfo;
@@ -61,12 +61,6 @@ use tagnet_core::FileInfo;
 /// multi-threaded runtime — can move them across threads.
 pub trait TransportBackend {
     // --- Read API (plan 5.3) -------------------------------------------------
-
-    /// List all tags.
-    fn list_tags(&self) -> impl Future<Output = Result<Vec<Tag>, ApiError>> + Send;
-
-    /// List every currently-known file with its latest version info.
-    fn list_files(&self) -> impl Future<Output = Result<Vec<FileInfo>, ApiError>> + Send;
 
     /// Resolve a full-or-short file id `prefix` to a single [`FileId`]. Errors
     /// with `NotFound` if nothing matches or `Ambiguous` if several do.
@@ -89,12 +83,22 @@ pub trait TransportBackend {
         subtag_rule: SubtagRule,
     ) -> impl Future<Output = Result<Vec<TagId>, ApiError>> + Send;
 
-    /// List the files carrying `tag_id` (the v1 single-tag "search").
-    fn files_for_tag(
+    /// Run a free-form query (`$tag`, `!tag`, and name substrings) and return
+    /// both the matching files and tags. Tag tokens are resolved in the daemon.
+    fn run_query(
         &self,
-        tag_id: TagId,
+        query: String,
         subtag_rule: SubtagRule,
-    ) -> impl Future<Output = Result<Vec<FileId>, ApiError>> + Send;
+    ) -> impl Future<Output = Result<QueryResult, ApiError>> + Send;
+
+    /// Get a single file's [`FileInfo`] by id (`NotFound` if unknown).
+    fn get_file(
+        &self,
+        file_id: FileId,
+    ) -> impl Future<Output = Result<FileInfo, ApiError>> + Send;
+
+    /// Get a single tag by id (`NotFound` if unknown).
+    fn get_tag(&self, tag_id: TagId) -> impl Future<Output = Result<Tag, ApiError>> + Send;
 
     /// List the subtags (children) of `tag_id` in the tag hierarchy.
     fn subtags_for_tag(
@@ -309,14 +313,6 @@ fn hash_error(error: crate::file_bytes::FileBytesError) -> ApiError {
 }
 
 impl TransportBackend for InProcessBackend {
-    async fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
-        self.api.list_tags()
-    }
-
-    async fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
-        self.api.list_files()
-    }
-
     async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         self.api.resolve_file_id(&prefix)
     }
@@ -333,12 +329,20 @@ impl TransportBackend for InProcessBackend {
         self.api.tags_for_file(file_id, subtag_rule)
     }
 
-    async fn files_for_tag(
+    async fn run_query(
         &self,
-        tag_id: TagId,
+        query: String,
         subtag_rule: SubtagRule,
-    ) -> Result<Vec<FileId>, ApiError> {
-        self.api.files_for_tag(tag_id, subtag_rule)
+    ) -> Result<QueryResult, ApiError> {
+        self.api.run_query(&query, subtag_rule)
+    }
+
+    async fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
+        self.api.get_file(file_id)
+    }
+
+    async fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
+        self.api.get_tag(tag_id)
     }
 
     async fn subtags_for_tag(
@@ -480,20 +484,6 @@ impl Backend {
 }
 
 impl TransportBackend for Backend {
-    async fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
-        match self {
-            Backend::InProcess(backend) => backend.list_tags().await,
-            Backend::Ipc(backend) => backend.list_tags().await,
-        }
-    }
-
-    async fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
-        match self {
-            Backend::InProcess(backend) => backend.list_files().await,
-            Backend::Ipc(backend) => backend.list_files().await,
-        }
-    }
-
     async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         match self {
             Backend::InProcess(backend) => backend.resolve_file_id(prefix).await,
@@ -519,14 +509,28 @@ impl TransportBackend for Backend {
         }
     }
 
-    async fn files_for_tag(
+    async fn run_query(
         &self,
-        tag_id: TagId,
+        query: String,
         subtag_rule: SubtagRule,
-    ) -> Result<Vec<FileId>, ApiError> {
+    ) -> Result<QueryResult, ApiError> {
         match self {
-            Backend::InProcess(backend) => backend.files_for_tag(tag_id, subtag_rule).await,
-            Backend::Ipc(backend) => backend.files_for_tag(tag_id, subtag_rule).await,
+            Backend::InProcess(backend) => backend.run_query(query, subtag_rule).await,
+            Backend::Ipc(backend) => backend.run_query(query, subtag_rule).await,
+        }
+    }
+
+    async fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.get_file(file_id).await,
+            Backend::Ipc(backend) => backend.get_file(file_id).await,
+        }
+    }
+
+    async fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.get_tag(tag_id).await,
+            Backend::Ipc(backend) => backend.get_tag(tag_id).await,
         }
     }
 

@@ -95,6 +95,17 @@ impl From<Tag> for TagEntry {
     }
 }
 
+/// The result of [`TagnetApp::run_query`] as the flattened [`FileEntry`] /
+/// [`TagEntry`] rows the Dart UI renders directly.
+///
+/// The daemon's [`QueryResult`] carries full `FileInfo`/`Tag` rows for the
+/// matched set, so the UI gets everything it needs in one call — no follow-up
+/// listing to turn ids into displayable rows.
+pub struct QueryEntries {
+    pub files: Vec<FileEntry>,
+    pub tags: Vec<TagEntry>,
+}
+
 /// The handle the Dart UI holds while it is open.
 ///
 /// It does **not** own the runtime. The runtime is a process-global owned by
@@ -175,52 +186,20 @@ impl TagnetApp {
 
     // --- Read API (plan 5.3) -------------------------------------------------
 
-    /// List all tags.
-    pub async fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
-        self.try_backend()?.list_tags().await
-    }
-
-    /// List every currently-known file with its latest version info.
-    pub async fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
-        self.try_backend()?.list_files().await
-    }
-
-    /// List every file as a Dart-readable [`FileEntry`] (flat fields).
-    pub async fn list_file_entries(&self) -> Result<Vec<FileEntry>, ApiError> {
-        Ok(self
-            .try_backend()?
-            .list_files()
-            .await?
-            .into_iter()
-            .map(FileEntry::from)
-            .collect())
-    }
-
-    /// List every tag as a Dart-readable [`TagEntry`] (flat fields).
-    pub async fn list_tag_entries(&self) -> Result<Vec<TagEntry>, ApiError> {
-        Ok(self
-            .try_backend()?
-            .list_tags()
-            .await?
-            .into_iter()
-            .map(TagEntry::from)
-            .collect())
-    }
-
-    /// Resolve a full-or-short file id `prefix` (as shown by `list_file_entries`'s
-    /// `short_id_length`) to a single [`FileId`]. Errors with `NotFound` if
-    /// nothing matches or `Ambiguous` if several do.
+    /// Resolve a full-or-short file id `prefix` `short_id_length`) to a single
+    /// [`FileId`]. Errors with `NotFound` if nothing matches or `Ambiguous` if
+    /// several do.
     pub async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         self.try_backend()?.resolve_file_id(prefix).await
     }
 
-    /// Resolve a full-or-short tag id `prefix` (as shown by `list_tag_entries`)
-    /// to a single [`TagId`]. Errors with `NotFound` if nothing matches or
-    /// `Ambiguous` if several do. The tag counterpart of [`resolve_file_id`].
+    /// Resolve a full-or-short tag id `prefix` to a single [`TagId`]. Errors
+    /// with `NotFound` if nothing matches or `Ambiguous` if several do. The
+    /// tag counterpart of [`resolve_file_id`].
     ///
     /// This is how the Dart UI turns a `TagEntry.tag_id` string back into the
     /// opaque [`TagId`] that the write/query methods (`delete_tag`, `tag_file`,
-    /// `untag_file`, `files_for_tag`) require.
+    /// `untag_file`) require.
     pub async fn resolve_tag_id(&self, prefix: String) -> Result<TagId, ApiError> {
         self.try_backend()?.resolve_tag_id(prefix).await
     }
@@ -236,23 +215,12 @@ impl TagnetApp {
             .await
     }
 
-    /// List the files carrying `tag_id` (the v1 single-tag "search").
-    pub async fn files_for_tag(
-        &self,
-        tag_id: TagId,
-        subtag_rule: SubtagRule,
-    ) -> Result<Vec<FileId>, ApiError> {
-        self.try_backend()?.files_for_tag(tag_id, subtag_rule).await
-    }
-
-    // --- String-id query helpers for the Dart UI -----------------------------
+    // --- Query helpers for the Dart UI ---------------------------------------
     //
-    // `tags_for_file` / `files_for_tag` return *opaque* id handles, which the
-    // Dart UI cannot render or match against the string ids in its DTOs
-    // (FileEntry/TagEntry). These variants take and return the canonical id
-    // *strings* instead, so the UI can drive tag<->file queries end to end
-    // without ever touching an opaque handle. `file_id` / `tag_id` accept the
-    // full-or-short prefix forms resolved by `resolve_file_id`/`resolve_tag_id`.
+    // The raw `tags_for_file` returns *opaque* id handles the Dart UI cannot
+    // render. These variants take id *strings* (full-or-short prefixes resolved
+    // by `resolve_file_id`) and return either id strings or flattened
+    // FileEntry/TagEntry rows, so the UI never touches an opaque handle.
 
     /// The string ids of the tags applied to the file identified by `file_id`.
     pub async fn tag_ids_for_file_string(
@@ -270,8 +238,10 @@ impl TagnetApp {
             .collect())
     }
 
-    /// The string ids of the files carrying the tag identified by `tag_id`.
-    pub async fn file_ids_for_tag_string(
+    /// The string ids of the tags applied to the tag identified by `tag_id`
+    /// (its parents in the hierarchy). The tag analogue of
+    /// [`Self::tag_ids_for_file_string`].
+    pub async fn tag_ids_for_tag_string(
         &self,
         tag_id: String,
         subtag_rule: SubtagRule,
@@ -279,11 +249,86 @@ impl TagnetApp {
         let backend = self.try_backend()?;
         let tag_id = backend.resolve_tag_id(tag_id).await?;
         Ok(backend
-            .files_for_tag(tag_id, subtag_rule)
+            .tags_for_tag(tag_id, subtag_rule)
             .await?
             .into_iter()
             .map(|id| id.to_string())
             .collect())
+    }
+
+    /// The string ids of the subtags (children) of the tag identified by
+    /// `tag_id`.
+    pub async fn subtag_ids_for_tag_string(
+        &self,
+        tag_id: String,
+        subtag_rule: SubtagRule,
+    ) -> Result<Vec<String>, ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        Ok(backend
+            .subtags_for_tag(tag_id, subtag_rule)
+            .await?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect())
+    }
+
+    /// Make `subtag_id` a subtag (child) of `parent_id` in the tag hierarchy.
+    /// String-id variant of the underlying `tag_tag` call.
+    pub async fn tag_tag_by_string(
+        &self,
+        parent_id: String,
+        subtag_id: String,
+    ) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let parent_id = backend.resolve_tag_id(parent_id).await?;
+        let subtag_id = backend.resolve_tag_id(subtag_id).await?;
+        backend.tag_tag(parent_id, subtag_id).await
+    }
+
+    /// Remove `subtag_id` as a subtag of `parent_id`. String-id variant of
+    /// the underlying `untag_tag` call.
+    pub async fn untag_tag_by_string(
+        &self,
+        parent_id: String,
+        subtag_id: String,
+    ) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let parent_id = backend.resolve_tag_id(parent_id).await?;
+        let subtag_id = backend.resolve_tag_id(subtag_id).await?;
+        backend.untag_tag(parent_id, subtag_id).await
+    }
+
+    /// The files and tags matching the free-form `query` (`$tag`, `!tag`, and
+    /// name substrings), as flattened [`FileEntry`]/[`TagEntry`] rows. Tag
+    /// tokens are resolved in the daemon.
+    pub async fn run_query(
+        &self,
+        query: String,
+        subtag_rule: SubtagRule,
+    ) -> Result<QueryEntries, ApiError> {
+        let backend = self.try_backend()?;
+        let result = backend.run_query(query, subtag_rule).await?;
+        Ok(QueryEntries {
+            files: result.files.into_iter().map(FileEntry::from).collect(),
+            tags: result.tags.into_iter().map(TagEntry::from).collect(),
+        })
+    }
+
+    /// Get a single file's flattened [`FileEntry`] by id string (a full or short
+    /// id prefix). Errors `NotFound` if unknown.
+    pub async fn get_file_entry(&self, file_id: String) -> Result<FileEntry, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(FileEntry::from(backend.get_file(file_id).await?))
+    }
+
+    /// Get a single tag's flattened [`TagEntry`] by id string (a full or short
+    /// id prefix). Errors `NotFound` if unknown.
+    pub async fn get_tag_entry(&self, tag_id: String) -> Result<TagEntry, ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        Ok(TagEntry::from(backend.get_tag(tag_id).await?))
     }
 
     // --- Write API (plan 5.4) ------------------------------------------------
@@ -296,6 +341,17 @@ impl TagnetApp {
     /// Delete a tag.
     pub async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         self.try_backend()?.delete_tag(tag_id).await
+    }
+
+    /// Rename a tag. The change propagates through the usual event stream, so
+    /// live UI (list, detail) refreshes without an explicit reload.
+    pub async fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
+        self.try_backend()?.rename_tag(tag_id, name).await
+    }
+
+    /// Change a tag's color. Same propagation rules as [`Self::rename_tag`].
+    pub async fn set_tag_color(&self, tag_id: TagId, color: String) -> Result<(), ApiError> {
+        self.try_backend()?.set_tag_color(tag_id, color).await
     }
 
     /// Upload a file from a path on disk; returns the freshly-minted id.
@@ -317,6 +373,19 @@ impl TagnetApp {
     /// Delete a file.
     pub async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
         self.try_backend()?.delete_file(file_id).await
+    }
+
+    /// Move (rename) a file to a new logical path. String-id variant of the
+    /// underlying `move_file` call — the Dart UI passes the `FileEntry.fileId`
+    /// string it already has.
+    pub async fn move_file_by_string(
+        &self,
+        file_id: String,
+        logical_path: String,
+    ) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        backend.move_file(file_id, logical_path).await
     }
 
     /// Apply `tag_id` to `file_id`.

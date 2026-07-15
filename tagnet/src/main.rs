@@ -233,26 +233,64 @@ fn emit_files(output: OutputMode, files: &[FileInfo], tags_by_file: &HashMap<Fil
     }
 }
 
-/// Fetch the tag-id → name map once, for turning per-file/per-relationship tag
-/// ids into human-readable names in the shared tables.
-async fn tag_name_map(backend: &IpcClientBackend) -> Result<HashMap<TagId, String>, String> {
-    Ok(backend
-        .list_tags()
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|tag| (tag.id, tag.name))
-        .collect())
+/// Resolve `tag_ids` to display names, one `get_tag` per *distinct* id, memoized
+/// in `cache` across calls so a tag seen on many files/tags is fetched once.
+///
+/// This replaces the old whole-store `list_tags` map: instead of fetching every
+/// tag up front (an O(all-tags) hazard), it looks up only the ids actually
+/// referenced. An id that no longer resolves (deleted) falls back to its
+/// stringified form.
+async fn resolve_tag_names(
+    backend: &IpcClientBackend,
+    tag_ids: &[TagId],
+    cache: &mut HashMap<TagId, String>,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::with_capacity(tag_ids.len());
+    for tag_id in tag_ids {
+        if let Some(name) = cache.get(tag_id) {
+            names.push(name.clone());
+            continue;
+        }
+        let name = match backend.get_tag(*tag_id).await {
+            Ok(tag) => tag.name,
+            // A referenced tag that no longer resolves: show its id rather than
+            // failing the whole listing.
+            Err(tagnetd::api::ApiError::NotFound) => tag_id.to_string(),
+            Err(error) => return Err(error.to_string()),
+        };
+        cache.insert(*tag_id, name.clone());
+        names.push(name);
+    }
+    Ok(names)
 }
 
-/// Build the per-file tag-name lists shown in [`file_table`], one lookup per
-/// file. `tag_names` maps ids to names (see [`tag_name_map`]); an unknown id
-/// falls back to its stringified form. `rule` controls whether the tag
-/// hierarchy is walked (see `--include-subtags`).
+/// Materialize a set of tag ids into full [`Tag`] rows via `get_tag`, one lookup
+/// per id. Replaces the old "list every tag, then filter to these ids" pattern,
+/// which scanned the whole tag store to render a handful of rows. Ids that no
+/// longer resolve (deleted) are skipped.
+async fn tags_from_ids(
+    backend: &IpcClientBackend,
+    tag_ids: impl IntoIterator<Item = TagId>,
+) -> Result<Vec<Tag>, String> {
+    let mut tags = Vec::new();
+    for tag_id in tag_ids {
+        match backend.get_tag(tag_id).await {
+            Ok(tag) => tags.push(tag),
+            Err(tagnetd::api::ApiError::NotFound) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(tags)
+}
+
+/// Build the per-file tag-name lists shown in [`file_table`], one `tags_for_file`
+/// lookup per file. Names are resolved on demand via [`resolve_tag_names`],
+/// sharing `name_cache` so repeated tags cost one lookup. `rule` controls
+/// whether the tag hierarchy is walked (see `--include-subtags`).
 async fn tags_by_file(
     backend: &IpcClientBackend,
     files: &[FileInfo],
-    tag_names: &HashMap<TagId, String>,
+    name_cache: &mut HashMap<TagId, String>,
     rule: SubtagRule,
 ) -> Result<HashMap<FileId, Vec<String>>, String> {
     let mut map = HashMap::with_capacity(files.len());
@@ -263,30 +301,20 @@ async fn tags_by_file(
             .await
             .map_err(|error| error.to_string())?;
 
-        let names = tag_ids
-            .iter()
-            .map(|tag_id| {
-                tag_names
-                    .get(tag_id)
-                    .cloned()
-                    .unwrap_or_else(|| tag_id.to_string())
-            })
-            .collect();
-
+        let names = resolve_tag_names(backend, &tag_ids, name_cache).await?;
         map.insert(file.file_id, names);
     }
 
     Ok(map)
 }
 
-/// Build the per-tag applied-tag name lists shown in [`tag_table`], one lookup
-/// per tag. The tag analogue of [`tags_by_file`]. `tag_names` maps ids to names
-/// (see [`tag_name_map`]); an unknown id falls back to its stringified form.
-/// `rule` controls whether the tag hierarchy is walked (see `--include-subtags`).
+/// Build the per-tag applied-tag name lists shown in [`tag_table`], one
+/// `tags_for_tag` lookup per tag. The tag analogue of [`tags_by_file`]; shares
+/// the same `name_cache`. `rule` controls whether the tag hierarchy is walked.
 async fn tags_by_tag(
     backend: &IpcClientBackend,
     tags: &[Tag],
-    tag_names: &HashMap<TagId, String>,
+    name_cache: &mut HashMap<TagId, String>,
     rule: SubtagRule,
 ) -> Result<HashMap<TagId, Vec<String>>, String> {
     let mut map = HashMap::with_capacity(tags.len());
@@ -297,16 +325,7 @@ async fn tags_by_tag(
             .await
             .map_err(|error| error.to_string())?;
 
-        let names = applied_ids
-            .iter()
-            .map(|tag_id| {
-                tag_names
-                    .get(tag_id)
-                    .cloned()
-                    .unwrap_or_else(|| tag_id.to_string())
-            })
-            .collect();
-
+        let names = resolve_tag_names(backend, &applied_ids, name_cache).await?;
         map.insert(tag.id, names);
     }
 
@@ -376,24 +395,7 @@ enum Commands {
         #[arg(long = "keep")]
         keep: bool,
     },
-    /// List all tags known to the daemon.
-    #[command(visible_alias = "lt")]
-    ListTags {
-        /// In the Tags column, also show tags reached through the tag hierarchy
-        /// (subtags), not just each tag's directly-applied tags.
-        #[arg(long)]
-        include_subtags: bool,
-    },
-    /// List all files known to the daemon.
-    #[command(visible_aliases = ["lf", "ls"])]
-    ListFiles {
-        /// In the Tags column, also show tags reached through the tag hierarchy
-        /// (subtags), not just each file's directly-applied tags.
-        #[arg(long)]
-        include_subtags: bool,
-    },
     /// Create a tag; prints the newly-minted tag id.
-    #[command(visible_alias = "ct")]
     CreateTag {
         name: String,
         // Hex form (matches the Flutter app's palette, kTagColorPalette), so
@@ -401,12 +403,19 @@ enum Commands {
         #[arg(long, default_value = "#F44336")]
         color: String,
     },
-    /// List the files carrying a tag (the v1 single-tag search).
-    #[command(visible_alias = "ft")]
-    FilesForTag {
-        tag_id: String,
-        /// Also include files carrying any subtag of this tag, walking the
-        /// hierarchy transitively.
+    /// Search files with a free-form query.
+    ///
+    /// The query is a whitespace-separated list of terms combined
+    /// conjunctively: `$tag` requires a tag, `!tag` (or `!$tag`) excludes one,
+    /// and any other word is matched as a case-insensitive substring of the
+    /// file's logical path. Example: `tagnet search '$photos !archived beach'`.
+    #[command(visible_alias = "s")]
+    Search {
+        /// The query terms; joined with spaces if given as multiple arguments.
+        #[arg(trailing_var_arg = true, required = true)]
+        query: Vec<String>,
+        /// Also match files carrying any subtag of a `$tag`/`!tag` term, walking
+        /// the hierarchy transitively.
         #[arg(long)]
         include_subtags: bool,
     },
@@ -427,14 +436,12 @@ enum Commands {
         id: String,
     },
     /// Delete a file.
-    #[command(visible_alias = "df")]
     DeleteFile {
         /// The file to delete, given as a full id or any unambiguous short-id
         /// prefix of it (as shown by `list-files`).
         id: String,
     },
     /// Delete a tag.
-    #[command(visible_alias = "dt")]
     DeleteTag {
         /// The tag to delete (a full id or any unambiguous short-id prefix of it, as shown by `list-tags`).
         tag_id: String,
@@ -462,7 +469,6 @@ enum Commands {
         tag_ids: Vec<String>,
     },
     /// List the tags applied to a file.
-    #[command(visible_alias = "tf")]
     TagsForFile {
         /// The file to inspect, given as a full id or any unambiguous short-id
         /// prefix of it (as shown by `list-files`).
@@ -473,7 +479,6 @@ enum Commands {
         include_subtags: bool,
     },
     /// Rename a tag.
-    #[command(visible_alias = "rt")]
     RenameTag {
         /// The tag to rename (a full id or any unambiguous short-id prefix of it, as shown by `list-tags`).
         tag_id: String,
@@ -481,7 +486,6 @@ enum Commands {
         name: String,
     },
     /// Change a tag's color.
-    #[command(visible_alias = "sc")]
     SetTagColor {
         /// The tag to recolor (a full id or any unambiguous short-id prefix of it, as shown by `list-tags`).
         tag_id: String,
@@ -520,7 +524,6 @@ enum Commands {
         parents: Vec<String>,
     },
     /// List the subtags (children) of a tag.
-    #[command(visible_alias = "st")]
     Subtags {
         /// The parent tag, given as a full id or any unambiguous short-id
         /// prefix of it (as shown by `list-tags`).
@@ -601,7 +604,7 @@ async fn run(
             // bytes are read into memory here. This call blocks until the daemon
             // has handed the content off to the storing peer(s).
             let file_id = backend
-                .upload_file(path.clone(), path_name, resolved_tags)
+                .upload_file(path.clone(), path_name.clone(), resolved_tags.clone())
                 .await
                 .map_err(|error| error.to_string())?;
 
@@ -615,77 +618,90 @@ async fn run(
                 })?;
             }
 
-            match output {
-                OutputMode::Human => println!("Uploaded as file {}", file_id.to_string()),
-                OutputMode::Json => print_json(&json!({ "id": file_id })),
-            }
-        }
-        Commands::ListTags { include_subtags } => {
-            let tags = backend
-                .list_tags()
-                .await
-                .map_err(|error| error.to_string())?;
-            let tag_names = tag_name_map(backend).await?;
-            let tag_tags =
-                tags_by_tag(backend, &tags, &tag_names, subtag_rule(include_subtags)).await?;
-
-            emit_tags(output, &tags, &tag_tags);
-        }
-        Commands::ListFiles { include_subtags } => {
-            // TODO: `list_files` + per-file `tags_for_file` is O(N) control-socket
-            // round-trips. Add a bulk `list_files_with_tags` (or server-side join)
-            // to the read API, and pagination with a stable order for large result
-            // sets — a bare limit without an order returns arbitrary rows.
-            let files = backend
-                .list_files()
-                .await
-                .map_err(|error| error.to_string())?;
-            let tag_names = tag_name_map(backend).await?;
-            let file_tags =
-                tags_by_file(backend, &files, &tag_names, subtag_rule(include_subtags)).await?;
-
-            emit_files(output, &files, &file_tags);
+            // Render the full entry from locally-known data rather than fetching
+            // it back (the metadata write is enqueued asynchronously and would
+            // race). We know the id, logical path, applied tags, and that this is
+            // the first version. The content hash is computed daemon-side and is
+            // not known here, so it renders empty in JSON output.
+            let file = FileInfo {
+                file_id,
+                logical_path: tagnet_core::LogicalPath::new(path_name),
+                content_hash: String::new(),
+                version_number: 1,
+                // Only one id is known locally; highlight the whole id.
+                short_id_length: file_id.to_string().len(),
+            };
+            let mut name_cache = HashMap::new();
+            let tag_names = resolve_tag_names(backend, &resolved_tags, &mut name_cache).await?;
+            let mut file_tags = HashMap::new();
+            file_tags.insert(file_id, tag_names);
+            emit_files(output, std::slice::from_ref(&file), &file_tags);
         }
         Commands::CreateTag { name, color } => {
             let tag_id = backend
-                .create_tag(name, color)
+                .create_tag(name.clone(), color.clone())
                 .await
                 .map_err(|error| error.to_string())?;
 
-            match output {
-                OutputMode::Human => println!("{}", tag_id.to_string()),
-                OutputMode::Json => print_json(&json!({ "id": tag_id })),
-            }
+            // Persistence is async (the write is enqueued), so we can't fetch the
+            // row back yet without racing the pipeline. Render the full entry from
+            // what we just sent instead — the id is authoritative and the
+            // name/color are exactly what the daemon will persist (the CLI's
+            // default color matches the daemon's empty-color default). A fresh tag
+            // has no applied tags, so that column is empty.
+            let tag = Tag {
+                id: tag_id,
+                name,
+                color,
+                metadata: None,
+            };
+            emit_tags(output, std::slice::from_ref(&tag), &HashMap::new());
         }
-        Commands::FilesForTag {
-            tag_id,
+        Commands::Search {
+            query,
             include_subtags,
         } => {
-            let tag_id = resolve_tag_id(backend, &tag_id).await?;
-            let file_ids: std::collections::HashSet<FileId> = backend
-                .files_for_tag(tag_id, subtag_rule(include_subtags))
+            let query = query.join(" ");
+            // The query returns full rows for exactly the matched set (files and
+            // tags), so no whole-store listing is needed to render them.
+            let result = backend
+                .run_query(query, subtag_rule(include_subtags))
                 .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
+                .map_err(|error| error.to_string())?;
+            let files = result.files;
+            let tags = result.tags;
 
-            // Render through the same file listing as `list-files`: fetch the
-            // full file listing and keep the ones carrying this tag. (The read
-            // API returns ids only; the daemon-computed short-id length and
-            // other columns live on the full `FileInfo`.)
-            let files: Vec<FileInfo> = backend
-                .list_files()
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|file| file_ids.contains(&file.file_id))
-                .collect();
-            let tag_names = tag_name_map(backend).await?;
-            // The Tags column shows each file's own direct tags, regardless of
-            // how the search matched them.
-            let file_tags = tags_by_file(backend, &files, &tag_names, SubtagRule::Exclude).await?;
+            let mut name_cache = HashMap::new();
+            // The Tags column shows each row's own direct tags, regardless of
+            // how the search matched it.
+            let file_tags =
+                tags_by_file(backend, &files, &mut name_cache, SubtagRule::Exclude).await?;
+            let tag_tags = tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
-            emit_files(output, &files, &file_tags);
+            match output {
+                OutputMode::Human => {
+                    emit_tags(output, &tags, &tag_tags);
+                    emit_files(output, &files, &file_tags);
+                }
+                OutputMode::Json => {
+                    let tag_rows: Vec<TagRow> = tags
+                        .iter()
+                        .map(|tag| {
+                            TagRow::new(tag, tag_tags.get(&tag.id).cloned().unwrap_or_default())
+                        })
+                        .collect();
+                    let file_rows: Vec<FileRow> = files
+                        .iter()
+                        .map(|file| {
+                            FileRow::new(
+                                file,
+                                file_tags.get(&file.file_id).cloned().unwrap_or_default(),
+                            )
+                        })
+                        .collect();
+                    print_json(&json!({ "tags": tag_rows, "files": file_rows }));
+                }
+            }
         }
         Commands::Edit { id } => {
             let file_id = resolve_file_id(backend, &id).await?;
@@ -780,25 +796,16 @@ async fn run(
             include_subtags,
         } => {
             let file_id = resolve_file_id(backend, &id).await?;
-            let tag_ids: std::collections::HashSet<TagId> = backend
+            let tag_ids = backend
                 .tags_for_file(file_id, subtag_rule(include_subtags))
                 .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            // Render through the same tag listing as `list-tags`: fetch all tags
-            // and keep the ones applied to this file.
-            let tags: Vec<Tag> = backend
-                .list_tags()
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|tag| tag_ids.contains(&tag.id))
-                .collect();
-            let tag_names = tag_name_map(backend).await?;
+                .map_err(|error| error.to_string())?;
+            // Materialize the matched ids into full rows via `get_tag`.
+            let tags = tags_from_ids(backend, tag_ids).await?;
+            let mut name_cache = HashMap::new();
             // The Tags column shows each tag's own direct tags, regardless of
             // how the command matched them.
-            let tag_tags = tags_by_tag(backend, &tags, &tag_names, SubtagRule::Exclude).await?;
+            let tag_tags = tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
             emit_tags(output, &tags, &tag_tags);
         }
@@ -897,25 +904,16 @@ async fn run(
         }
         Commands::Subtags { tag_id, recursive } => {
             let tag_id = resolve_tag_id(backend, &tag_id).await?;
-            let subtag_ids: std::collections::HashSet<TagId> = backend
+            let subtag_ids = backend
                 .subtags_for_tag(tag_id, subtag_rule(recursive))
                 .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .collect();
-            // Render through the same tag listing as `list-tags`: fetch all tags
-            // and keep the subtags of this tag.
-            let tags: Vec<Tag> = backend
-                .list_tags()
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|tag| subtag_ids.contains(&tag.id))
-                .collect();
-            let tag_names = tag_name_map(backend).await?;
+                .map_err(|error| error.to_string())?;
+            // Materialize the matched ids into full rows via `get_tag`.
+            let tags = tags_from_ids(backend, subtag_ids).await?;
+            let mut name_cache = HashMap::new();
             // The Tags column shows each tag's own direct tags, regardless of
             // how the command matched them.
-            let tag_tags = tags_by_tag(backend, &tags, &tag_names, SubtagRule::Exclude).await?;
+            let tag_tags = tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
             emit_tags(output, &tags, &tag_tags);
         }
@@ -956,20 +954,14 @@ async fn edit_file(
 
     // Not local: we need the expected content hash to fetch. It comes from the
     // file's known metadata; if the daemon has never heard of this file there is
-    // nothing to fetch.
-    // TODO: Fetching every file just to find one by id is O(N) on the hot path
-    // of `tagnet edit` (and `download_file` does the same). Add a
-    // `get_file(FileId) -> Result<FileInfo, ApiError>` to the read API that
-    // returns `NotFound`, and replace both call sites.
-    let files = backend
-        .list_files()
-        .await
-        .map_err(|error| error.to_string())?;
-    let expected_hash = files
-        .into_iter()
-        .find(|file| file.file_id == file_id)
-        .map(|file| file.content_hash)
-        .ok_or_else(|| format!("unknown file id: {}", file_id.to_string()))?;
+    // nothing to fetch. A single by-id lookup (not a full listing).
+    let expected_hash = match backend.get_file(file_id).await {
+        Ok(file) => file.content_hash,
+        Err(tagnetd::api::ApiError::NotFound) => {
+            return Err(format!("unknown file id: {}", file_id.to_string()));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     // The daemon stages the fetched content in a temp file and hands us the
     // path with move semantics: we own it now and must consume (edit + hand
@@ -1041,15 +1033,16 @@ async fn download_file(
     file_id: FileId,
     output: OutputMode,
 ) -> Result<(), String> {
-    // Pull the file's metadata once: we need its content hash to fetch (if it
-    // isn't local) and its logical path to pick a sensible output filename.
-    let file = backend
-        .list_files()
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|file| file.file_id == file_id)
-        .ok_or_else(|| format!("unknown file id: {}", file_id.to_string()))?;
+    // Pull the file's metadata once (a single by-id lookup): we need its content
+    // hash to fetch (if it isn't local) and its logical path to pick a sensible
+    // output filename.
+    let file = match backend.get_file(file_id).await {
+        Ok(file) => file,
+        Err(tagnetd::api::ApiError::NotFound) => {
+            return Err(format!("unknown file id: {}", file_id.to_string()));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     // Either the file already lives in a local sync directory (copy it out,
     // leaving the real file untouched) or we fetch it, which stages a

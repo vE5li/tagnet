@@ -8,6 +8,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Needed to post the ongoing notification on API 33+. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- tagnet: the sync directory lives in shared storage (Documents/tagnet)
+         so synced files are browsable in the Files app / Gallery. Broad "All
+         files access"; the user must grant it via the system settings screen
+         (see MainActivity). Requested via MANAGE_APP_ALL_FILES_ACCESS_PERMISSION. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:label="tagnet"

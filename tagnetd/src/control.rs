@@ -64,7 +64,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    api::{Api, ApiError, ApiEvent},
+    api::{Api, ApiError, ApiEvent, QueryResult},
     database::{SubtagRule, Tag},
     transport::{EventStream, TransportBackend},
 };
@@ -78,9 +78,6 @@ use crate::{
 /// may be in flight on one connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
-    // Reads (plan 5.3).
-    ListTags,
-    ListFiles,
     /// Resolve a full-or-short file id prefix to a single `FileId`. Answered
     /// with [`ControlResponse::FileId`] (or an `Error`).
     ResolveFileId {
@@ -95,9 +92,22 @@ pub enum ControlRequest {
         file_id: FileId,
         subtag_rule: SubtagRule,
     },
-    FilesForTag {
-        tag_id: TagId,
+    /// Run a free-form query (`$tag`, `!tag`, and name substrings) and return
+    /// both the matching files and tags. Tag tokens are resolved in the daemon.
+    /// Answered with [`ControlResponse::QueryResult`].
+    RunQuery {
+        query: String,
         subtag_rule: SubtagRule,
+    },
+    /// Get a single file's info by id. Answered with [`ControlResponse::File`]
+    /// (or `Error(NotFound)`).
+    GetFile {
+        file_id: FileId,
+    },
+    /// Get a single tag by id. Answered with [`ControlResponse::Tag`] (or
+    /// `Error(NotFound)`).
+    GetTag {
+        tag_id: TagId,
     },
     SubtagsForTag {
         tag_id: TagId,
@@ -189,10 +199,15 @@ pub enum ControlRequest {
 /// the [`TransportBackend`] return types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
-    Tags(Vec<Tag>),
-    Files(Vec<FileInfo>),
+    /// A single file's info (answer to [`ControlRequest::GetFile`]).
+    File(FileInfo),
+    /// A single tag (answer to [`ControlRequest::GetTag`]).
+    Tag(Tag),
     TagIds(Vec<TagId>),
     FileIds(Vec<FileId>),
+    /// The files and tags matching a query (answer to
+    /// [`ControlRequest::RunQuery`]).
+    QueryResult(QueryResult),
     TagId(TagId),
     FileId(FileId),
     /// Path to a daemon-owned temp file holding a fetched file's content
@@ -497,14 +512,6 @@ async fn dispatch(
     active_provider: &mut Option<(FileId, String)>,
 ) -> ControlResponse {
     match request {
-        ControlRequest::ListTags => match api.list_tags() {
-            Ok(tags) => ControlResponse::Tags(tags),
-            Err(error) => ControlResponse::Error(error),
-        },
-        ControlRequest::ListFiles => match api.list_files() {
-            Ok(files) => ControlResponse::Files(files),
-            Err(error) => ControlResponse::Error(error),
-        },
         ControlRequest::ResolveFileId { prefix } => match api.resolve_file_id(&prefix) {
             Ok(file_id) => ControlResponse::FileId(file_id),
             Err(error) => ControlResponse::Error(error),
@@ -520,11 +527,19 @@ async fn dispatch(
             Ok(tag_ids) => ControlResponse::TagIds(tag_ids),
             Err(error) => ControlResponse::Error(error),
         },
-        ControlRequest::FilesForTag {
-            tag_id,
+        ControlRequest::RunQuery {
+            query,
             subtag_rule,
-        } => match api.files_for_tag(tag_id, subtag_rule) {
-            Ok(file_ids) => ControlResponse::FileIds(file_ids),
+        } => match api.run_query(&query, subtag_rule) {
+            Ok(result) => ControlResponse::QueryResult(result),
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::GetFile { file_id } => match api.get_file(file_id) {
+            Ok(file) => ControlResponse::File(file),
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::GetTag { tag_id } => match api.get_tag(tag_id) {
+            Ok(tag) => ControlResponse::Tag(tag),
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::SubtagsForTag {
@@ -973,20 +988,6 @@ fn unexpected(response: ControlResponse) -> ApiError {
 // and pattern-matches the expected `ControlResponse`, treating anything else
 // (including `ControlResponse::Error`) via `unexpected`.
 impl TransportBackend for IpcClientBackend {
-    async fn list_tags(&self) -> Result<Vec<Tag>, ApiError> {
-        match self.call(ControlRequest::ListTags).await? {
-            ControlResponse::Tags(tags) => Ok(tags),
-            other => Err(unexpected(other)),
-        }
-    }
-
-    async fn list_files(&self) -> Result<Vec<FileInfo>, ApiError> {
-        match self.call(ControlRequest::ListFiles).await? {
-            ControlResponse::Files(files) => Ok(files),
-            other => Err(unexpected(other)),
-        }
-    }
-
     async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         match self.call(ControlRequest::ResolveFileId { prefix }).await? {
             ControlResponse::FileId(file_id) => Ok(file_id),
@@ -1018,19 +1019,33 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
-    async fn files_for_tag(
+    async fn run_query(
         &self,
-        tag_id: TagId,
+        query: String,
         subtag_rule: SubtagRule,
-    ) -> Result<Vec<FileId>, ApiError> {
+    ) -> Result<QueryResult, ApiError> {
         match self
-            .call(ControlRequest::FilesForTag {
-                tag_id,
+            .call(ControlRequest::RunQuery {
+                query,
                 subtag_rule,
             })
             .await?
         {
-            ControlResponse::FileIds(file_ids) => Ok(file_ids),
+            ControlResponse::QueryResult(result) => Ok(result),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
+        match self.call(ControlRequest::GetFile { file_id }).await? {
+            ControlResponse::File(file) => Ok(file),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
+        match self.call(ControlRequest::GetTag { tag_id }).await? {
+            ControlResponse::Tag(tag) => Ok(tag),
             other => Err(unexpected(other)),
         }
     }

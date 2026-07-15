@@ -1,91 +1,185 @@
-// File detail: show a file's fields, the tags applied to it, and let the user
-// add/remove tags or delete the file. Drives tagIdsForFileString /
-// tagFileByString / untagFileByString / deleteFileByString.
+// File detail: show a file's fields (path, id, hash, version), the tags
+// applied to it, and let the user rename (change the logical path), add/remove
+// tags, or delete the file. Live-updates on the change stream so external
+// changes / peer syncs / our own mutations all land immediately; if the file
+// disappears underneath us the screen pops itself back to the previous route.
+//
+// Keyed by [fileId] rather than by a captured [FileEntry] so the display
+// always reflects the current state of the store on rebuild.
 
 import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
 import '../rust/api.dart' as tagnet;
 import '../tagnet_service.dart';
+import '../widgets/property_tile.dart';
 import '../widgets/tag_chip.dart';
+import 'tag_detail_screen.dart';
 
 class FileDetailScreen extends StatefulWidget {
-  const FileDetailScreen({
+  FileDetailScreen({
     super.key,
     required this.session,
-    required this.file,
-  });
+    required tagnet.FileEntry file,
+  }) : fileId = file.fileId;
 
   final TagnetSession session;
-  final tagnet.FileEntry file;
+
+  /// The string id of the file to display. Callers still pass a captured
+  /// [tagnet.FileEntry] via the constructor for continuity with the existing
+  /// list rows; the screen only holds onto its id and refetches the full
+  /// entry itself.
+  final String fileId;
 
   @override
   State<FileDetailScreen> createState() => _FileDetailScreenState();
 }
 
 class _FileDetailScreenState extends State<FileDetailScreen> {
-  /// All tags known to the engine, keyed by string id (for name/color lookup).
-  Map<String, tagnet.TagEntry> _allTags = {};
+  tagnet.FileEntry? _file;
+
+  /// Tags currently applied to this file, keyed by string id (for name/color
+  /// lookup when rendering the chips). Bounded by the number of applied tags,
+  /// so we fetch these one-by-one rather than pulling every tag in the store.
+  Map<String, tagnet.TagEntry> _appliedTags = {};
 
   /// The string ids of tags currently applied to this file (direct only).
   List<String> _appliedTagIds = [];
 
   bool _loading = true;
   String? _error;
+  bool _deleted = false;
+  bool _watching = false;
 
   tagnet.TagnetApp get _app => widget.session.app;
-  tagnet.FileEntry get _file => widget.file;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _watch();
+  }
+
+  @override
+  void dispose() {
+    _watching = false;
+    super.dispose();
+  }
+
+  Future<void> _watch() async {
+    _watching = true;
+    try {
+      final events = await _app.subscribe();
+      while (mounted && _watching) {
+        final event = await events.next();
+        if (event == null) break;
+        if (!mounted) break;
+        await _load();
+      }
+    } catch (_) {
+      // Stream errors are surfaced elsewhere (bootstrap) — ignore here so a
+      // transient hiccup doesn't kill the screen.
+    }
   }
 
   Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
     try {
-      final tags = await _app.listTagEntries();
+      // Fetch the file itself, its applied tag ids, and each applied tag's row.
+      // All three stay bounded by "this file"; nothing scans the whole store.
+      final file = await _app.getFileEntry(fileId: widget.fileId);
       // Direct tags only (Exclude = no subtag recursion) — these are the ones
       // the user can meaningfully add/remove on this file.
       final applied = await _app.tagIdsForFileString(
-        fileId: _file.fileId,
+        fileId: widget.fileId,
         subtagRule: tagnet.SubtagRule.exclude,
+      );
+      final entries = await Future.wait(
+        applied.map((id) => _app.getTagEntry(tagId: id)),
       );
       if (!mounted) return;
       setState(() {
-        _allTags = {for (final t in tags) t.tagId: t};
+        _file = file;
         _appliedTagIds = applied;
+        _appliedTags = {for (final t in entries) t.tagId: t};
         _loading = false;
+        _error = null;
       });
     } catch (error) {
       if (!mounted) return;
+      // `getFileEntry` (or a tag lookup on a just-deleted-then-recreated race)
+      // throws NotFound when the entity is gone; treat NotFound on the file
+      // itself as "deleted underneath us" and pop back to the previous route.
+      final isMissing = '$error'.contains('NotFound');
       setState(() {
-        _error = '$error';
+        if (isMissing) {
+          _file = null;
+          _error = null;
+          if (!_deleted) {
+            _deleted = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) Navigator.of(context).maybePop();
+            });
+          }
+        } else {
+          _error = '$error';
+        }
         _loading = false;
       });
     }
   }
 
+  Future<void> _renameFile() async {
+    final file = _file;
+    if (file == null) return;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => _RenameFileDialog(initial: file.path),
+    );
+    if (result == null) return;
+    final trimmed = result.trim();
+    if (trimmed.isEmpty || trimmed == file.path) return;
+    try {
+      await _app.moveFileByString(
+        fileId: widget.fileId,
+        logicalPath: trimmed,
+      );
+      // Live update flows in via the change stream.
+    } catch (error) {
+      _snack('Failed to rename file: $error');
+    }
+  }
+
   Future<void> _removeTag(String tagId) async {
     try {
-      await _app.untagFileByString(tagId: tagId, fileId: _file.fileId);
-      await _load();
+      await _app.untagFileByString(tagId: tagId, fileId: widget.fileId);
     } catch (error) {
       _snack('Failed to remove tag: $error');
     }
   }
 
   Future<void> _addTag() async {
+    // TODO(perf/UX): this runs an empty `runQuery` to list every tag, purely
+    // to power the picker. It's deferred until the user taps Add (so file
+    // detail opens don't pay the cost), but the picker itself still scans the
+    // whole tag store. Revisit — the right shape is likely a small
+    // search-in-picker that calls `runQuery` per keystroke, matching the home
+    // screen's model. Same TODO applies to TagDetailScreen._pickTag.
+    final tagnet.QueryEntries all;
+    try {
+      all = await _app.runQuery(
+        query: '',
+        subtagRule: tagnet.SubtagRule.include,
+      );
+    } catch (error) {
+      _snack('Failed to load tags: $error');
+      return;
+    }
+    if (!mounted) return;
     final applied = _appliedTagIds.toSet();
-    final available = _allTags.values
-        .where((t) => !applied.contains(t.tagId))
-        .toList();
+    final available =
+        all.tags.where((t) => !applied.contains(t.tagId)).toList();
     if (available.isEmpty) {
-      _snack('No more tags to add. Create one on the Tags screen.');
+      _snack('No more tags to add.');
       return;
     }
     final chosen = await showModalBottomSheet<tagnet.TagEntry>(
@@ -107,19 +201,20 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     );
     if (chosen == null) return;
     try {
-      await _app.tagFileByString(tagId: chosen.tagId, fileId: _file.fileId);
-      await _load();
+      await _app.tagFileByString(tagId: chosen.tagId, fileId: widget.fileId);
     } catch (error) {
       _snack('Failed to add tag: $error');
     }
   }
 
   Future<void> _deleteFile() async {
+    final file = _file;
+    if (file == null) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('Delete file?'),
-        content: Text('Delete "${_file.path}"? This cannot be undone.'),
+        content: Text('Delete "${file.path}"? This cannot be undone.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -134,10 +229,12 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     );
     if (confirmed != true) return;
     try {
-      await _app.deleteFileByString(_file.fileId);
+      _deleted = true;
+      await _app.deleteFileByString(widget.fileId);
       if (!mounted) return;
-      Navigator.pop(context); // back to the list; the change stream refreshes it
+      Navigator.of(context).maybePop();
     } catch (error) {
+      _deleted = false;
       _snack('Failed to delete file: $error');
     }
   }
@@ -149,83 +246,159 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final file = _file;
     return Scaffold(
       appBar: AppBar(
-        title: Text(_file.path, overflow: TextOverflow.ellipsis),
+        title: Text(file?.path ?? 'File', overflow: TextOverflow.ellipsis),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.delete_outline),
-            tooltip: 'Delete file',
-            onPressed: _deleteFile,
-          ),
+          if (file != null)
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Delete file',
+              onPressed: _deleteFile,
+            ),
         ],
       ),
-      body: _buildBody(),
+      body: _buildBody(context),
     );
   }
 
-  Widget _buildBody() {
+  Widget _buildBody(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_error != null) return Center(child: Text('Error: $_error'));
-
+    final file = _file;
+    if (file == null) {
+      // Post-frame pop is queued; render a neutral state in the meantime.
+      return const SizedBox.shrink();
+    }
+    final theme = Theme.of(context);
     return ListView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.symmetric(vertical: 8),
       children: [
-        _field('Path', _file.path),
-        _field('File id', _file.fileId, mono: true),
-        _field('Content hash', _file.contentHash, mono: true),
-        _field('Version', 'v${_file.versionNumber}'),
-        const SizedBox(height: 24),
-        Row(
-          children: [
-            const Text('Tags', style: TextStyle(fontWeight: FontWeight.bold)),
-            const Spacer(),
-            TextButton.icon(
-              icon: const Icon(Icons.add, size: 18),
-              label: const Text('Add'),
-              onPressed: _addTag,
-            ),
-          ],
+        PropertyTile(
+          label: 'Path',
+          value: file.path,
+          trailing: const Icon(Icons.edit_outlined, size: 20),
+          onTap: _renameFile,
         ),
-        const SizedBox(height: 8),
-        if (_appliedTagIds.isEmpty)
-          const Text('No tags applied.')
-        else
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
+        PropertyTile(
+          label: 'File ID',
+          value: file.fileId,
+          monospace: true,
+        ),
+        PropertyTile(
+          label: 'Content hash',
+          value: file.contentHash,
+          monospace: true,
+        ),
+        PropertyTile(
+          label: 'Version',
+          value: 'v${file.versionNumber}',
+        ),
+        const SizedBox(height: 16),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              for (final tagId in _appliedTagIds)
-                _tagChipFor(tagId),
+              Row(
+                children: [
+                  Text(
+                    'Tags',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    icon: const Icon(Icons.add, size: 18),
+                    label: const Text('Add'),
+                    onPressed: _addTag,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              if (_appliedTagIds.isEmpty)
+                const Text('No tags applied.')
+              else
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final tagId in _appliedTagIds) _tagChipFor(tagId),
+                  ],
+                ),
             ],
           ),
+        ),
       ],
     );
   }
 
   Widget _tagChipFor(String tagId) {
-    final tag = _allTags[tagId];
+    final tag = _appliedTags[tagId];
     if (tag == null) {
-      // Applied tag not in the listing (e.g. race). Show the raw id.
+      // Applied tag not resolved (e.g. race between _load steps). Show the
+      // raw id so the row is still meaningful.
       return Chip(label: Text(tagId, style: const TextStyle(fontFamily: 'monospace')));
     }
-    return TagChip(tag: tag, onDeleted: () => _removeTag(tagId));
+    return TagChip(
+      tag: tag,
+      onPressed: () => Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => TagDetailScreen(
+            session: widget.session,
+            tagId: tagId,
+          ),
+        ),
+      ),
+      onDeleted: () => _removeTag(tagId),
+    );
+  }
+}
+
+/// Prompts the user for a new logical path. Pops the entered string on submit,
+/// or `null` on cancel. Empty / unchanged input is filtered by the caller.
+class _RenameFileDialog extends StatefulWidget {
+  const _RenameFileDialog({required this.initial});
+
+  final String initial;
+
+  @override
+  State<_RenameFileDialog> createState() => _RenameFileDialogState();
+}
+
+class _RenameFileDialogState extends State<_RenameFileDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initial);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
   }
 
-  Widget _field(String label, String value, {bool mono = false}) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-          const SizedBox(height: 2),
-          SelectableText(
-            value,
-            style: mono ? const TextStyle(fontFamily: 'monospace') : null,
-          ),
-        ],
+  void _submit() => Navigator.pop(context, _controller.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Rename file'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: const InputDecoration(labelText: 'Logical path'),
+        onSubmitted: (_) => _submit(),
       ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        TextButton(onPressed: _submit, child: const Text('Save')),
+      ],
     );
   }
 }

@@ -17,6 +17,22 @@ extension TagnetServiceX on tagnet.TagnetApp {
     await deleteTag(tagId: await resolveTagId(prefix: tagId));
   }
 
+  /// Rename a tag identified by its string id.
+  Future<void> renameTagByString({
+    required String tagId,
+    required String name,
+  }) async {
+    await renameTag(tagId: await resolveTagId(prefix: tagId), name: name);
+  }
+
+  /// Change the color of a tag identified by its string id.
+  Future<void> setTagColorByString({
+    required String tagId,
+    required String color,
+  }) async {
+    await setTagColor(tagId: await resolveTagId(prefix: tagId), color: color);
+  }
+
   /// Delete a file by its string id (as shown in FileEntry.fileId).
   Future<void> deleteFileByString(String fileId) async {
     await deleteFile(fileId: await resolveFileId(prefix: fileId));

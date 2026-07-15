@@ -2,13 +2,14 @@
 //
 // This is entirely platform-agnostic: it takes a [TagnetBootstrap] (chosen in
 // main.dart via --dart-define) and drives the lifecycle that is identical on
-// every platform — connect, subscribe to the change stream, and re-fetch the
-// file/tag lists on each event. The actual pixels live in screens/.
+// every platform — connect, then hand the session to the home screen. Live
+// updates and query dispatch are owned by the screens themselves (each opens
+// its own change-stream subscription), so no state below the session lives
+// here anymore. The actual pixels live in screens/.
 
 import 'package:flutter/material.dart';
 
 import 'bootstrap/bootstrap.dart';
-import 'rust/api.dart' as tagnet;
 import 'screens/home_screen.dart';
 
 class TagnetApp extends StatefulWidget {
@@ -27,10 +28,7 @@ final GlobalKey<ScaffoldMessengerState> _messengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
 class _TagnetAppState extends State<TagnetApp> {
-  String _status = 'starting...';
   TagnetSession? _session;
-  List<tagnet.FileEntry> _files = [];
-  int _tagCount = 0;
 
   @override
   void initState() {
@@ -43,44 +41,21 @@ class _TagnetAppState extends State<TagnetApp> {
       final session = await widget.bootstrap.connect();
       setState(() {
         _session = session;
-        _status = 'connected';
       });
 
       // Wire any platform-only inputs (Android share sheet); no-op on Linux.
+      // `onChanged` used to trigger an app-level re-fetch; screens now watch
+      // the change stream directly, so the callback is intentionally a no-op.
       widget.bootstrap.attachInputs(
         session,
         showMessage: _showMessage,
-        onChanged: _refresh,
+        onChanged: () {},
       );
-
-      // Subscribe BEFORE the initial fetch. Peer connection and reconciliation
-      // run asynchronously, so a change can land between fetch and subscribe
-      // and be missed (the broadcast stream only delivers to subscribers
-      // present when an event is sent). Subscribing first closes that race; the
-      // initial _refresh() then captures whatever is already there.
-      final events = await session.app.subscribe();
-      await _refresh();
-
-      while (mounted) {
-        final event = await events.next();
-        if (event == null) break; // stream closed (engine/daemon gone)
-        await _refresh();
-      }
     } catch (error) {
-      setState(() => _status = 'failed: $error');
+      // TODO: surface connection failures in the UI once the redesigned
+      // status/error surface lands. For now they only appear in logs.
+      debugPrint('tagnet bootstrap failed: $error');
     }
-  }
-
-  Future<void> _refresh() async {
-    final session = _session;
-    if (session == null) return;
-    final files = await session.app.listFileEntries();
-    final tags = await session.app.listTagEntries();
-    if (!mounted) return;
-    setState(() {
-      _files = files;
-      _tagCount = tags.length;
-    });
   }
 
   void _showMessage(String message) {
@@ -102,13 +77,7 @@ class _TagnetAppState extends State<TagnetApp> {
     return MaterialApp(
       title: 'tagnet',
       scaffoldMessengerKey: _messengerKey,
-      home: HomeScreen(
-        status: _status,
-        session: _session,
-        files: _files,
-        tagCount: _tagCount,
-        onRefresh: _session == null ? null : _refresh,
-      ),
+      home: HomeScreen(session: _session),
     );
   }
 }
