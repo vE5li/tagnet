@@ -228,7 +228,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   Future<void> _addParent() async {
     final chosen = await _pickTag(
-      title: 'Add parent tag',
+      title: 'Add tag',
       excludeIds: _parentTagIds.toSet(),
     );
     if (chosen == null) return;
@@ -379,13 +379,9 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
           value: tag.color,
           trailing: TagColorSwatch(color: tag.color),
           onTap: _recolorTag,
-        ),
-        PropertyTile(
-          label: 'Tag ID',
-          value: tag.tagId,
           monospace: true,
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         _TagsSection(
           title: 'Tags',
           tagIds: _parentTagIds,
@@ -404,6 +400,13 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
           onRemove: _removeSubtag,
           onTapTag: _openTag,
           emptyLabel: 'No subtags.',
+        ),
+        const SizedBox(height: 24),
+        PropertyTile(
+          label: 'Tag id',
+          value: tag.tagId,
+          monospace: true,
+          dense: true,
         ),
       ],
     );
@@ -457,7 +460,6 @@ class _TagsSection extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 8),
           if (tagIds.isEmpty)
             Text(emptyLabel)
           else

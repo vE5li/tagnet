@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import '../bootstrap/bootstrap.dart';
 import '../rust/api.dart' as tagnet;
 import '../tagnet_service.dart';
+import '../widgets/file_preview.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/tag_chip.dart';
 import 'tag_detail_screen.dart';
@@ -45,6 +46,11 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
 
   /// The string ids of tags currently applied to this file (direct only).
   List<String> _appliedTagIds = [];
+
+  /// Absolute on-disk path where this file's bytes currently live locally, or
+  /// `null` if no sync directory on this device holds a copy. Refreshed on
+  /// every [_load] so a fetch/eviction elsewhere shows up in the preview.
+  String? _localPath;
 
   bool _loading = true;
   String? _error;
@@ -96,11 +102,16 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       final entries = await Future.wait(
         applied.map((id) => _app.getTagEntry(tagId: id)),
       );
+      // Best-effort: absence (not-synced-here) is expected, not an error. Any
+      // hard failure surfaces below as `_error` via the outer catch.
+      final localPath =
+          await _app.localPathForFileByString(fileId: widget.fileId);
       if (!mounted) return;
       setState(() {
         _file = file;
         _appliedTagIds = applied;
         _appliedTags = {for (final t in entries) t.tagId: t};
+        _localPath = localPath;
         _loading = false;
         _error = null;
       });
@@ -275,25 +286,12 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: 8),
       children: [
+        _buildPreview(context, file),
         PropertyTile(
           label: 'Path',
           value: file.path,
           trailing: const Icon(Icons.edit_outlined, size: 20),
           onTap: _renameFile,
-        ),
-        PropertyTile(
-          label: 'File ID',
-          value: file.fileId,
-          monospace: true,
-        ),
-        PropertyTile(
-          label: 'Content hash',
-          value: file.contentHash,
-          monospace: true,
-        ),
-        PropertyTile(
-          label: 'Version',
-          value: 'v${file.versionNumber}',
         ),
         const SizedBox(height: 16),
         Padding(
@@ -318,7 +316,6 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
               if (_appliedTagIds.isEmpty)
                 const Text('No tags applied.')
               else
@@ -332,7 +329,60 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
             ],
           ),
         ),
+        const SizedBox(height: 24),
+        PropertyTile(
+          label: 'Version',
+          value: '${file.versionNumber}',
+          dense: true,
+        ),
+        PropertyTile(
+          label: 'File id',
+          value: file.fileId,
+          monospace: true,
+          dense: true,
+        ),
+        PropertyTile(
+          label: 'Content hash',
+          value: file.contentHash,
+          monospace: true,
+          dense: true,
+        ),
       ],
+    );
+  }
+
+  /// The file's inline preview, or a placeholder if no local copy is present.
+  ///
+  /// Not every known file has bytes on this device: peers can advertise files
+  /// whose content we haven't fetched yet. In that case `_localPath` is null
+  /// and we render a neutral "not synced" tile instead of the preview widget.
+  /// Preview height is bounded so it never crowds out the tags/properties.
+  Widget _buildPreview(BuildContext context, tagnet.FileEntry file) {
+    final theme = Theme.of(context);
+    final path = _localPath;
+    final header = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Text(
+        'Preview',
+        style: theme.textTheme.labelMedium?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+    final body = path == null
+        ? ListTile(
+            leading: const Icon(Icons.cloud_off_outlined),
+            title: const Text('Not available locally'),
+            subtitle: const Text('No sync directory on this device holds a copy.'),
+          )
+        : ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 360),
+            child: FilePreview(path: path),
+          );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [header, body],
     );
   }
 

@@ -50,22 +50,43 @@ pub enum SubtagRule {
 /// A single clause of a file search (see [`FileDatabase::file_ids_for_query`]).
 ///
 /// Terms are combined conjunctively: a file matches a query only if it matches
-/// *every* term.
+/// *every* term. Each term corresponds to one parsed chunk from the API layer
+/// (`api::chunk::Chunk`) after its tag references have been resolved to
+/// [`TagId`] sets.
 ///
-/// A single `$foo`/`!foo` token can match a *set* of tags (every tag whose name
-/// contains `foo` or whose id starts with `foo`), so the tag terms carry a
-/// resolved [`TagId`] set rather than a single id; the set is expanded from the
-/// user's syntax in a higher layer (the daemon's API), keeping this database
-/// primitive free of name/prefix-resolution concerns. An empty set matches no
-/// tag (so `HasTag([])` matches no file and `NotTag([])` excludes nothing).
+/// A single tag token can match a *set* of tags (every tag whose name contains
+/// the token substring or whose id starts with it), so the tag-bearing terms
+/// carry a resolved [`TagId`] set rather than a single id; the set is expanded
+/// from the user's syntax in a higher layer (the daemon's API), keeping this
+/// database primitive free of name/prefix-resolution concerns. An empty set
+/// matches no tag (so `HasTag([])` matches no file and `NotTag([])` excludes
+/// nothing).
+///
+/// The `Any`/`NotAny` variants correspond to a *prefix-less* chunk: the user
+/// wrote `foo`, and it should match anything that could reasonably relate to
+/// `foo` — its logical path contains `foo`, *or* it carries/subtags a tag
+/// resolved from `foo`. These variants carry both the raw substring and the
+/// resolved tag set so both sides of the disjunction can be evaluated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryTerm {
-    /// The file must carry *at least one* tag in this set.
+    /// `/t foo` — must carry *at least one* tag in this set.
     HasTag(Vec<TagId>),
-    /// The file must carry *none* of the tags in this set.
+    /// `! /t foo` — must carry *none* of the tags in this set.
     NotTag(Vec<TagId>),
-    /// The file's logical path must contain this substring (case-insensitive).
-    NameContains(String),
+    /// `/l foo` — the logical path (file) or name (tag) must contain the
+    /// substring (case-insensitive).
+    LogicalContains(String),
+    /// `! /l foo` — the logical path (file) or name (tag) must *not* contain
+    /// the substring (case-insensitive).
+    NotLogicalContains(String),
+    /// Prefix-less `foo` — matches on *either* substring OR tag (union across
+    /// both axes). The [`String`] is the substring; the [`Vec<TagId>`] is the
+    /// resolved tag set for the same token. An empty tag set here does **not**
+    /// mean "matches nothing" — the substring side still stands.
+    AnyMatch(String, Vec<TagId>),
+    /// Negation of [`AnyMatch`]: must match *neither* the substring nor any
+    /// tag in the set.
+    NotAnyMatch(String, Vec<TagId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,13 +1232,18 @@ impl FileDatabase {
     ///   traversal governed by `subtag_rule`).
     /// - [`QueryTerm::NotTag`]: it carries *none* of the tags in the set (same
     ///   traversal).
-    /// - [`QueryTerm::NameContains`]: its logical path contains the substring,
-    ///   compared case-insensitively.
+    /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
+    ///   its logical path contains / does not contain the substring, compared
+    ///   case-insensitively.
+    /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: its logical
+    ///   path contains the substring **or** it carries any tag in the set —
+    ///   the "prefix-less" chunk semantics.
     ///
     /// An empty term list matches every file; an empty tag set inside a term
     /// matches no tag (so `HasTag([])` matches nothing and `NotTag([])` excludes
-    /// nothing). Composes [`Self::file_ids_for_tag`] and [`Self::get_all_files`];
-    /// no new SQL.
+    /// nothing). For [`QueryTerm::AnyMatch`] the substring side still stands
+    /// when the tag set is empty. Composes [`Self::file_ids_for_tag`] and
+    /// [`Self::get_all_files`]; no new SQL.
     pub fn file_ids_for_query(
         &self,
         terms: &[QueryTerm],
@@ -1233,9 +1259,12 @@ impl FileDatabase {
             Ok(union)
         };
 
-        // Seed the candidate set. If there is at least one positive tag term,
-        // start from the intersection of those (each contributing the union of
-        // its matched tags' files); otherwise start from all files.
+        // Seed the candidate set. If there is at least one positive tag-only
+        // term (`HasTag`), start from the intersection of those (each
+        // contributing the union of its matched tags' files); otherwise start
+        // from all files. `AnyMatch` is *not* a seed — its substring half can
+        // match files that carry no tags at all, so we always need every file
+        // in the candidate pool for the filter pass below.
         let positive: Vec<&[TagId]> = terms
             .iter()
             .filter_map(|term| match term {
@@ -1266,26 +1295,70 @@ impl FileDatabase {
             }
         }
 
-        // Apply name-substring filters. These need each candidate's logical
-        // path, so build a lookup from the full listing once.
-        let name_needles: Vec<String> = terms
-            .iter()
-            .filter_map(|term| match term {
-                QueryTerm::NameContains(needle) => Some(needle.to_lowercase()),
-                _ => None,
-            })
-            .collect();
+        // Text-bearing terms (`LogicalContains`, `NotLogicalContains`,
+        // `AnyMatch`, `NotAnyMatch`) need each candidate's logical path *and*,
+        // for the `Any` variants, the union of files-carrying-any-of-the-set.
+        // Build both lookups once, then apply every text term as one retain
+        // pass — cheaper than rebuilding per term and keeps the semantics
+        // obvious.
+        let has_text_term = terms.iter().any(|term| {
+            matches!(
+                term,
+                QueryTerm::LogicalContains(_)
+                    | QueryTerm::NotLogicalContains(_)
+                    | QueryTerm::AnyMatch(_, _)
+                    | QueryTerm::NotAnyMatch(_, _),
+            )
+        });
 
-        if !name_needles.is_empty() {
+        if has_text_term {
             let paths: std::collections::BTreeMap<FileId, String> = self
                 .get_all_files()?
                 .into_iter()
                 .map(|file| (file.file_id, file.logical_path.as_str().to_lowercase()))
                 .collect();
 
-            candidates.retain(|file_id| match paths.get(file_id) {
-                Some(path) => name_needles.iter().all(|needle| path.contains(needle)),
-                None => false,
+            // Precompute the file set for every `Any` variant so we don't hit
+            // the DB inside the retain closure.
+            let mut any_tag_sets: Vec<(String, BTreeSet<FileId>, bool)> = Vec::new();
+            for term in terms {
+                let (needle, tag_ids, negated) = match term {
+                    QueryTerm::AnyMatch(needle, tag_ids) => (needle, tag_ids, false),
+                    QueryTerm::NotAnyMatch(needle, tag_ids) => (needle, tag_ids, true),
+                    _ => continue,
+                };
+                any_tag_sets.push((
+                    needle.to_lowercase(),
+                    files_for_any_tag(tag_ids)?,
+                    negated,
+                ));
+            }
+
+            candidates.retain(|file_id| {
+                let Some(path) = paths.get(file_id) else {
+                    return false;
+                };
+                for term in terms {
+                    let ok = match term {
+                        QueryTerm::LogicalContains(needle) => {
+                            path.contains(&needle.to_lowercase())
+                        }
+                        QueryTerm::NotLogicalContains(needle) => {
+                            !path.contains(&needle.to_lowercase())
+                        }
+                        _ => continue,
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                for (needle, tagged_files, negated) in &any_tag_sets {
+                    let hit = path.contains(needle) || tagged_files.contains(file_id);
+                    if hit == *negated {
+                        return false;
+                    }
+                }
+                true
             });
         }
 
@@ -1300,12 +1373,17 @@ impl FileDatabase {
     ///   of "a file carries this tag".
     /// - [`QueryTerm::NotTag`]: the tag must *not* be a subtag of any tag in the
     ///   set.
-    /// - [`QueryTerm::NameContains`]: the tag's name contains the substring,
-    ///   compared case-insensitively.
+    /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
+    ///   the tag's name contains / does not contain the substring, compared
+    ///   case-insensitively.
+    /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: the tag's name
+    ///   contains the substring **or** the tag is a subtag of any tag in the
+    ///   set — the tag analogue of the file-side `Any` semantics.
     ///
     /// An empty term list matches every tag; an empty tag set inside a term
-    /// matches no tag. Composes [`Self::subtag_ids_for_tag`] and
-    /// [`Self::get_all_tags`]; no new SQL.
+    /// matches no tag. For [`QueryTerm::AnyMatch`] the substring side still
+    /// stands when the tag set is empty. Composes [`Self::subtag_ids_for_tag`]
+    /// and [`Self::get_all_tags`]; no new SQL.
     pub fn tag_ids_for_query(
         &self,
         terms: &[QueryTerm],
@@ -1321,6 +1399,9 @@ impl FileDatabase {
             Ok(union)
         };
 
+        // Seed on `HasTag` only, same reasoning as `file_ids_for_query`:
+        // `AnyMatch` can match on the name side without any tag membership, so
+        // we can't use it to narrow the seed.
         let positive: Vec<&[TagId]> = terms
             .iter()
             .filter_map(|term| match term {
@@ -1350,24 +1431,62 @@ impl FileDatabase {
             }
         }
 
-        let name_needles: Vec<String> = terms
-            .iter()
-            .filter_map(|term| match term {
-                QueryTerm::NameContains(needle) => Some(needle.to_lowercase()),
-                _ => None,
-            })
-            .collect();
+        let has_text_term = terms.iter().any(|term| {
+            matches!(
+                term,
+                QueryTerm::LogicalContains(_)
+                    | QueryTerm::NotLogicalContains(_)
+                    | QueryTerm::AnyMatch(_, _)
+                    | QueryTerm::NotAnyMatch(_, _),
+            )
+        });
 
-        if !name_needles.is_empty() {
+        if has_text_term {
             let names: std::collections::BTreeMap<TagId, String> = self
                 .get_all_tags()?
                 .into_iter()
                 .map(|tag| (tag.id, tag.name.to_lowercase()))
                 .collect();
 
-            candidates.retain(|tag_id| match names.get(tag_id) {
-                Some(name) => name_needles.iter().all(|needle| name.contains(needle)),
-                None => false,
+            let mut any_tag_sets: Vec<(String, BTreeSet<TagId>, bool)> = Vec::new();
+            for term in terms {
+                let (needle, tag_ids, negated) = match term {
+                    QueryTerm::AnyMatch(needle, tag_ids) => (needle, tag_ids, false),
+                    QueryTerm::NotAnyMatch(needle, tag_ids) => (needle, tag_ids, true),
+                    _ => continue,
+                };
+                any_tag_sets.push((
+                    needle.to_lowercase(),
+                    subtags_of_any(tag_ids)?,
+                    negated,
+                ));
+            }
+
+            candidates.retain(|tag_id| {
+                let Some(name) = names.get(tag_id) else {
+                    return false;
+                };
+                for term in terms {
+                    let ok = match term {
+                        QueryTerm::LogicalContains(needle) => {
+                            name.contains(&needle.to_lowercase())
+                        }
+                        QueryTerm::NotLogicalContains(needle) => {
+                            !name.contains(&needle.to_lowercase())
+                        }
+                        _ => continue,
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                for (needle, subtagged, negated) in &any_tag_sets {
+                    let hit = name.contains(needle) || subtagged.contains(tag_id);
+                    if hit == *negated {
+                        return false;
+                    }
+                }
+                true
             });
         }
 
@@ -1518,7 +1637,7 @@ impl FileDatabase {
         Ok(tag_list)
     }
 
-    /// Get the name of a tag by the ID.
+    /// Get the name of a tag by the id.
     pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
         let mut statement = self
             .connection
@@ -1542,7 +1661,7 @@ impl FileDatabase {
         Ok(tag)
     }
 
-    /// Get the ID of a file by its logical path.
+    /// Get the id of a file by its logical path.
     pub fn file_id_from_logical_path(
         &self,
         logical_path: &LogicalPath,
@@ -1612,7 +1731,7 @@ impl FileDatabase {
         Ok(ids.into_iter().collect())
     }
 
-    /// Get the ID of a tag by the name.
+    /// Get the id of a tag by the name.
     pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
         let mut statement = self
             .connection

@@ -130,7 +130,7 @@ fn tag_table(tags: &[Tag], tags_by_tag: &HashMap<TagId, Vec<String>>) -> Table {
     table
         .load_preset(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Tag ID", "Name", "Color", "Tags"]);
+        .set_header(vec!["Tag id", "Name", "Color", "Tags"]);
 
     for tag in tags {
         let id = tag.id.to_string();
@@ -164,7 +164,7 @@ fn file_table(files: &[FileInfo], tags_by_file: &HashMap<FileId, Vec<String>>) -
     table
         .load_preset(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["File ID", "Path", "Version", "Tags"]);
+        .set_header(vec!["File id", "Path", "Version", "Tags"]);
 
     for file in files {
         let id = file.file_id.to_string();
@@ -405,10 +405,17 @@ enum Commands {
     },
     /// Search files with a free-form query.
     ///
-    /// The query is a whitespace-separated list of terms combined
-    /// conjunctively: `$tag` requires a tag, `!tag` (or `!$tag`) excludes one,
-    /// and any other word is matched as a case-insensitive substring of the
-    /// file's logical path. Example: `tagnet search '$photos !archived beach'`.
+    /// The query is a whitespace-separated list of chunks combined
+    /// conjunctively. Each chunk may be prefixed:
+    ///
+    /// - `/t foo` — require the tag(s) matching `foo`
+    /// - `/l foo` — logical-path substring
+    /// - `!` — invert the following chunk (e.g. `! /t foo`)
+    /// - no prefix — match `foo` as *either* a logical-path substring OR a tag
+    ///
+    /// Quote payloads to include whitespace: `/t "my tag"`. Malformed chunks
+    /// are silently dropped. Example:
+    ///   `tagnet search '/t photos ! /t archived beach'`.
     #[command(visible_alias = "s")]
     Search {
         /// The query terms; joined with spaces if given as multiple arguments.

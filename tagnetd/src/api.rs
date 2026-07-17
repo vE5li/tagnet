@@ -268,18 +268,27 @@ impl Api {
     /// The query is a whitespace-separated list of terms, combined
     /// conjunctively (a result must satisfy every term):
     ///
-    /// - `$name` — require the tag whose id/name resolves from `name` (a full or
-    ///   short tag-id prefix). A file matches if it carries the tag; a tag
-    ///   matches if it is a subtag of it.
-    /// - `!name` or `!$name` — exclude that tag (the negation of the above).
-    /// - any other token — a case-insensitive substring match against the
-    ///   file's logical path / the tag's name.
+    /// The query is a whitespace-separated list of *chunks*, each optionally
+    /// prefixed by `!` (negation) and/or a kind prefix:
     ///
-    /// Tag tokens are resolved to [`TagId`]s here, in the daemon, so clients can
-    /// pass the raw string straight through. An unresolvable/ambiguous tag token
-    /// surfaces as [`ApiError::NotFound`] / [`ApiError::Ambiguous`]. An empty
-    /// query matches everything. `subtag_rule` controls hierarchy traversal for
-    /// the tag terms.
+    /// - `/t foo` — require the tag(s) resolved from `foo`. A file matches if
+    ///   it carries any such tag; a tag matches if it is a subtag of any.
+    /// - `/l foo` — case-insensitive substring against the file's logical
+    ///   path (or the tag's name on the tag side).
+    /// - `/p foo` — reserved for physical-path search; currently a no-op.
+    /// - `foo` (no prefix) — matches on *either* side: logical/name substring
+    ///   OR tag membership. This is the "just find anything that looks like
+    ///   `foo`" chunk.
+    /// - `!` in front of any of the above inverts the filter.
+    ///
+    /// Chunks with whitespace can be quoted: `/t "foo bar"`.
+    ///
+    /// Parsing is forgiving — malformed chunks are silently dropped so a
+    /// half-typed query in a search box still returns results (see
+    /// [`chunk`] for the full grammar and recovery rules). Tag tokens are
+    /// resolved to [`TagId`]s here so clients pass the raw string through; an
+    /// empty query matches everything. `subtag_rule` controls hierarchy
+    /// traversal for the tag terms.
     ///
     /// Returns full [`FileInfo`]/[`Tag`] rows (not bare ids): the daemon joins
     /// each matched id to its row here, over just the result set, so callers
@@ -338,34 +347,46 @@ impl Api {
 
     /// Parse a free-form query string into resolved [`QueryTerm`]s.
     ///
-    /// Splits on ASCII whitespace and classifies each token by its leading
-    /// sigil (`$` = require tag, `!` = exclude tag, otherwise a name substring).
-    /// Tag tokens are expanded to the *set* of matching tags via
-    /// `tag_ids_matching_token` (name substring OR id prefix). Empty tag tokens
-    /// (a bare `$` or `!`) are rejected as invalid; a token that simply matches
-    /// no tag yields an empty set, which the query treats as "matches no tag"
-    /// rather than an error.
+    /// Two stages: [`chunk::lex_query`] tokenises the string into [`Chunk`]s
+    /// (pure, no DB access — see the [`chunk`] module docs for the grammar and
+    /// error-recovery contract), then this function resolves each chunk into
+    /// one [`QueryTerm`], expanding tag references via
+    /// [`FileDatabase::tag_ids_matching_token`].
+    ///
+    /// Both stages are forgiving:
+    /// - the lexer silently drops malformed chunks (see its module docs);
+    /// - this resolver silently drops any [`ChunkKind::Physical`] chunk, since
+    ///   physical-path search is not wired up yet — the grammar accepts `/p`
+    ///   so users see consistent parsing, but the filter is a no-op.
+    ///
+    /// The only remaining fallible step is `tag_ids_matching_token`, which can
+    /// surface a real database error; that is propagated as-is.
     fn parse_query(database: &FileDatabase, query: &str) -> Result<Vec<QueryTerm>, ApiError> {
+        use chunk::{ChunkKind, lex_query};
+
         let mut terms = Vec::new();
-        for token in query.split_whitespace() {
-            let term = if let Some(rest) = token.strip_prefix('!') {
-                // `!$foo` and `!foo` both mean "exclude tags matching foo".
-                let name = rest.strip_prefix('$').unwrap_or(rest);
-                if name.is_empty() {
-                    return Err(ApiError::InvalidArgument(
-                        "empty tag in '!' term".to_owned(),
-                    ));
+        for chunk in lex_query(query) {
+            let term = match (chunk.kind, chunk.negated) {
+                (ChunkKind::Tag, false) => {
+                    QueryTerm::HasTag(database.tag_ids_matching_token(&chunk.text)?)
                 }
-                QueryTerm::NotTag(database.tag_ids_matching_token(name)?)
-            } else if let Some(name) = token.strip_prefix('$') {
-                if name.is_empty() {
-                    return Err(ApiError::InvalidArgument(
-                        "empty tag in '$' term".to_owned(),
-                    ));
+                (ChunkKind::Tag, true) => {
+                    QueryTerm::NotTag(database.tag_ids_matching_token(&chunk.text)?)
                 }
-                QueryTerm::HasTag(database.tag_ids_matching_token(name)?)
-            } else {
-                QueryTerm::NameContains(token.to_owned())
+                (ChunkKind::Logical, false) => QueryTerm::LogicalContains(chunk.text),
+                (ChunkKind::Logical, true) => QueryTerm::NotLogicalContains(chunk.text),
+                (ChunkKind::Any, false) => QueryTerm::AnyMatch(
+                    chunk.text.clone(),
+                    database.tag_ids_matching_token(&chunk.text)?,
+                ),
+                (ChunkKind::Any, true) => QueryTerm::NotAnyMatch(
+                    chunk.text.clone(),
+                    database.tag_ids_matching_token(&chunk.text)?,
+                ),
+                // `/p` is reserved but not yet supported — drop the chunk so
+                // the rest of the query still works, matching the "forgiving
+                // search box" contract.
+                (ChunkKind::Physical, _) => continue,
             };
             terms.push(term);
         }
@@ -672,5 +693,359 @@ impl Api {
     /// onto an [`ApiEvent::Resynced`] so the UI re-fetches state.
     pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.events.subscribe()
+    }
+}
+
+/// Search-query lexer (stage 1 of two — see [`Api::parse_query`]).
+///
+/// This module is deliberately **pure**: it turns a raw query string into a
+/// vector of [`Chunk`]s without ever touching the database. Resolving a chunk's
+/// text into concrete [`TagId`](tagnet_core::TagId)s or applying it against the
+/// stored files happens in the resolver stage.
+///
+/// # Grammar
+///
+/// A query is a whitespace-separated sequence of *chunks*. A chunk is:
+///
+/// 1. An optional `!` (negation) — must be a standalone whitespace-delimited
+///    token; `!foo` is **not** a negation, it's a literal chunk whose text
+///    starts with `!`.
+/// 2. An optional *kind prefix* — one of `/t`, `/l`, `/p`, again standalone:
+///    - `/t` — tag chunk: match tags whose name/id resolves from the payload.
+///    - `/l` — logical-path chunk: substring match on the file's logical path.
+///    - `/p` — physical-path chunk (reserved; not wired up yet).
+///
+///    Unknown `/x` tokens are **not** prefixes: they become literal chunks
+///    whose payload starts with `/`. This keeps `/home/lucas` searchable.
+/// 3. A *payload*, either:
+///    - A double-quoted string `"..."` — captures whitespace verbatim. Supports
+///      backslash escapes `\"` and `\\`; any other `\c` is left as-is (`\c`).
+///    - Or a bare run of non-whitespace characters.
+///
+/// A chunk without a kind prefix is [`ChunkKind::Any`] — the resolver will
+/// match its payload against *both* names and tags (union).
+///
+/// # Error recovery
+///
+/// Parsing is **infallible**: `lex_query` always returns a `Vec<Chunk>`, never
+/// an error. Malformed input is skipped rather than rejected, so a search box
+/// stays usable mid-typing. Specifically, when the lexer hits any of the
+/// following it *discards the current chunk in progress* and resumes at the
+/// next whitespace boundary:
+///
+/// - a `!` or kind prefix followed by nothing (`!`, `/t`, `! /t` at EOF);
+/// - conflicting kind prefixes (`/t /l foo` drops the `/t /l` chunk and
+///   continues from `foo`);
+/// - a duplicate `!` (`! ! foo` drops that chunk);
+/// - an unterminated quoted string (`"foo` at EOF is dropped entirely).
+///
+/// Diagnostics are intentionally not surfaced: the caller sees only the chunks
+/// that parsed cleanly.
+pub(crate) mod chunk {
+    /// What kind of filter a chunk expresses.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChunkKind {
+        /// No prefix — match names *and* tags (union).
+        Any,
+        /// `/t` — the payload names a tag.
+        Tag,
+        /// `/l` — the payload is a logical-path substring.
+        Logical,
+        /// `/p` — the payload is a physical-path substring. Reserved; the
+        /// resolver does not yet accept this variant.
+        Physical,
+    }
+
+    /// One parsed chunk of the query.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Chunk {
+        pub kind: ChunkKind,
+        pub text: String,
+        pub negated: bool,
+    }
+
+    /// Lex a query string into [`Chunk`]s. See the module docs for the grammar
+    /// and the error-recovery contract (this function is infallible; malformed
+    /// input is silently dropped).
+    pub fn lex_query(query: &str) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        let mut cursor = query;
+
+        while !{
+            cursor = cursor.trim_start();
+            cursor.is_empty()
+        } {
+            let (maybe_chunk, rest) = lex_one_chunk(cursor);
+            if let Some(chunk) = maybe_chunk {
+                chunks.push(chunk);
+            }
+            cursor = rest;
+        }
+        chunks
+    }
+
+    /// Try to lex one chunk starting at `cursor` (which must be non-empty and
+    /// not start with whitespace). Returns the parsed chunk (if any) and the
+    /// remainder of the string to keep lexing.
+    ///
+    /// On any grammar error we return `(None, rest_after_next_whitespace)` —
+    /// the whole in-progress chunk is discarded and lexing resumes at the next
+    /// token boundary. An unterminated quote is treated as consuming the whole
+    /// rest of the string (there is no whitespace boundary that could rescue
+    /// half of a broken quote).
+    fn lex_one_chunk(cursor: &str) -> (Option<Chunk>, &str) {
+        let mut rest = cursor;
+        let mut negated = false;
+        let mut kind: Option<ChunkKind> = None;
+
+        // Consume prefix tokens (`!`, `/t`, `/l`, `/p`) until we hit something
+        // that isn't a prefix — that becomes the payload. On any grammar error
+        // we drop the current chunk and resume at the *next* whitespace
+        // boundary (the token that caused the error is itself skipped).
+        loop {
+            let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let token = &rest[..token_end];
+
+            match token {
+                "!" => {
+                    if negated {
+                        return (None, &rest[token_end..]);
+                    }
+                    negated = true;
+                }
+                "/t" | "/l" | "/p" => {
+                    if kind.is_some() {
+                        return (None, &rest[token_end..]);
+                    }
+                    kind = Some(match token {
+                        "/t" => ChunkKind::Tag,
+                        "/l" => ChunkKind::Logical,
+                        "/p" => ChunkKind::Physical,
+                        _ => unreachable!(),
+                    });
+                }
+                _ => break, // not a prefix — treat as payload
+            }
+
+            // Advance past the prefix and its trailing whitespace.
+            rest = rest[token_end..].trim_start();
+            if rest.is_empty() {
+                // Prefix with no following chunk: drop it.
+                return (None, rest);
+            }
+        }
+
+        // Read the payload: quoted string or bare token.
+        let (text, rest) = if let Some(after_quote) = rest.strip_prefix('"') {
+            match read_quoted(after_quote) {
+                Some(parsed) => parsed,
+                // Unterminated quote: discard the rest of the input entirely.
+                None => return (None, ""),
+            }
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (rest[..end].to_owned(), &rest[end..])
+        };
+
+        (
+            Some(Chunk {
+                kind: kind.unwrap_or(ChunkKind::Any),
+                text,
+                negated,
+            }),
+            rest,
+        )
+    }
+
+    /// Read a `"..."`-quoted payload starting *after* the opening quote.
+    /// Returns `Some((unescaped_text, remainder_after_closing_quote))`, or
+    /// `None` if the closing quote is missing (unterminated string).
+    fn read_quoted(input: &str) -> Option<(String, &str)> {
+        let mut out = String::new();
+        let mut chars = input.char_indices();
+        while let Some((idx, ch)) = chars.next() {
+            match ch {
+                '"' => {
+                    let rest = &input[idx + ch.len_utf8()..];
+                    return Some((out, rest));
+                }
+                '\\' => match chars.next() {
+                    Some((_, esc @ ('"' | '\\'))) => out.push(esc),
+                    Some((_, other)) => {
+                        // Unknown escape: keep the backslash + char verbatim.
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    // Trailing backslash inside a quote: treat as unterminated.
+                    None => return None,
+                },
+                _ => out.push(ch),
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn any(text: &str) -> Chunk {
+            Chunk { kind: ChunkKind::Any, text: text.to_owned(), negated: false }
+        }
+        fn tag(text: &str) -> Chunk {
+            Chunk { kind: ChunkKind::Tag, text: text.to_owned(), negated: false }
+        }
+        fn logical(text: &str) -> Chunk {
+            Chunk { kind: ChunkKind::Logical, text: text.to_owned(), negated: false }
+        }
+        fn negate(mut c: Chunk) -> Chunk {
+            c.negated = true;
+            c
+        }
+
+        #[test]
+        fn empty_and_whitespace_only_yield_no_chunks() {
+            assert_eq!(lex_query(""), Vec::<Chunk>::new());
+            assert_eq!(lex_query("   \t  "), Vec::<Chunk>::new());
+        }
+
+        #[test]
+        fn bare_words_become_any_chunks() {
+            assert_eq!(lex_query("foo bar"), vec![any("foo"), any("bar")]);
+        }
+
+        #[test]
+        fn quoted_strings_capture_whitespace() {
+            assert_eq!(
+                lex_query(r#""foo bar" baz"#),
+                vec![any("foo bar"), any("baz")],
+            );
+        }
+
+        #[test]
+        fn quoted_string_supports_escapes() {
+            assert_eq!(lex_query(r#""a\"b\\c""#), vec![any(r#"a"b\c"#)]);
+        }
+
+        #[test]
+        fn unknown_backslash_escape_is_kept_literally() {
+            // `\n` is not a recognised escape; we keep it verbatim rather than
+            // silently interpreting it, to match the "quotes are only for
+            // whitespace capture" contract.
+            assert_eq!(lex_query(r#""a\nb""#), vec![any(r"a\nb")]);
+        }
+
+        #[test]
+        fn kind_prefixes_apply_to_the_next_chunk() {
+            assert_eq!(lex_query("/t foo"), vec![tag("foo")]);
+            assert_eq!(lex_query("/l foo"), vec![logical("foo")]);
+        }
+
+        #[test]
+        fn kind_prefix_only_matches_as_standalone_token() {
+            // `/tfoo` is not a `/t` prefix — it's a literal chunk starting with `/`.
+            assert_eq!(lex_query("/tfoo"), vec![any("/tfoo")]);
+        }
+
+        #[test]
+        fn negation_alone_and_with_kind_prefix() {
+            assert_eq!(lex_query("! foo"), vec![negate(any("foo"))]);
+            assert_eq!(lex_query("! /t foo"), vec![negate(tag("foo"))]);
+            // Order of `!` and `/t` doesn't matter.
+            assert_eq!(lex_query("/t ! foo"), vec![negate(tag("foo"))]);
+        }
+
+        #[test]
+        fn negation_applies_to_quoted_payload() {
+            assert_eq!(
+                lex_query(r#"! /t "foo bar""#),
+                vec![negate(tag("foo bar"))],
+            );
+        }
+
+        #[test]
+        fn bang_without_space_is_literal_not_negation() {
+            // `!foo` is a literal chunk whose text is `!foo`, matching the
+            // "prefixes are standalone tokens" rule from the grammar.
+            assert_eq!(lex_query("!foo"), vec![any("!foo")]);
+        }
+
+        #[test]
+        fn unknown_slash_prefix_is_literal() {
+            // `/x` isn't a known kind prefix, so it's just a chunk payload.
+            // This keeps paths like `/home/lucas` searchable.
+            assert_eq!(lex_query("/x foo"), vec![any("/x"), any("foo")]);
+            assert_eq!(lex_query("/home/lucas"), vec![any("/home/lucas")]);
+        }
+
+        #[test]
+        fn mixed_query_parses_end_to_end() {
+            // A realistic mix: bare word, tag, quoted logical path, negated tag.
+            let got = lex_query(r#"foo /t bar /l "my file.txt" ! /t old"#);
+            assert_eq!(
+                got,
+                vec![
+                    any("foo"),
+                    tag("bar"),
+                    logical("my file.txt"),
+                    negate(tag("old")),
+                ],
+            );
+        }
+
+        // --- Error-recovery contract --------------------------------------
+        //
+        // The lexer is infallible: it drops the current chunk-in-progress on
+        // any grammar error and resumes at the next whitespace boundary. The
+        // tests below pin down exactly what "resume" means for each error
+        // shape.
+
+        #[test]
+        fn unterminated_quote_drops_rest_of_input() {
+            // Prior chunks are kept; the broken quote and everything after it
+            // are discarded (there is no whitespace *inside* the broken quote
+            // that could rescue the remainder).
+            assert_eq!(lex_query(r#"foo "bar baz"#), vec![any("foo")]);
+            assert_eq!(lex_query(r#""foo"#), Vec::<Chunk>::new());
+        }
+
+        #[test]
+        fn trailing_prefix_is_silently_dropped() {
+            // A prefix with no payload (`!`, `/t`, `! /t` at EOF) yields no
+            // chunk but doesn't affect chunks already parsed.
+            assert_eq!(lex_query("foo !"), vec![any("foo")]);
+            assert_eq!(lex_query("foo /t"), vec![any("foo")]);
+            assert_eq!(lex_query("foo ! /t"), vec![any("foo")]);
+            // Just the bad prefix on its own is an empty result, not an error.
+            assert_eq!(lex_query("!"), Vec::<Chunk>::new());
+            assert_eq!(lex_query("/t"), Vec::<Chunk>::new());
+        }
+
+        #[test]
+        fn conflicting_kind_prefixes_drop_that_chunk_only() {
+            // `/t /l` conflicts — that chunk-in-progress is discarded at the
+            // conflict point, so lexing resumes with `foo bar` intact.
+            assert_eq!(
+                lex_query("/t /l foo bar"),
+                vec![any("foo"), any("bar")],
+            );
+        }
+
+        #[test]
+        fn duplicate_negation_drops_that_chunk_only() {
+            // `! !` is a duplicate — drop it, keep everything else.
+            assert_eq!(
+                lex_query("first ! ! second third"),
+                vec![any("first"), any("second"), any("third")],
+            );
+        }
+
+        #[test]
+        fn errors_between_valid_chunks_do_not_bleed() {
+            // Interleave several error shapes with valid chunks to prove each
+            // recovery is local.
+            let got = lex_query(r#"a /t /l b ! ! c "unterminated"#);
+            assert_eq!(got, vec![any("a"), any("b"), any("c")]);
+        }
     }
 }

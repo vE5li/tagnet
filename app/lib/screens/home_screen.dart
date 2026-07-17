@@ -36,6 +36,13 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _query = TextEditingController();
 
+  /// Owned so we can programmatically drop focus when navigating to a detail
+  /// screen. Without this, Flutter's automatic focus restoration can re-focus
+  /// the search field when the detail route is popped, which re-opens the
+  /// soft keyboard on mobile — a jarring UX papercut every time the user
+  /// backs out of a detail view.
+  final FocusNode _queryFocus = FocusNode();
+
   /// Debounce timer for keystrokes -> `runQuery` calls. Kept short so results
   /// feel live but the daemon isn't hit on every character.
   Timer? _debounce;
@@ -65,6 +72,22 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _query.addListener(_onQueryChanged);
     if (widget.session != null) _watch();
+    // Global Ctrl+F -> focus the search field. We hook `HardwareKeyboard`
+    // directly (rather than using Shortcuts/Actions) because the focus tree
+    // above HomeScreen doesn't route to a Shortcuts widget placed inside it:
+    // shortcut resolution walks up from the currently focused node, so a
+    // Shortcuts widget higher than the focus never sees the event. The raw
+    // handler runs regardless of focus location, which is exactly what a
+    // "global" accelerator wants.
+    HardwareKeyboard.instance.addHandler(_handleGlobalKey);
+  }
+
+  bool _handleGlobalKey(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.keyF) return false;
+    if (!HardwareKeyboard.instance.isControlPressed) return false;
+    _queryFocus.requestFocus();
+    return true; // consume so the browser/OS Ctrl+F is fully suppressed
   }
 
   @override
@@ -77,8 +100,10 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _watching = false;
     _debounce?.cancel();
+    HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     _query.removeListener(_onQueryChanged);
     _query.dispose();
+    _queryFocus.dispose();
     super.dispose();
   }
 
@@ -193,7 +218,11 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.all(16),
-              child: _SearchBar(controller: _query, loading: _loading),
+              child: _SearchBar(
+                controller: _query,
+                focusNode: _queryFocus,
+                loading: _loading,
+              ),
             ),
             Expanded(child: _buildResults()),
           ],
@@ -253,15 +282,21 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class _SearchBar extends StatelessWidget {
-  const _SearchBar({required this.controller, required this.loading});
+  const _SearchBar({
+    required this.controller,
+    required this.focusNode,
+    required this.loading,
+  });
 
   final TextEditingController controller;
+  final FocusNode focusNode;
   final bool loading;
 
   @override
   Widget build(BuildContext context) {
     return TextField(
       controller: controller,
+      focusNode: focusNode,
       decoration: InputDecoration(
         prefixIcon: const Icon(Icons.search),
         hintText: 'Search files and tags',
@@ -320,15 +355,22 @@ class _TagRow extends StatelessWidget {
       leading: TagColorSwatch(color: tag.color),
       title: Text(tag.name),
       trailing: const Icon(Icons.chevron_right),
-      onTap: () => Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => TagDetailScreen(
-            session: session,
-            tagId: tag.tagId,
+      onTap: () {
+        // Drop focus from the search field before pushing so the soft keyboard
+        // hides during navigation and — importantly — is not re-opened when
+        // the user pops back to Home (Flutter otherwise restores focus to the
+        // previously-focused text field on route resumption).
+        FocusManager.instance.primaryFocus?.unfocus();
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => TagDetailScreen(
+              session: session,
+              tagId: tag.tagId,
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -369,15 +411,19 @@ class _FileRow extends StatelessWidget {
       dense: true,
       title: Text(file.path),
       trailing: const Icon(Icons.chevron_right),
-      onTap: () => Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => FileDetailScreen(
-            session: session,
-            file: file,
+      onTap: () {
+        // See _TagRow.onTap for why we drop focus before navigating.
+        FocusManager.instance.primaryFocus?.unfocus();
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => FileDetailScreen(
+              session: session,
+              file: file,
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }

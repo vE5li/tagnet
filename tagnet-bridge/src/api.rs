@@ -323,6 +323,24 @@ impl TagnetApp {
         Ok(FileEntry::from(backend.get_file(file_id).await?))
     }
 
+    /// Absolute on-disk path where `file_id`'s bytes currently live locally,
+    /// or `None` if no sync directory on this device holds a copy (e.g. the
+    /// file is known by metadata but hasn't been fetched yet). Read-only.
+    ///
+    /// The UI uses this to render an inline preview from disk without pulling
+    /// bytes across the bridge. Errors `NotFound` if the id itself is unknown.
+    pub async fn local_path_for_file_by_string(
+        &self,
+        file_id: String,
+    ) -> Result<Option<String>, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(backend
+            .local_path_for_file(file_id)
+            .await?
+            .map(|path| path.to_string_lossy().into_owned()))
+    }
+
     /// Get a single tag's flattened [`TagEntry`] by id string (a full or short
     /// id prefix). Errors `NotFound` if unknown.
     pub async fn get_tag_entry(&self, tag_id: String) -> Result<TagEntry, ApiError> {

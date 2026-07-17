@@ -80,7 +80,7 @@ class TagnetService : Service() {
               "sync_directories": [
                 {
                   "path": "${documents.absolutePath}/phone",
-                  "sync_type": { "TagBased": { "tags": ["467f35d7ae6f4dffb72905ff2bc743c5"] } }
+                  "sync_type": { "TagBased": { "tags": ["467f35d7ae6f4dffb72905ff2bc743c5", "6450a8fe6eb945cc8b40adf4b97408bd"] } }
                 },
                 {
                   "path": "${documents.absolutePath}/audiobooks",

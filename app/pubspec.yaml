@@ -43,6 +43,7 @@ dependencies:
   # project builds with Kotlin 2.2.20 (android/settings.gradle.kts). 1.8.1
   # exposes the same Dart API (getMediaStream / getInitialMedia / reset).
   receive_sharing_intent: ">=1.8.1 <1.9.0"
+  flutter_markdown_plus: ^1.0.3
 
 dev_dependencies:
   flutter_test:
