@@ -40,6 +40,8 @@ pub struct FileEntry {
     pub path: String,
     pub content_hash: String,
     pub version_number: i64,
+    /// The latest version's content size in bytes.
+    pub size: i64,
     /// Number of leading characters of `file_id` that uniquely identify this
     /// file among all files in the listing — the "short id" length, à la
     /// `jj`/`git`. The UI highlights `file_id[..short_id_length]` and dims the
@@ -54,6 +56,7 @@ impl From<FileInfo> for FileEntry {
             path: info.logical_path.into_string(),
             content_hash: info.content_hash,
             version_number: info.version_number,
+            size: info.size as i64,
             short_id_length: info.short_id_length as i64,
         }
     }

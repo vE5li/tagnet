@@ -67,12 +67,16 @@ pub enum ContentChange {
         logical_path: LogicalPath,
         content: FileBytes,
         content_hash: String,
+        /// Content size in bytes, read at hash time.
+        size: u64,
         tags: Vec<TagId>,
     },
     FileChanged {
         file_id: FileId,
         content: FileBytes,
         content_hash: String,
+        /// Content size in bytes, read at hash time.
+        size: u64,
     },
 }
 
@@ -147,6 +151,8 @@ pub enum DaemonMessage {
         /// file is not yet known locally.
         logical_path: LogicalPath,
         content_hash: String,
+        /// The version's content size in bytes (from the manifest history).
+        size: u64,
         /// The announcing peer (stored in `file_versions.origin`).
         origin: ChangeOrigin,
     },
@@ -161,6 +167,8 @@ pub enum DaemonMessage {
         /// an edit of an existing file (`FileMetadataChanged`).
         logical_path: Option<LogicalPath>,
         content_hash: String,
+        /// Content size in bytes, read at hash time by the provider (CLI).
+        size: u64,
         tags: Vec<TagId>,
     },
 }
@@ -178,6 +186,9 @@ pub enum PeerCommand {
     StartReceive {
         file_id: FileId,
         content_hash: String,
+        /// The file's known content size in bytes (from the catalog/manifest),
+        /// used to cap the receiver's request window at EOF.
+        expected_size: u64,
         placement: MaterializePlacement,
     },
 }

@@ -21,7 +21,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.os.Build
-import android.os.Environment
 import android.os.IBinder
 import android.util.Log
 
@@ -59,46 +58,13 @@ class TagnetService : Service() {
         // tokio runtime + inotify) survives the UI closing and Doze.
         startForeground(NOTIFICATION_ID, buildNotification())
 
-        // App-private storage: inotify works here with no storage permission.
-        // Identity + per-directory DBs live here (not user-browsable).
-        val dataDir = filesDir.absolutePath
-        val identityFile = "$dataDir/identity.key"
+        // Runtime inputs (config JSON + data / identity paths) live in
+        // TagnetConfig, the single source of truth on Android. The Dart side
+        // reads the same values via a MethodChannel (see MainActivity) so the
+        // literal is never duplicated.
+        val inputs = TagnetConfig.build(this)
 
-        // Shared external storage: Documents/tagnet is fully browsable in the
-        // Files app / Gallery and survives uninstall. Writing here needs "All
-        // files access" (MANAGE_EXTERNAL_STORAGE), which MainActivity gates on
-        // before starting this service, so create_dir_all succeeds. Watcher
-        // (inotify) reliability on shared storage varies by device (POC caveat).
-        // Kept in sync with lib/bootstrap/android_bootstrap.dart.
-        val documents =
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-
-        // Hardcoded POC config, kept in sync with lib/main.dart. The service is
-        // the source of truth for the runtime; the Dart side attaches to it.
-        val configJson = """
-            {
-              "sync_directories": [
-                {
-                  "path": "${documents.absolutePath}/phone",
-                  "sync_type": { "TagBased": { "tags": ["467f35d7ae6f4dffb72905ff2bc743c5", "6450a8fe6eb945cc8b40adf4b97408bd"] } }
-                },
-                {
-                  "path": "${documents.absolutePath}/audiobooks",
-                  "sync_type": { "TagBased": { "tags": ["b053c022c8a6432eb88acb0452abceb2"] } }
-                }
-              ],
-              "listen_port": null,
-              "peers": [
-                {
-                  "address": ["192.168.188.10", 3468],
-                  "name": "central",
-                  "public_key": "AYWQNMCy5y20bjB1oxU79x5fUYQI4CGPbsqk7N+Qrgs="
-                }
-              ]
-            }
-        """.trimIndent()
-
-        val publicKey = nativeStart(dataDir, identityFile, configJson)
+        val publicKey = nativeStart(inputs.dataDir, inputs.identityFile, inputs.configJson)
         if (publicKey != null) {
             Log.i(TAG, "TagnetService started runtime; device public key $publicKey")
         } else {

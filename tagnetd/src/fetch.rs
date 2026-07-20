@@ -82,6 +82,10 @@ pub enum FoundAction {
         from_peer: String,
         file_id: FileId,
         expected_hash: String,
+        /// The file's size in bytes as announced in the `FetchFound` (0 if the
+        /// answering node could not determine it). Used to cap the pull's
+        /// request window at EOF.
+        expected_size: u64,
         then: FoundThen,
     },
 }
@@ -98,6 +102,8 @@ pub enum FoundThen {
         request_id: RequestId,
         file_id: FileId,
         content_hash: String,
+        /// The size carried by the `FetchFound` we are relaying upward.
+        size: u64,
     },
 }
 
@@ -296,24 +302,25 @@ impl PendingFetches {
 
     /// Handle an inbound `FetchRequest` relayed from `from_public_key`.
     ///
-    /// If `have_local` is true, answer a content-less `FetchFound` straight back
-    /// to the sender (the sender then pulls the bytes from us over a transfer,
-    /// served from our sync directories by the standard `TransferStart` path).
-    /// Otherwise forward to all peers except the sender and register a pending
-    /// entry keyed by the request's own `request_id`. With no other peers to
-    /// try, answer `FetchMissing` immediately.
+    /// If `local_size` is `Some(size)` we hold the file: answer a content-less
+    /// `FetchFound` (carrying `size` so the puller can cap its request window)
+    /// straight back to the sender, which then pulls the bytes from us over a
+    /// transfer, served from our sync directories by the standard
+    /// `TransferStart` path. Otherwise forward to all peers except the sender
+    /// and register a pending entry keyed by the request's own `request_id`.
+    /// With no other peers to try, answer `FetchMissing` immediately.
     pub async fn handle_incoming_request(
         &self,
         from_public_key: &str,
         request_id: RequestId,
         file_id: FileId,
         expected_hash: String,
-        have_local: bool,
+        local_size: Option<u64>,
     ) {
-        if have_local {
+        if let Some(size) = local_size {
             log::debug!(
                 "handle_incoming_request: request {request_id} for {} from {}: \
-                 have it locally; answering FetchFound",
+                 have it locally ({size} bytes); answering FetchFound",
                 file_id.to_string(),
                 from_public_key,
             );
@@ -323,6 +330,7 @@ impl PendingFetches {
                     request_id,
                     file_id,
                     content_hash,
+                    size,
                 }));
             }
             return;
@@ -388,6 +396,7 @@ impl PendingFetches {
         request_id: RequestId,
         file_id: FileId,
         content_hash: String,
+        size: u64,
     ) -> Option<FoundAction> {
         let entry = {
             let mut table = self.inner.lock().await;
@@ -428,6 +437,7 @@ impl PendingFetches {
                 request_id,
                 file_id,
                 content_hash: content_hash.clone(),
+                size,
             },
         };
 
@@ -435,6 +445,7 @@ impl PendingFetches {
             from_peer: from_public_key.to_owned(),
             file_id,
             expected_hash: content_hash,
+            expected_size: size,
             then,
         })
     }
@@ -569,7 +580,13 @@ mod tests {
     async fn found_for_unknown_request_is_none() {
         let engine = engine();
         let action = engine
-            .handle_incoming_found("peer", RequestId::new(), FileId::new(), "hash".to_owned())
+            .handle_incoming_found(
+                "peer",
+                RequestId::new(),
+                FileId::new(),
+                "hash".to_owned(),
+                0,
+            )
             .await;
         assert!(action.is_none());
     }

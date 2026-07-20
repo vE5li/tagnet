@@ -308,6 +308,7 @@ impl SyncDirectoryManager {
         path: impl AsRef<Path>,
         content: FileBytes,
         content_hash: String,
+        size: u64,
         tags: Vec<TagId>,
     ) -> Result<(), SyncDirectoryError> {
         let file_id = FileId::new();
@@ -335,6 +336,7 @@ impl SyncDirectoryManager {
                 logical_path,
                 content,
                 content_hash,
+                size,
                 tags,
             },
         )
@@ -346,6 +348,7 @@ impl SyncDirectoryManager {
         path: impl AsRef<Path>,
         content: FileBytes,
         content_hash: String,
+        size: u64,
         tags: Vec<TagId>,
     ) -> Result<(), SyncDirectoryError> {
         let file_id = FileId::new();
@@ -381,6 +384,7 @@ impl SyncDirectoryManager {
                 logical_path,
                 content: content.into_move(),
                 content_hash,
+                size,
                 tags,
             },
         ) {
@@ -401,6 +405,7 @@ impl SyncDirectoryManager {
         file_id: FileId,
         content: FileBytes,
         content_hash: String,
+        size: u64,
     ) -> Result<(), SyncDirectoryError> {
         self.send_content_change(
             sync_directory,
@@ -408,6 +413,7 @@ impl SyncDirectoryManager {
                 file_id,
                 content,
                 content_hash,
+                size,
             },
         )
     }
@@ -455,7 +461,13 @@ impl SyncDirectoryManager {
             .remove_file_by_id(file_id)
             .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
 
-        self.send_change(sync_directory, Change::FileDeleted { file_id })
+        self.send_change(
+            sync_directory,
+            Change::FileDeleted {
+                file_id,
+                deleted_at: crate::database::now_millis(),
+            },
+        )
     }
 
     fn get_all_files(
@@ -481,9 +493,12 @@ impl SyncDirectoryManager {
     }
 
     /// Describe the content at `path` for ingestion without buffering it into
-    /// memory: returns a [`FileBytes::FileToCopy`] referencing the file plus its
+    /// memory: returns a [`FileBytes::FileToCopy`] referencing the file, its
     /// BLAKE3 hash (computed by streaming the file, so a large file is never
-    /// held in memory at once).
+    /// held in memory at once), and its size in bytes.
+    ///
+    /// The size is read here, at hash time, since the file is already being
+    /// opened/streamed and its exact byte length is known.
     ///
     /// `FileToCopy` is the safe default (the source is left in place). Producers
     /// whose ingestion should *consume* the source (e.g. a Universal upload)
@@ -491,13 +506,17 @@ impl SyncDirectoryManager {
     async fn get_file_content(
         &self,
         path: impl AsRef<Path>,
-    ) -> Result<(FileBytes, String), SyncDirectoryError> {
+    ) -> Result<(FileBytes, String, u64), SyncDirectoryError> {
         let content = FileBytes::FileToCopy(path.as_ref().to_path_buf());
         let content_hash = content
             .hash()
             .await
             .map_err(|_| SyncDirectoryError::FailedToReadFile)?;
-        Ok((content, content_hash))
+        let size = content
+            .byte_len()
+            .await
+            .map_err(|_| SyncDirectoryError::FailedToReadFile)?;
+        Ok((content, content_hash, size))
     }
 
     fn sync_directory_for_path(
@@ -550,8 +569,8 @@ impl SyncDirectoryManager {
                 continue;
             }
 
-            let (content, content_hash) = match self.get_file_content(&full_path).await {
-                Ok((content, content_hash)) => (content, content_hash),
+            let (content, content_hash, size) = match self.get_file_content(&full_path).await {
+                Ok(triple) => triple,
                 Err(error) => {
                     log::error!("Failed to read file content: {:?}", error);
                     continue;
@@ -570,6 +589,7 @@ impl SyncDirectoryManager {
                     sync_file.file_id,
                     content,
                     content_hash,
+                    size,
                 ) {
                     log::error!(
                         "Failed to update file {}: {:?}",
@@ -615,8 +635,8 @@ impl SyncDirectoryManager {
                 entry.path().to_string_lossy()
             );
 
-            let (content, content_hash) = match self.get_file_content(entry.path()).await {
-                Ok(content_and_hash) => content_and_hash,
+            let (content, content_hash, size) = match self.get_file_content(entry.path()).await {
+                Ok(triple) => triple,
                 Err(error) => {
                     log::error!("Failed to read added file: {:?}", error);
                     continue;
@@ -628,6 +648,7 @@ impl SyncDirectoryManager {
                 relative_path,
                 content,
                 content_hash,
+                size,
                 Vec::new(),
             )
             .unwrap();
@@ -663,8 +684,8 @@ impl SyncDirectoryManager {
                 continue;
             }
 
-            let (content, content_hash) = match self.get_file_content(&full_path).await {
-                Ok((content, content_hash)) => (content, content_hash),
+            let (content, content_hash, size) = match self.get_file_content(&full_path).await {
+                Ok(triple) => triple,
                 Err(error) => {
                     log::error!("Failed to read file content: {:?}", error);
                     continue;
@@ -683,6 +704,7 @@ impl SyncDirectoryManager {
                     sync_file.file_id,
                     content,
                     content_hash,
+                    size,
                 ) {
                     log::error!(
                         "Failed to update file {}: {:?}",
@@ -720,19 +742,21 @@ impl SyncDirectoryManager {
                         entry.path().to_string_lossy()
                     );
 
-                    let (content, content_hash) = match self.get_file_content(entry.path()).await {
-                        Ok((content, content_hash)) => (content, content_hash),
-                        Err(error) => {
-                            log::error!("Failed to read added file: {:?}", error);
-                            continue;
-                        }
-                    };
+                    let (content, content_hash, size) =
+                        match self.get_file_content(entry.path()).await {
+                            Ok(triple) => triple,
+                            Err(error) => {
+                                log::error!("Failed to read added file: {:?}", error);
+                                continue;
+                            }
+                        };
 
                     if let Err(error) = self.add_file(
                         sync_directory,
                         relative_path,
                         content,
                         content_hash,
+                        size,
                         tags.to_vec(),
                     ) {
                         log::error!(
@@ -765,7 +789,7 @@ impl SyncDirectoryManager {
             };
 
             match &sync_directory.sync_type {
-                SyncType::Universal => {
+                SyncType::Universal { .. } => {
                     self.intial_sync_universal(sync_directory, files, last_known_hashes)
                         .await
                 }
@@ -934,7 +958,7 @@ impl SyncDirectoryManager {
                 continue;
             };
             let path = match &sync_directory.sync_type {
-                SyncType::Universal => sync_directory.path.join(file_id.to_string()),
+                SyncType::Universal { .. } => sync_directory.path.join(file_id.to_string()),
                 SyncType::TagBased { .. } => sync_directory.path.join(file.physical_path.as_str()),
             };
             if path.exists() {
@@ -1038,7 +1062,7 @@ impl SyncDirectoryManager {
                 let sync_directory = self.sync_directory_for_path(&sync_directory_path)?;
 
                 let physical_path = match &sync_directory.sync_type {
-                    SyncType::Universal => PhysicalPath::new(file_id.to_string()),
+                    SyncType::Universal { .. } => PhysicalPath::new(file_id.to_string()),
                     SyncType::TagBased { .. } => {
                         sync_directory
                             .database
@@ -1077,7 +1101,7 @@ impl SyncDirectoryManager {
                 let sync_directory = self.sync_directory_for_path(&sync_directory_path)?;
 
                 match &sync_directory.sync_type {
-                    SyncType::Universal => {
+                    SyncType::Universal { .. } => {
                         // Universal directories store files under their `file_id`
                         // on disk, so a logical rename never moves any bytes: the
                         // resolved `physical_path` is still the `file_id` and this
@@ -1138,6 +1162,23 @@ impl SyncDirectoryManager {
                     .get_file(file_id)
                     .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
 
+                // Recovery vault: a Universal directory with `keep_deleted_files`
+                // retains its physical copy (and its per-directory DB row) on
+                // delete, so an accidental deletion can be undone here. The file
+                // is still gone from the catalog and every other directory; this
+                // one just doesn't drop its bytes.
+                if let SyncType::Universal {
+                    keep_deleted_files: true,
+                } = &sync_directory.sync_type
+                {
+                    log::info!(
+                        "Keeping deleted file {} in {} (keep_deleted_files)",
+                        file_id.to_string(),
+                        sync_directory.path.to_string_lossy()
+                    );
+                    return Ok(());
+                }
+
                 log::info!(
                     "Removing file {} from {}",
                     file.physical_path,
@@ -1145,7 +1186,7 @@ impl SyncDirectoryManager {
                 );
 
                 let file_path = match &sync_directory.sync_type {
-                    SyncType::Universal => sync_directory.path.join(file_id.to_string()),
+                    SyncType::Universal { .. } => sync_directory.path.join(file_id.to_string()),
                     SyncType::TagBased { .. } => {
                         sync_directory.path.join(file.physical_path.as_str())
                     }
@@ -1255,19 +1296,19 @@ impl SyncDirectoryManager {
                     // the file.
                     let physical_path = file.physical_path.clone();
                     let absolute_path = sync_directory.path.join(physical_path.as_str());
-                    let (content, content_hash) = match self.get_file_content(&absolute_path).await
-                    {
-                        Ok(content_and_hash) => content_and_hash,
-                        Err(error) => {
-                            log::warn!(
-                                "ReadFile: {} reported {} but read failed: {:?}",
-                                sync_directory.path.to_string_lossy(),
-                                absolute_path.to_string_lossy(),
-                                error
-                            );
-                            continue;
-                        }
-                    };
+                    let (content, content_hash, _size) =
+                        match self.get_file_content(&absolute_path).await {
+                            Ok(triple) => triple,
+                            Err(error) => {
+                                log::warn!(
+                                    "ReadFile: {} reported {} but read failed: {:?}",
+                                    sync_directory.path.to_string_lossy(),
+                                    absolute_path.to_string_lossy(),
+                                    error
+                                );
+                                continue;
+                            }
+                        };
                     response = Some((physical_path, content, content_hash));
                     break;
                 }
@@ -1295,15 +1336,16 @@ impl SyncDirectoryManager {
                 let sync_directory = self.sync_directory_for_path(&file_name)?;
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
 
-                let (content, content_hash) = self.get_file_content(&file_name).await?;
+                let (content, content_hash, size) = self.get_file_content(&file_name).await?;
 
                 match &sync_directory.sync_type {
-                    SyncType::Universal => {
+                    SyncType::Universal { .. } => {
                         self.upload_file(
                             sync_directory,
                             sync_relative_path,
                             content,
                             content_hash,
+                            size,
                             Vec::new(),
                         )?;
                     }
@@ -1313,6 +1355,7 @@ impl SyncDirectoryManager {
                             sync_relative_path,
                             content,
                             content_hash,
+                            size,
                             tags.to_vec(),
                         )?;
                     }
@@ -1330,7 +1373,7 @@ impl SyncDirectoryManager {
                 {
                     // Move within the directory.
 
-                    if let SyncType::Universal = sync_directory.sync_type {
+                    if let SyncType::Universal { .. } = sync_directory.sync_type {
                         // A Universal directory stores files under their `file_id`
                         // on disk; a rename *within* it has no logical meaning and
                         // must not propagate. This event is normally one we caused
@@ -1424,15 +1467,16 @@ impl SyncDirectoryManager {
 
                         let sync_relative_path = to.strip_prefix(&sync_directory.path).unwrap();
 
-                        let (content, content_hash) = self.get_file_content(&to).await?;
+                        let (content, content_hash, size) = self.get_file_content(&to).await?;
 
                         match &sync_directory.sync_type {
-                            SyncType::Universal => {
+                            SyncType::Universal { .. } => {
                                 self.upload_file(
                                     sync_directory,
                                     sync_relative_path,
                                     content,
                                     content_hash,
+                                    size,
                                     Vec::new(),
                                 )?;
                             }
@@ -1442,6 +1486,7 @@ impl SyncDirectoryManager {
                                     sync_relative_path,
                                     content,
                                     content_hash,
+                                    size,
                                     tags.to_vec(),
                                 )?;
                             }
@@ -1463,16 +1508,17 @@ impl SyncDirectoryManager {
                             let sync_relative_path =
                                 entry.path().strip_prefix(&sync_directory.path).unwrap();
 
-                            let (content, content_hash) =
+                            let (content, content_hash, size) =
                                 self.get_file_content(entry.path()).await?;
 
                             match &sync_directory.sync_type {
-                                SyncType::Universal => {
+                                SyncType::Universal { .. } => {
                                     self.upload_file(
                                         sync_directory,
                                         sync_relative_path,
                                         content,
                                         content_hash,
+                                        size,
                                         Vec::new(),
                                     )?;
                                 }
@@ -1482,6 +1528,7 @@ impl SyncDirectoryManager {
                                         sync_relative_path,
                                         content,
                                         content_hash,
+                                        size,
                                         tags.to_vec(),
                                     )?;
                                 }
@@ -1497,7 +1544,7 @@ impl SyncDirectoryManager {
                 }
             }
             DebouncedEventKind::Modify { file_name } => {
-                let (content, content_hash) = self.get_file_content(&file_name).await?;
+                let (content, content_hash, size) = self.get_file_content(&file_name).await?;
 
                 // Suppress only if the on-disk content matches what the daemon
                 // just wrote here.
@@ -1513,7 +1560,7 @@ impl SyncDirectoryManager {
                 let sync_relative_path = file_name.strip_prefix(&sync_directory.path).unwrap();
                 let file_id = self.get_file_id(sync_directory, sync_relative_path)?;
 
-                self.update_file_content(sync_directory, file_id, content, content_hash)?;
+                self.update_file_content(sync_directory, file_id, content, content_hash, size)?;
             }
             DebouncedEventKind::Remove { file_name } => {
                 // A removal the daemon caused itself (delete, move-out, or the
@@ -1620,10 +1667,20 @@ mod tests {
     /// `sync_dir`, returning the manager (the change receiver is discarded; the
     /// tests only exercise `handle_command`, which does not emit changes).
     async fn universal_manager(data_dir: &Path, sync_dir: &Path) -> SyncDirectoryManager {
+        universal_manager_with(data_dir, sync_dir, false).await
+    }
+
+    /// As [`universal_manager`] but with an explicit `keep_deleted_files` flag
+    /// on the Universal directory.
+    async fn universal_manager_with(
+        data_dir: &Path,
+        sync_dir: &Path,
+        keep_deleted_files: bool,
+    ) -> SyncDirectoryManager {
         let configuration = Configuration {
             sync_directories: vec![SyncDirectory {
                 path: sync_dir.to_path_buf(),
-                sync_type: SyncType::Universal,
+                sync_type: SyncType::Universal { keep_deleted_files },
             }],
             listen_port: None,
             peers: Vec::new(),
@@ -1802,7 +1859,9 @@ mod tests {
         let configuration = Configuration {
             sync_directories: vec![SyncDirectory {
                 path: sync_dir.to_path_buf(),
-                sync_type: SyncType::Universal,
+                sync_type: SyncType::Universal {
+                    keep_deleted_files: false,
+                },
             }],
             listen_port: None,
             peers: Vec::new(),
@@ -1867,7 +1926,9 @@ mod tests {
         let configuration = Configuration {
             sync_directories: vec![SyncDirectory {
                 path: sync_dir.to_path_buf(),
-                sync_type: SyncType::Universal,
+                sync_type: SyncType::Universal {
+                    keep_deleted_files: false,
+                },
             }],
             listen_port: None,
             peers: Vec::new(),
@@ -2026,7 +2087,9 @@ mod tests {
             sync_directories: vec![
                 SyncDirectory {
                     path: universal_dir.to_path_buf(),
-                    sync_type: SyncType::Universal,
+                    sync_type: SyncType::Universal {
+                        keep_deleted_files: false,
+                    },
                 },
                 SyncDirectory {
                     path: tagged_dir.to_path_buf(),
@@ -2288,6 +2351,96 @@ mod tests {
                 .get_file(file_id)
                 .is_err(),
             "TagBased dir DB must not track a file that was never materialized"
+        );
+    }
+
+    /// Create then `RemoveFile` a file in a Universal directory with
+    /// `keep_deleted_files = true`: the bytes and the per-directory DB row must
+    /// survive so the file can be recovered.
+    #[tokio::test]
+    async fn keep_deleted_files_retains_bytes_on_remove() {
+        let data_dir = temp_dir("keep-data");
+        let sync_dir = temp_dir("keep-sync");
+        let mut manager = universal_manager_with(&data_dir, &sync_dir, true).await;
+
+        let file_id = FileId::new();
+        let physical_path = PhysicalPath::new(file_id.to_string());
+        let destination = sync_dir.join(physical_path.as_str());
+
+        manager
+            .handle_command(SyncDirectoryCommand::CreateFile {
+                file_id,
+                physical_path,
+                content: FileBytes::InMemory(b"precious".to_vec()),
+                sync_directory_path: sync_dir.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(destination.exists());
+
+        manager
+            .handle_command(SyncDirectoryCommand::RemoveFile {
+                file_id,
+                sync_directory_path: sync_dir.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            destination.exists(),
+            "keep_deleted_files must retain the physical copy on delete"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"precious");
+        assert!(
+            manager.sync_directories[0]
+                .database
+                .get_file(file_id)
+                .is_ok(),
+            "keep_deleted_files must retain the per-directory DB row for recovery"
+        );
+    }
+
+    /// The default (`keep_deleted_files = false`) still deletes the bytes on
+    /// `RemoveFile`.
+    #[tokio::test]
+    async fn default_universal_deletes_bytes_on_remove() {
+        let data_dir = temp_dir("del-data");
+        let sync_dir = temp_dir("del-sync");
+        let mut manager = universal_manager_with(&data_dir, &sync_dir, false).await;
+
+        let file_id = FileId::new();
+        let physical_path = PhysicalPath::new(file_id.to_string());
+        let destination = sync_dir.join(physical_path.as_str());
+
+        manager
+            .handle_command(SyncDirectoryCommand::CreateFile {
+                file_id,
+                physical_path,
+                content: FileBytes::InMemory(b"disposable".to_vec()),
+                sync_directory_path: sync_dir.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(destination.exists());
+
+        manager
+            .handle_command(SyncDirectoryCommand::RemoveFile {
+                file_id,
+                sync_directory_path: sync_dir.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !destination.exists(),
+            "default Universal must delete the physical copy on remove"
+        );
+        assert!(
+            manager.sync_directories[0]
+                .database
+                .get_file(file_id)
+                .is_err(),
+            "default Universal must drop the per-directory DB row"
         );
     }
 }

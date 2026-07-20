@@ -273,7 +273,7 @@ impl Api {
     ///
     /// - `/t foo` — require the tag(s) resolved from `foo`. A file matches if
     ///   it carries any such tag; a tag matches if it is a subtag of any.
-    /// - `/l foo` — case-insensitive substring against the file's logical
+    /// - `/n foo` — case-insensitive substring against the file's logical
     ///   path (or the tag's name on the tag side).
     /// - `/p foo` — reserved for physical-path search; currently a no-op.
     /// - `foo` (no prefix) — matches on *either* side: logical/name substring
@@ -295,11 +295,7 @@ impl Api {
     /// render directly without a second whole-store listing. Backed by
     /// `FileDatabase::file_ids_for_query`/`tag_ids_for_query` plus
     /// `file_info_from_id`/`tag_from_id`.
-    pub fn run_query(
-        &self,
-        query: &str,
-        subtag_rule: SubtagRule,
-    ) -> Result<QueryResult, ApiError> {
+    pub fn run_query(&self, query: &str, subtag_rule: SubtagRule) -> Result<QueryResult, ApiError> {
         let database = self.open_read()?;
         let terms = Self::parse_query(&database, query)?;
 
@@ -453,9 +449,14 @@ impl Api {
         Ok(tag_id)
     }
 
-    /// Delete a tag. Enqueues `Change::TagRemoved`.
+    /// Delete a tag. Enqueues `Change::TagRemoved`, stamped with our wall clock
+    /// now: a tag reuses `modified_at` as its last-writer-wins clock, so the
+    /// delete carries the timestamp here.
     pub fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
-        self.enqueue(Change::TagRemoved { tag_id })
+        self.enqueue(Change::TagRemoved {
+            tag_id,
+            modified_at: crate::database::now_millis(),
+        })
     }
 
     /// Rename a tag. Enqueues `Change::TagRenamed`, stamped with our wall clock
@@ -495,6 +496,7 @@ impl Api {
         &self,
         path_name: String,
         content_hash: String,
+        size: u64,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
         if path_name.trim().is_empty() {
@@ -506,6 +508,7 @@ impl Api {
                 file_id,
                 logical_path: Some(LogicalPath::new(path_name)),
                 content_hash,
+                size,
                 tags,
             })
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
@@ -536,20 +539,30 @@ impl Api {
     /// (see [`Self::upload_file`]). Records the new version and announces a
     /// metadata-only `FileMetadataChanged` to peers, which pull from the
     /// provider.
-    pub fn edit_file(&self, file_id: FileId, content_hash: String) -> Result<(), ApiError> {
+    pub fn edit_file(
+        &self,
+        file_id: FileId,
+        content_hash: String,
+        size: u64,
+    ) -> Result<(), ApiError> {
         self.change_sender
             .send(DaemonMessage::AnnounceProvided {
                 file_id,
                 logical_path: None,
                 content_hash,
+                size,
                 tags: Vec::new(),
             })
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))
     }
 
-    /// Delete a file. Enqueues `Change::FileDeleted`.
+    /// Delete a file. Enqueues `Change::FileDeleted`, stamped with our wall
+    /// clock now for last-writer-wins against a later edit.
     pub fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
-        self.enqueue(Change::FileDeleted { file_id })
+        self.enqueue(Change::FileDeleted {
+            file_id,
+            deleted_at: crate::database::now_millis(),
+        })
     }
 
     /// Move (rename) a file to a new logical path. Enqueues `Change::FileMoved`;
@@ -710,9 +723,9 @@ impl Api {
 /// 1. An optional `!` (negation) — must be a standalone whitespace-delimited
 ///    token; `!foo` is **not** a negation, it's a literal chunk whose text
 ///    starts with `!`.
-/// 2. An optional *kind prefix* — one of `/t`, `/l`, `/p`, again standalone:
+/// 2. An optional *kind prefix* — one of `/t`, `/n`, `/p`, again standalone:
 ///    - `/t` — tag chunk: match tags whose name/id resolves from the payload.
-///    - `/l` — logical-path chunk: substring match on the file's logical path.
+///    - `/n` — logical-path chunk: substring match on the file's logical path.
 ///    - `/p` — physical-path chunk (reserved; not wired up yet).
 ///
 ///    Unknown `/x` tokens are **not** prefixes: they become literal chunks
@@ -734,7 +747,7 @@ impl Api {
 /// next whitespace boundary:
 ///
 /// - a `!` or kind prefix followed by nothing (`!`, `/t`, `! /t` at EOF);
-/// - conflicting kind prefixes (`/t /l foo` drops the `/t /l` chunk and
+/// - conflicting kind prefixes (`/t /n foo` drops the `/t /n` chunk and
 ///   continues from `foo`);
 /// - a duplicate `!` (`! ! foo` drops that chunk);
 /// - an unterminated quoted string (`"foo` at EOF is dropped entirely).
@@ -749,7 +762,7 @@ pub(crate) mod chunk {
         Any,
         /// `/t` — the payload names a tag.
         Tag,
-        /// `/l` — the payload is a logical-path substring.
+        /// `/n` — the payload is a logical-path substring.
         Logical,
         /// `/p` — the payload is a physical-path substring. Reserved; the
         /// resolver does not yet accept this variant.
@@ -798,7 +811,7 @@ pub(crate) mod chunk {
         let mut negated = false;
         let mut kind: Option<ChunkKind> = None;
 
-        // Consume prefix tokens (`!`, `/t`, `/l`, `/p`) until we hit something
+        // Consume prefix tokens (`!`, `/t`, `/n`, `/p`) until we hit something
         // that isn't a prefix — that becomes the payload. On any grammar error
         // we drop the current chunk and resume at the *next* whitespace
         // boundary (the token that caused the error is itself skipped).
@@ -813,13 +826,13 @@ pub(crate) mod chunk {
                     }
                     negated = true;
                 }
-                "/t" | "/l" | "/p" => {
+                "/t" | "/n" | "/p" => {
                     if kind.is_some() {
                         return (None, &rest[token_end..]);
                     }
                     kind = Some(match token {
                         "/t" => ChunkKind::Tag,
-                        "/l" => ChunkKind::Logical,
+                        "/n" => ChunkKind::Logical,
                         "/p" => ChunkKind::Physical,
                         _ => unreachable!(),
                     });
@@ -890,13 +903,25 @@ pub(crate) mod chunk {
         use super::*;
 
         fn any(text: &str) -> Chunk {
-            Chunk { kind: ChunkKind::Any, text: text.to_owned(), negated: false }
+            Chunk {
+                kind: ChunkKind::Any,
+                text: text.to_owned(),
+                negated: false,
+            }
         }
         fn tag(text: &str) -> Chunk {
-            Chunk { kind: ChunkKind::Tag, text: text.to_owned(), negated: false }
+            Chunk {
+                kind: ChunkKind::Tag,
+                text: text.to_owned(),
+                negated: false,
+            }
         }
         fn logical(text: &str) -> Chunk {
-            Chunk { kind: ChunkKind::Logical, text: text.to_owned(), negated: false }
+            Chunk {
+                kind: ChunkKind::Logical,
+                text: text.to_owned(),
+                negated: false,
+            }
         }
         fn negate(mut c: Chunk) -> Chunk {
             c.negated = true;
@@ -938,7 +963,7 @@ pub(crate) mod chunk {
         #[test]
         fn kind_prefixes_apply_to_the_next_chunk() {
             assert_eq!(lex_query("/t foo"), vec![tag("foo")]);
-            assert_eq!(lex_query("/l foo"), vec![logical("foo")]);
+            assert_eq!(lex_query("/n foo"), vec![logical("foo")]);
         }
 
         #[test]
@@ -957,10 +982,7 @@ pub(crate) mod chunk {
 
         #[test]
         fn negation_applies_to_quoted_payload() {
-            assert_eq!(
-                lex_query(r#"! /t "foo bar""#),
-                vec![negate(tag("foo bar"))],
-            );
+            assert_eq!(lex_query(r#"! /t "foo bar""#), vec![negate(tag("foo bar"))],);
         }
 
         #[test]
@@ -981,7 +1003,7 @@ pub(crate) mod chunk {
         #[test]
         fn mixed_query_parses_end_to_end() {
             // A realistic mix: bare word, tag, quoted logical path, negated tag.
-            let got = lex_query(r#"foo /t bar /l "my file.txt" ! /t old"#);
+            let got = lex_query(r#"foo /t bar /n "my file.txt" ! /t old"#);
             assert_eq!(
                 got,
                 vec![
@@ -1023,12 +1045,9 @@ pub(crate) mod chunk {
 
         #[test]
         fn conflicting_kind_prefixes_drop_that_chunk_only() {
-            // `/t /l` conflicts — that chunk-in-progress is discarded at the
+            // `/t /n` conflicts — that chunk-in-progress is discarded at the
             // conflict point, so lexing resumes with `foo bar` intact.
-            assert_eq!(
-                lex_query("/t /l foo bar"),
-                vec![any("foo"), any("bar")],
-            );
+            assert_eq!(lex_query("/t /n foo bar"), vec![any("foo"), any("bar")],);
         }
 
         #[test]
@@ -1044,7 +1063,7 @@ pub(crate) mod chunk {
         fn errors_between_valid_chunks_do_not_bleed() {
             // Interleave several error shapes with valid chunks to prove each
             // recovery is local.
-            let got = lex_query(r#"a /t /l b ! ! c "unterminated"#);
+            let got = lex_query(r#"a /t /n b ! ! c "unterminated"#);
             assert_eq!(got, vec![any("a"), any("b"), any("c")]);
         }
     }

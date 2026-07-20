@@ -176,15 +176,30 @@ impl std::error::Error for TransferError {}
 /// `outbound` carries this endpoint's messages to the peer; `inbound` delivers
 /// the peer's replies (already demuxed for this `transfer_id`).
 ///
+/// `expected_size` is the file's known content size in bytes (from the
+/// catalog/manifest). It is used only to cap the request window so the receiver
+/// never asks for chunks past end-of-file — completion and correctness still
+/// rest on the sender's `last` flag and the BLAKE3 verification. A `0` here
+/// means "size unknown" and disables the cap (falls back to the old behaviour).
+///
 /// On any error the temp file is removed and an abort is sent to the peer.
 pub async fn run_receiver(
     file_id: FileId,
     content_hash: String,
+    expected_size: u64,
     temp_path: PathBuf,
     outbound: UnboundedSender<TransferMessage>,
     mut inbound: UnboundedReceiver<TransferMessage>,
 ) -> Result<FileBytes, TransferError> {
-    let result = receive_inner(file_id, &content_hash, &temp_path, &outbound, &mut inbound).await;
+    let result = receive_inner(
+        file_id,
+        &content_hash,
+        expected_size,
+        &temp_path,
+        &outbound,
+        &mut inbound,
+    )
+    .await;
 
     if let Err(error) = &result {
         // Best-effort cleanup + notify the peer we gave up.
@@ -200,6 +215,7 @@ pub async fn run_receiver(
 async fn receive_inner(
     file_id: FileId,
     content_hash: &str,
+    expected_size: u64,
     temp_path: &PathBuf,
     outbound: &UnboundedSender<TransferMessage>,
     inbound: &mut UnboundedReceiver<TransferMessage>,
@@ -208,6 +224,16 @@ async fn receive_inner(
         .await
         .map_err(TransferError::Io)?;
     let mut hasher = blake3::Hasher::new();
+
+    // How far ahead we may request. When the size is known we never request an
+    // offset at or beyond it, so no chunk past EOF is ever asked for and the
+    // completion-abort below is not needed in the common case. A zero-length
+    // file still needs exactly one request (offset 0) to receive the empty
+    // final chunk, so treat `expected_size == 0` as "one chunk at offset 0".
+    // An `expected_size` of 0 for a genuinely-unknown size is indistinguishable
+    // here, but that path still terminates on the sender's `last` flag.
+    let request_ceiling = expected_size.max(1);
+    let may_request = |offset: u64| offset < request_ceiling;
 
     // Open the transfer, then prime the request window. Requests are keyed by
     // the offset we want next; because chunk sizes are fixed at CHUNK_SIZE we
@@ -228,8 +254,8 @@ async fn receive_inner(
     let mut saw_last = false;
     let mut last_offset: u64 = 0;
 
-    // Prime the window.
-    while in_flight < WINDOW {
+    // Prime the window, capped so we never request past EOF.
+    while in_flight < WINDOW && may_request(next_request_offset) {
         outbound
             .send(TransferMessage::ChunkRequest {
                 offset: next_request_offset,
@@ -260,9 +286,11 @@ async fn receive_inner(
                     file.write_all(&chunk).await.map_err(TransferError::Io)?;
                     write_offset += chunk.len() as u64;
                     if chunk_last {
-                        // Final chunk written: verify and finish. We may have
-                        // windowed requests still outstanding (offsets past EOF)
-                        // that the sender will answer; send an Abort so it stops
+                        // Final chunk written: verify and finish. With a known
+                        // size we cap requests at EOF, so normally nothing is
+                        // outstanding here; but if the size hint was wrong (or
+                        // unknown) we may have windowed requests past EOF that
+                        // the sender will answer — send an Abort so it stops
                         // rather than emitting orphaned chunks our peer session
                         // would then log as "unknown transfer".
                         file.flush().await.map_err(TransferError::Io)?;
@@ -270,6 +298,20 @@ async fn receive_inner(
                             let _ = outbound.send(TransferMessage::Abort {
                                 reason: "transfer complete".to_owned(),
                             });
+                        }
+                        // The `last` flag is authoritative for completion; the
+                        // known size is only a hint. Log if the bytes actually
+                        // received disagree with it (e.g. a stale pre-migration
+                        // placeholder size), but still let the hash decide
+                        // correctness.
+                        if expected_size != 0 && write_offset != expected_size {
+                            log::warn!(
+                                "transfer for {}: received {} bytes but expected size was {} \
+                                 (size hint stale?); verifying by hash",
+                                file_id.to_string(),
+                                write_offset,
+                                expected_size
+                            );
                         }
                         let actual = hasher.finalize().to_hex().to_string();
                         if actual == content_hash {
@@ -283,9 +325,10 @@ async fn receive_inner(
                 }
 
                 // Refill the window (unless we've already seen the last chunk,
-                // in which case no more requests are useful).
+                // in which case no more requests are useful), capped so we never
+                // request past EOF when the size is known.
                 if !saw_last {
-                    while in_flight < WINDOW {
+                    while in_flight < WINDOW && may_request(next_request_offset) {
                         outbound
                             .send(TransferMessage::ChunkRequest {
                                 offset: next_request_offset,
@@ -463,10 +506,12 @@ pub enum ReceiveOutcome {
 /// onto it. Returns the sender the peer session must feed inbound
 /// `TransferMessage`s for `transfer_id` into (register it in the demux table).
 /// The final [`ReceiveOutcome`] is delivered on `done`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_receiver<F>(
     transfer_id: TransferId,
     file_id: FileId,
     content_hash: String,
+    expected_size: u64,
     temp_path: PathBuf,
     peer_tx: UnboundedSender<F>,
     wrap: impl Fn(SyncMessage) -> F + Send + 'static,
@@ -492,6 +537,7 @@ where
         let outcome = match run_receiver(
             file_id,
             content_hash,
+            expected_size,
             temp_path,
             endpoint_out_tx,
             inbound_rx,
@@ -560,6 +606,7 @@ mod tests {
     /// transfer to completion, returning the received bytes.
     async fn roundtrip(source: FileBytes) -> Result<Vec<u8>, TransferError> {
         let content_hash = source.hash().await.unwrap();
+        let expected_size = source.byte_len().await.unwrap();
         let file_id = FileId::new();
         let dest = temp_path("dest");
 
@@ -569,7 +616,15 @@ mod tests {
         let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let sender = tokio::spawn(run_sender(source, s2r_tx, r2s_rx));
-        let received = run_receiver(file_id, content_hash, dest.clone(), r2s_tx, s2r_rx).await;
+        let received = run_receiver(
+            file_id,
+            content_hash,
+            expected_size,
+            dest.clone(),
+            r2s_tx,
+            s2r_rx,
+        )
+        .await;
         sender.await.unwrap();
 
         let result = received.map(|file_bytes| {
@@ -621,7 +676,15 @@ mod tests {
             r2s_rx,
         ));
         let wrong_hash = blake3::hash(b"different").to_hex().to_string();
-        let received = run_receiver(file_id, wrong_hash, dest.clone(), r2s_tx, s2r_rx).await;
+        let received = run_receiver(
+            file_id,
+            wrong_hash,
+            b"real bytes".len() as u64,
+            dest.clone(),
+            r2s_tx,
+            s2r_rx,
+        )
+        .await;
         sender.await.unwrap();
 
         assert!(matches!(received, Err(TransferError::HashMismatch { .. })));
@@ -640,10 +703,92 @@ mod tests {
 
         let sender = tokio::spawn(run_sender(FileBytes::FileToCopy(missing), s2r_tx, r2s_rx));
         let hash = blake3::hash(b"whatever").to_hex().to_string();
-        let received = run_receiver(file_id, hash, dest.clone(), r2s_tx, s2r_rx).await;
+        // Size unknown (source is missing): pass 0 to disable the request cap
+        // so we still request offset 0 and receive the sender's abort.
+        let received = run_receiver(file_id, hash, 0, dest.clone(), r2s_tx, s2r_rx).await;
         sender.await.unwrap();
 
         assert!(matches!(received, Err(TransferError::Aborted(_))));
         assert!(!dest.exists());
+    }
+
+    /// With a known size, the receiver must never request a chunk at or beyond
+    /// EOF: no wasted past-EOF requests, and no completion-abort needed. We
+    /// drive the receiver against a hand-rolled "sender" that records every
+    /// requested offset and serves the real bytes.
+    #[tokio::test]
+    async fn known_size_never_requests_past_eof() {
+        // A size that is NOT a multiple of CHUNK_SIZE, so the final chunk is
+        // partial — the case that used to overshoot.
+        let bytes: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7)).map(|i| i as u8).collect();
+        let size = bytes.len() as u64;
+        let content_hash = blake3::hash(&bytes).to_hex().to_string();
+        let file_id = FileId::new();
+        let dest = temp_path("cap-dest");
+
+        let (r2s_tx, mut r2s_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
+        let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
+
+        // Hand-rolled sender: record requested offsets and serve chunks. Asserts
+        // no offset is at or beyond `size`.
+        let sender_bytes = bytes.clone();
+        let sender = tokio::spawn(async move {
+            let mut requested = Vec::new();
+            while let Some(message) = r2s_rx.recv().await {
+                match message {
+                    TransferMessage::Start { .. } => {}
+                    TransferMessage::ChunkRequest { offset } => {
+                        requested.push(offset);
+                        assert!(
+                            offset < size,
+                            "receiver requested offset {offset} at/beyond EOF {size}"
+                        );
+                        let start = offset as usize;
+                        let end = (start + CHUNK_SIZE).min(sender_bytes.len());
+                        let chunk = sender_bytes[start..end].to_vec();
+                        let last = end == sender_bytes.len();
+                        if s2r_tx
+                            .send(TransferMessage::Chunk {
+                                offset,
+                                bytes: chunk,
+                                last,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    TransferMessage::Abort { .. } => break,
+                    TransferMessage::Chunk { .. } => {}
+                }
+            }
+            requested
+        });
+
+        let received =
+            run_receiver(file_id, content_hash, size, dest.clone(), r2s_tx, s2r_rx).await;
+        let requested = sender.await.unwrap();
+
+        let received_bytes = received
+            .map(|file_bytes| std::fs::read(file_bytes.path().unwrap()).unwrap())
+            .unwrap();
+        assert_eq!(received_bytes, bytes);
+
+        // Exactly ceil(size / CHUNK_SIZE) distinct offsets, none past EOF.
+        let expected_requests = size.div_ceil(CHUNK_SIZE as u64);
+        let mut unique = requested.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len() as u64, expected_requests);
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// A zero-length file still completes: exactly one request at offset 0
+    /// yields the empty final chunk.
+    #[tokio::test]
+    async fn known_zero_size_requests_only_offset_zero() {
+        let received = roundtrip(FileBytes::InMemory(Vec::new())).await.unwrap();
+        assert!(received.is_empty());
     }
 }

@@ -15,15 +15,17 @@ use tagnet_core::{
     tag::MetadataFormat,
 };
 
-/// A file's version history as `(version_number, content_hash)` pairs ordered
-/// oldest-to-newest. Mirrors `state::ManifestEntry::history`.
-pub type VersionHistory = Vec<(i64, String)>;
+/// A file's version history as `(version_number, content_hash, size)` triples
+/// ordered oldest-to-newest. `size` is the version's content size in bytes.
+/// Mirrors `state::ManifestEntry::history`.
+pub type VersionHistory = Vec<(i64, String, i64)>;
 
 /// One row of [`FileDatabase::manifest_entries`]: a file id, its full
-/// [`VersionHistory`], the unix-millis timestamp of its latest version, and
-/// the file's logical path.
+/// [`VersionHistory`], the unix-millis timestamp of its latest version, the
+/// file's logical path, and its soft-delete tombstone state
+/// (`deleted`, `deleted_at`).
 /// Maps directly onto a `state::ManifestEntry`.
-pub type ManifestRow = (FileId, VersionHistory, i64, LogicalPath);
+pub type ManifestRow = (FileId, VersionHistory, i64, LogicalPath, bool, i64);
 
 /// A single recorded version of a file's content.
 ///
@@ -39,6 +41,9 @@ pub struct FileVersion {
     pub observed_at: i64,
     pub version_number: i64,
     pub origin: String,
+    /// The version's content size in bytes. Read from disk (or the in-memory
+    /// buffer) at the same time the content hash is computed.
+    pub size: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,10 +78,10 @@ pub enum QueryTerm {
     HasTag(Vec<TagId>),
     /// `! /t foo` — must carry *none* of the tags in this set.
     NotTag(Vec<TagId>),
-    /// `/l foo` — the logical path (file) or name (tag) must contain the
+    /// `/n foo` — the logical path (file) or name (tag) must contain the
     /// substring (case-insensitive).
     LogicalContains(String),
-    /// `! /l foo` — the logical path (file) or name (tag) must *not* contain
+    /// `! /n foo` — the logical path (file) or name (tag) must *not* contain
     /// the substring (case-insensitive).
     NotLogicalContains(String),
     /// Prefix-less `foo` — matches on *either* substring OR tag (union across
@@ -270,9 +275,22 @@ impl FileDatabase {
                 // directory stores the bytes on disk. Contrast with
                 // `SyncDirectoryDatabase.files.physical_path`, which is the
                 // on-disk location within a particular sync directory.
+                // `deleted` / `deleted_at` are the soft-delete tombstone.
+                // Unlike tags (which reuse their `modified_at` clock), a file
+                // has no single per-file timestamp — its "latest activity" time
+                // is the newest `file_versions.observed_at` — so the delete time
+                // needs its own column. `deleted_at` is the unix-millis wall
+                // clock stamped when the file was deleted, preserved across the
+                // wire. Reconciliation compares it against the peer's latest
+                // version `observed_at`: an edit newer than the delete resurrects
+                // the file (last-writer-wins). All live reads filter
+                // `deleted = 0`; reconciliation deliberately considers
+                // tombstoned rows so a delete can win over a stale peer.
                 "CREATE TABLE IF NOT EXISTS files (
             id              TEXT PRIMARY KEY,
-            logical_path    TEXT NOT NULL
+            logical_path    TEXT NOT NULL,
+            deleted         INTEGER NOT NULL,
+            deleted_at      INTEGER NOT NULL
         )",
                 (), // empty list of parameters.
             )
@@ -291,12 +309,20 @@ impl FileDatabase {
         // when applying a peer's change.
         connection
             .execute(
+                // `deleted` is the soft-delete tombstone. Unlike files, a tag
+                // already carries `modified_at` as its single last-writer-wins
+                // clock, so a delete just sets `deleted = 1` and bumps
+                // `modified_at` (mirroring the relationship tombstones in
+                // `untag_entry`) — no separate `deleted_at` is needed. All live
+                // reads filter `deleted = 0`; reconciliation considers
+                // tombstoned rows so a delete can win LWW against a stale peer.
                 "CREATE TABLE IF NOT EXISTS tags (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL,
             color       TEXT NOT NULL,
             metadata    TEXT,
-            modified_at INTEGER NOT NULL DEFAULT 0
+            modified_at INTEGER NOT NULL DEFAULT 0,
+            deleted     INTEGER NOT NULL
         )",
                 (), // empty list of parameters.
             )
@@ -352,12 +378,18 @@ impl FileDatabase {
         // make `remove_file` cascade the delete here.
         connection
             .execute(
+                // `size` is the version's content size in bytes, read from disk
+                // (or the in-memory buffer) at the same time the content hash is
+                // computed. A 0-byte file stores `size = 0` — that is a real,
+                // known value, distinct from absence, which is why the column is
+                // `NOT NULL` with no default.
                 "CREATE TABLE IF NOT EXISTS file_versions (
             file_id         TEXT    NOT NULL,
             content_hash    TEXT    NOT NULL,
             observed_at     INTEGER NOT NULL,
             version_number  INTEGER NOT NULL,
             origin          TEXT    NOT NULL,
+            size            INTEGER NOT NULL,
             PRIMARY KEY (file_id, version_number)
         )",
                 (),
@@ -372,7 +404,75 @@ impl FileDatabase {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
+        // TODO: DELETE after all devices migrated.
+        //
+        // Temporary, hardcoded, idempotent migration. The `CREATE TABLE IF NOT
+        // EXISTS` statements above only create the new columns on a *fresh* DB;
+        // an already-existing DB predates them, so bring it up to date here with
+        // `ALTER TABLE ... ADD COLUMN`. These use `DEFAULT` purely to backfill
+        // existing rows (SQLite requires a default when adding a NOT NULL
+        // column) — the `CREATE TABLE` definitions above deliberately have no
+        // default so that omitting a value in normal operation is an error.
+        //
+        // - `file_versions.size`: backfill to 1 byte; files get their true size
+        //   the next time they are modified.
+        // - `files.deleted` / `files.deleted_at`: backfill to 0 (live, no
+        //   delete time).
+        // - `tags.deleted`: backfill to 0 (live).
+        Self::add_column_if_missing(
+            &connection,
+            "file_versions",
+            "size",
+            "ALTER TABLE file_versions ADD COLUMN size INTEGER NOT NULL DEFAULT 1",
+        )?;
+        Self::add_column_if_missing(
+            &connection,
+            "files",
+            "deleted",
+            "ALTER TABLE files ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            &connection,
+            "files",
+            "deleted_at",
+            "ALTER TABLE files ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            &connection,
+            "tags",
+            "deleted",
+            "ALTER TABLE tags ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        )?;
+
         Ok(Self { connection })
+    }
+
+    /// TODO: DELETE after all devices migrated.
+    ///
+    /// Run `alter_sql` (an `ALTER TABLE ... ADD COLUMN`) only if `table` does
+    /// not already have `column`. Idempotent: safe to call on every startup.
+    /// Used solely by the temporary hardcoded migration in [`Self::initialize`].
+    fn add_column_if_missing(
+        connection: &Connection,
+        table: &str,
+        column: &str,
+        alter_sql: &str,
+    ) -> Result<(), DatabaseError> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let existing: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        if existing.iter().any(|name| name == column) {
+            return Ok(());
+        }
+        connection
+            .execute(alter_sql, ())
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        Ok(())
     }
 
     /// Append a new version row for `file_id`.
@@ -384,11 +484,14 @@ impl FileDatabase {
     /// `origin` is `"local"` when the version was observed on disk by this
     /// daemon; it will later be a peer's public key when the version came in
     /// over the wire.
+    ///
+    /// `size` is the version's content size in bytes, read at hash time.
     pub fn record_version(
         &mut self,
         file_id: FileId,
         content_hash: &str,
         origin: &str,
+        size: i64,
     ) -> Result<i64, DatabaseError> {
         let observed_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -415,14 +518,15 @@ impl FileDatabase {
         transaction
             .execute(
                 "INSERT INTO file_versions
-                    (file_id, content_hash, observed_at, version_number, origin)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (file_id, content_hash, observed_at, version_number, origin, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (
                     file_id,
                     content_hash,
                     observed_at,
                     next_version_number,
                     origin,
+                    size,
                 ),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -483,7 +587,7 @@ impl FileDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT content_hash, observed_at, version_number, origin
+                "SELECT content_hash, observed_at, version_number, origin, size
                  FROM file_versions
                  WHERE file_id = ?1
                  ORDER BY version_number DESC
@@ -499,6 +603,7 @@ impl FileDatabase {
                     observed_at: row.get(1)?,
                     version_number: row.get(2)?,
                     origin: row.get(3)?,
+                    size: row.get(4)?,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -511,15 +616,15 @@ impl FileDatabase {
     }
 
     /// Return the full version history for `file_id`, ordered oldest-first by
-    /// `version_number`. Each tuple is `(version_number, content_hash)`. An
-    /// empty vec means the file has no recorded versions.
+    /// `version_number`. Each triple is `(version_number, content_hash, size)`.
+    /// An empty vec means the file has no recorded versions.
     ///
     /// Used to build `state::ManifestEntry::history`.
     pub fn version_history(&self, file_id: FileId) -> Result<VersionHistory, DatabaseError> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT version_number, content_hash
+                "SELECT version_number, content_hash, size
                  FROM file_versions
                  WHERE file_id = ?1
                  ORDER BY version_number ASC",
@@ -531,7 +636,8 @@ impl FileDatabase {
             .query_map([file_id], |row| {
                 let version_number: i64 = row.get(0)?;
                 let content_hash: String = row.get(1)?;
-                Ok((version_number, content_hash))
+                let size: i64 = row.get(2)?;
+                Ok((version_number, content_hash, size))
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         for row in rows {
@@ -540,14 +646,14 @@ impl FileDatabase {
         Ok(history)
     }
 
-    /// Return every `file_id` that currently has at least one row in the
-    /// `files` table (i.e. not deleted) together with its full version
-    /// history.
+    /// Return every `file_id` in the `files` table together with its full
+    /// version history and soft-delete tombstone state (`deleted`,
+    /// `deleted_at`).
     ///
-    /// Files with rows in `file_versions` but no row in `files` (a deleted
-    /// file whose history we kept around) are excluded — we don't announce
-    /// them during reconciliation. When the tombstone design lands, this is
-    /// where deletes will start being included again.
+    /// Deleted (tombstoned) files *are* included: reconciliation advertises the
+    /// tombstone so a delete can win last-writer-wins against a peer's stale
+    /// "present", and so a peer offline during the delete learns about it on
+    /// reconnect (or restores the file if it holds a newer edit).
     pub fn manifest_entries(&self) -> Result<Vec<ManifestRow>, DatabaseError> {
         // First fetch the file rows we still know about, then for each fetch
         // its history and tags. Two-stage to keep the SQL straightforward;
@@ -555,18 +661,24 @@ impl FileDatabase {
         // is acceptable.
         let mut id_statement = self
             .connection
-            .prepare("SELECT id, logical_path FROM files")
+            .prepare("SELECT id, logical_path, deleted, deleted_at FROM files")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let file_rows: Vec<(FileId, LogicalPath)> = id_statement
+        let file_rows: Vec<(FileId, LogicalPath, bool, i64)> = id_statement
             .query_map([], |row| {
-                Ok((row.get::<_, FileId>(0)?, row.get::<_, LogicalPath>(1)?))
+                let deleted: i64 = row.get(2)?;
+                Ok((
+                    row.get::<_, FileId>(0)?,
+                    row.get::<_, LogicalPath>(1)?,
+                    deleted != 0,
+                    row.get::<_, i64>(3)?,
+                ))
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let mut entries = Vec::with_capacity(file_rows.len());
-        for (file_id, logical_path) in file_rows {
+        for (file_id, logical_path, deleted, deleted_at) in file_rows {
             let history = self.version_history(file_id)?;
             // Files in `files` should always have at least one version
             // (every add/change path records one), but be defensive.
@@ -581,26 +693,37 @@ impl FileDatabase {
                 .latest_version(file_id)?
                 .map(|version| version.observed_at)
                 .unwrap_or(0);
-            entries.push((file_id, history, latest_observed_at, logical_path));
+            entries.push((
+                file_id,
+                history,
+                latest_observed_at,
+                logical_path,
+                deleted,
+                deleted_at,
+            ));
         }
         Ok(entries)
     }
 
     /// Every tag definition as a lightweight manifest entry (`tag_id` +
-    /// `modified_at`). Drives last-writer-wins reconciliation of definitions:
-    /// the receiver requests the full definition only for tags whose
-    /// `modified_at` is newer than (or absent from) its own. Mirrors
-    /// [`manifest_entries`] for files.
+    /// `modified_at` + `deleted`), *including* soft-deleted (tombstoned) tags.
+    /// Drives last-writer-wins reconciliation of definitions: the receiver
+    /// requests the full definition only for tags whose `modified_at` is newer
+    /// than (or absent from) its own, and applies a tombstone directly. A tag
+    /// delete bumps `modified_at`, so the existing LWW comparison also decides
+    /// delete-vs-edit. Mirrors [`manifest_entries`] for files.
     pub fn tag_manifest_entries(&self) -> Result<Vec<TagManifestEntry>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, modified_at FROM tags")
+            .prepare("SELECT id, modified_at, deleted FROM tags")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let entries = statement
             .query_map([], |row| {
+                let deleted: i64 = row.get(2)?;
                 Ok(TagManifestEntry {
                     tag_id: row.get(0)?,
                     modified_at: row.get(1)?,
+                    deleted: deleted != 0,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -897,14 +1020,51 @@ impl FileDatabase {
         file_id: FileId,
         logical_path: &LogicalPath,
     ) -> Result<(), DatabaseError> {
+        // A freshly added file is always live: `deleted = 0`, `deleted_at = 0`.
+        // (No default on the columns, so they are set explicitly here.)
         self.connection
             .execute(
-                "INSERT INTO files (id, logical_path) VALUES (?1, ?2)",
+                "INSERT INTO files (id, logical_path, deleted, deleted_at)
+                 VALUES (?1, ?2, 0, 0)",
                 (file_id, logical_path),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(())
+    }
+
+    /// Clear a file's soft-delete tombstone (mark it live again). Used when a
+    /// version newer than a local delete arrives (the restore-after-delete case)
+    /// so the previously-tombstoned file becomes visible again.
+    pub fn restore_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE files SET deleted = 0, deleted_at = 0 WHERE id = ?1",
+                [file_id],
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// The soft-delete tombstone state of a file as `(deleted, deleted_at)`, or
+    /// `None` if the file is unknown. Used by reconciliation to decide
+    /// delete-vs-edit last-writer-wins.
+    pub fn file_deletion_state(
+        &self,
+        file_id: FileId,
+    ) -> Result<Option<(bool, i64)>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT deleted, deleted_at FROM files WHERE id = ?1",
+                [file_id],
+                |row| {
+                    let deleted: i64 = row.get(0)?;
+                    Ok((deleted != 0, row.get::<_, i64>(1)?))
+                },
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)
     }
 
     pub fn update_file_logical_path(
@@ -922,12 +1082,39 @@ impl FileDatabase {
         Ok(())
     }
 
-    pub fn remove_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
-        self.connection
-            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+    /// Soft-delete a file: set its tombstone (`deleted = 1`, `deleted_at`)
+    /// instead of removing the row, so the deletion survives reconciliation
+    /// (a peer offline during the delete learns of it on reconnect) and can win
+    /// last-writer-wins against a stale "present".
+    ///
+    /// Last-writer-wins guard: the delete is applied only if `deleted_at` is
+    /// strictly newer than the file's latest recorded version `observed_at`.
+    /// This is the restore-after-delete rule — an edit made after the delete
+    /// (its `observed_at` beats `deleted_at`) keeps the file alive. The
+    /// `file_versions` history is left intact.
+    ///
+    /// Returns `true` if the tombstone was applied, `false` if a newer version
+    /// out-dated it (the file stays live).
+    pub fn remove_file(&self, file_id: FileId, deleted_at: i64) -> Result<bool, DatabaseError> {
+        let latest_observed_at = self
+            .latest_version(file_id)?
+            .map(|version| version.observed_at)
+            .unwrap_or(0);
+
+        if deleted_at <= latest_observed_at {
+            // A newer edit supersedes this delete; keep the file live.
+            return Ok(false);
+        }
+
+        let affected = self
+            .connection
+            .execute(
+                "UPDATE files SET deleted = 1, deleted_at = ?2 WHERE id = ?1",
+                (file_id, deleted_at),
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Add a new tag.
@@ -966,11 +1153,13 @@ impl FileDatabase {
         // values we tried to insert.
         self.connection
             .execute(
-                "INSERT INTO tags (id, name, color, modified_at) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO tags (id, name, color, modified_at, deleted)
+                 VALUES (?1, ?2, ?3, ?4, 0)
                  ON CONFLICT(id) DO UPDATE SET
                      name = excluded.name,
                      color = excluded.color,
-                     modified_at = excluded.modified_at
+                     modified_at = excluded.modified_at,
+                     deleted = 0
                  WHERE excluded.modified_at > tags.modified_at",
                 (tag_id, &name, &color, modified_at),
             )
@@ -1032,19 +1221,29 @@ impl FileDatabase {
         Ok(())
     }
 
-    pub fn remove_tag(&self, tag_id: TagId) -> Result<(), DatabaseError> {
-        self.connection
-            .execute("DELETE FROM tags WHERE id = ?1", [&tag_id])
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        self.connection
+    /// Soft-delete a tag: set its tombstone (`deleted = 1`) and bump
+    /// `modified_at` to `deleted_at`, instead of removing the row. A tag reuses
+    /// its `modified_at` as its single last-writer-wins clock, so the delete is
+    /// applied only if `deleted_at` is strictly newer than the stored
+    /// `modified_at` (a newer rename/recolor resurrects the tag). Mirrors the
+    /// relationship tombstones in [`untag_entry`].
+    ///
+    /// Relationship rows referencing the tag are left untouched: they carry
+    /// their own tombstones and reconcile independently.
+    ///
+    /// Returns `true` if the tombstone was applied, `false` if a newer edit
+    /// out-dated it (the tag stays live).
+    pub fn remove_tag(&self, tag_id: TagId, deleted_at: i64) -> Result<bool, DatabaseError> {
+        let affected = self
+            .connection
             .execute(
-                "DELETE FROM entries WHERE tag_id = ?1 OR (target_id = ?1 AND type = 1)",
-                [&tag_id],
+                "UPDATE tags SET deleted = 1, modified_at = ?2
+                 WHERE id = ?1 AND ?2 > modified_at",
+                (&tag_id, deleted_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Tag a file with the provided tag.
@@ -1327,11 +1526,7 @@ impl FileDatabase {
                     QueryTerm::NotAnyMatch(needle, tag_ids) => (needle, tag_ids, true),
                     _ => continue,
                 };
-                any_tag_sets.push((
-                    needle.to_lowercase(),
-                    files_for_any_tag(tag_ids)?,
-                    negated,
-                ));
+                any_tag_sets.push((needle.to_lowercase(), files_for_any_tag(tag_ids)?, negated));
             }
 
             candidates.retain(|file_id| {
@@ -1340,9 +1535,7 @@ impl FileDatabase {
                 };
                 for term in terms {
                     let ok = match term {
-                        QueryTerm::LogicalContains(needle) => {
-                            path.contains(&needle.to_lowercase())
-                        }
+                        QueryTerm::LogicalContains(needle) => path.contains(&needle.to_lowercase()),
                         QueryTerm::NotLogicalContains(needle) => {
                             !path.contains(&needle.to_lowercase())
                         }
@@ -1418,10 +1611,7 @@ impl FileDatabase {
             }
             set
         } else {
-            self.get_all_tags()?
-                .into_iter()
-                .map(|tag| tag.id)
-                .collect()
+            self.get_all_tags()?.into_iter().map(|tag| tag.id).collect()
         };
 
         for term in terms {
@@ -1455,11 +1645,7 @@ impl FileDatabase {
                     QueryTerm::NotAnyMatch(needle, tag_ids) => (needle, tag_ids, true),
                     _ => continue,
                 };
-                any_tag_sets.push((
-                    needle.to_lowercase(),
-                    subtags_of_any(tag_ids)?,
-                    negated,
-                ));
+                any_tag_sets.push((needle.to_lowercase(), subtags_of_any(tag_ids)?, negated));
             }
 
             candidates.retain(|tag_id| {
@@ -1468,9 +1654,7 @@ impl FileDatabase {
                 };
                 for term in terms {
                     let ok = match term {
-                        QueryTerm::LogicalContains(needle) => {
-                            name.contains(&needle.to_lowercase())
-                        }
+                        QueryTerm::LogicalContains(needle) => name.contains(&needle.to_lowercase()),
                         QueryTerm::NotLogicalContains(needle) => {
                             !name.contains(&needle.to_lowercase())
                         }
@@ -1614,11 +1798,11 @@ impl FileDatabase {
         Ok(tags)
     }
 
-    /// Get all tags.
+    /// Get all tags. Excludes soft-deleted (tombstoned) tags.
     pub fn get_all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, name, color FROM tags")
+            .prepare("SELECT id, name, color FROM tags WHERE deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag_list = statement
@@ -1637,11 +1821,12 @@ impl FileDatabase {
         Ok(tag_list)
     }
 
-    /// Get the name of a tag by the id.
+    /// Get the name of a tag by the id. Excludes soft-deleted (tombstoned) tags
+    /// (a tombstoned tag reads as `MissingTag`).
     pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT name, color FROM tags WHERE id = ?1")
+            .prepare("SELECT name, color FROM tags WHERE id = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag = statement
@@ -1668,7 +1853,7 @@ impl FileDatabase {
     ) -> Result<FileId, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM files WHERE logical_path = ?1")
+            .prepare("SELECT id FROM files WHERE logical_path = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file_id = statement
@@ -1704,7 +1889,7 @@ impl FileDatabase {
         let pattern = format!("%{escaped}%");
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM tags WHERE name LIKE ?1 ESCAPE '\\'")
+            .prepare("SELECT id FROM tags WHERE name LIKE ?1 ESCAPE '\\' AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let name_matches = statement
             .query_map([&pattern], |row| row.get::<_, TagId>(0))
@@ -1718,7 +1903,7 @@ impl FileDatabase {
             let id_pattern = format!("{prefix}%");
             let mut statement = self
                 .connection
-                .prepare("SELECT id FROM tags WHERE id LIKE ?1")
+                .prepare("SELECT id FROM tags WHERE id LIKE ?1 AND deleted = 0")
                 .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
             let id_matches = statement
                 .query_map([&id_pattern], |row| row.get::<_, TagId>(0))
@@ -1731,11 +1916,11 @@ impl FileDatabase {
         Ok(ids.into_iter().collect())
     }
 
-    /// Get the id of a tag by the name.
+    /// Get the id of a tag by the name. Excludes soft-deleted (tombstoned) tags.
     pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM tags WHERE name = ?1")
+            .prepare("SELECT id FROM tags WHERE name = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag_id = statement
@@ -1755,7 +1940,7 @@ impl FileDatabase {
     pub fn logical_path_for_file_id(&self, file_id: FileId) -> Result<LogicalPath, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT logical_path FROM files WHERE id = ?1")
+            .prepare("SELECT logical_path FROM files WHERE id = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let logical_path = statement
@@ -1779,7 +1964,7 @@ impl FileDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.logical_path, v.content_hash, v.version_number
+                "SELECT f.logical_path, v.content_hash, v.version_number, v.size
                  FROM files AS f
                  JOIN file_versions AS v
                    ON v.file_id = f.id
@@ -1788,7 +1973,7 @@ impl FileDatabase {
                       FROM file_versions AS inner
                       WHERE inner.file_id = f.id
                   )
-                 WHERE f.id = ?1",
+                 WHERE f.id = ?1 AND f.deleted = 0",
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -1799,6 +1984,7 @@ impl FileDatabase {
                     logical_path: row.get(0)?,
                     content_hash: row.get(1)?,
                     version_number: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
                     // Filled in below.
                     short_id_length: 0,
                 })
@@ -1825,7 +2011,7 @@ impl FileDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.id, f.logical_path, v.content_hash, v.version_number
+                "SELECT f.id, f.logical_path, v.content_hash, v.version_number, v.size
                  FROM files AS f
                  JOIN file_versions AS v
                    ON v.file_id = f.id
@@ -1833,7 +2019,8 @@ impl FileDatabase {
                       SELECT MAX(version_number)
                       FROM file_versions AS inner
                       WHERE inner.file_id = f.id
-                  )",
+                  )
+                 WHERE f.deleted = 0",
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -1845,6 +2032,7 @@ impl FileDatabase {
                     logical_path: row.get(1)?,
                     content_hash: row.get(2)?,
                     version_number: row.get(3)?,
+                    size: row.get::<_, i64>(4)? as u64,
                     // Filled in below once we have the whole set.
                     short_id_length: 0,
                 })
@@ -2099,10 +2287,10 @@ mod tests {
         // Two versions; get_all_files must report the latest (higher
         // version_number), not the first.
         let v1 = database
-            .record_version(file_id, "hash-v1", "local")
+            .record_version(file_id, "hash-v1", "local", 1)
             .unwrap();
         let v2 = database
-            .record_version(file_id, "hash-v2", "local")
+            .record_version(file_id, "hash-v2", "local", 1)
             .unwrap();
         assert!(v2 > v1);
 
@@ -2129,8 +2317,12 @@ mod tests {
             .add_file(file_id, &LogicalPath::new("a.txt"))
             .unwrap();
 
-        database.record_version(file_id, "hash-A", "local").unwrap();
-        database.record_version(file_id, "hash-B", "local").unwrap();
+        database
+            .record_version(file_id, "hash-A", "local", 1)
+            .unwrap();
+        database
+            .record_version(file_id, "hash-B", "local", 1)
+            .unwrap();
         // Current version is B, but A is still in history.
         assert_eq!(
             database
@@ -2142,14 +2334,19 @@ mod tests {
         );
 
         // Revert to A: a new version whose hash is the old A.
-        let reverted = database.record_version(file_id, "hash-A", "local").unwrap();
+        let reverted = database
+            .record_version(file_id, "hash-A", "local", 1)
+            .unwrap();
         let latest = database.latest_version(file_id).unwrap().unwrap();
         assert_eq!(latest.content_hash, "hash-A");
         assert_eq!(latest.version_number, reverted);
         // History now has three entries: A, B, A.
         let history = database.version_history(file_id).unwrap();
         assert_eq!(
-            history.iter().map(|(_, h)| h.as_str()).collect::<Vec<_>>(),
+            history
+                .iter()
+                .map(|(_, h, _)| h.as_str())
+                .collect::<Vec<_>>(),
             vec!["hash-A", "hash-B", "hash-A"]
         );
     }
@@ -2229,7 +2426,7 @@ mod tests {
         let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
         for (id, name) in [(shared_a, "a"), (shared_b, "b")] {
             database.add_file(id, &LogicalPath::new(name)).unwrap();
-            database.record_version(id, "hash", "local").unwrap();
+            database.record_version(id, "hash", "local", 1).unwrap();
         }
 
         let files = database.get_all_files().unwrap();
@@ -2325,7 +2522,7 @@ mod tests {
         let far = file_id_from_hex("ffff000000000000000000000000000f");
         for (id, name) in [(shared_a, "a"), (shared_b, "b"), (far, "c")] {
             database.add_file(id, &LogicalPath::new(name)).unwrap();
-            database.record_version(id, "hash", "local").unwrap();
+            database.record_version(id, "hash", "local", 1).unwrap();
         }
 
         // Each file's displayed short id must resolve back to exactly itself.
@@ -2789,7 +2986,7 @@ mod tests {
             database.add_file(id, &LogicalPath::new(path)).unwrap();
             // A negative-only query seeds from all files, which requires each to
             // have a recorded version to appear in the listing.
-            database.record_version(id, "hash", "test").unwrap();
+            database.record_version(id, "hash", "test", 1).unwrap();
         }
         database.tag_file(foo, file_a, 1).unwrap();
         database.tag_file(foobar, file_b, 1).unwrap();
@@ -2803,5 +3000,214 @@ mod tests {
             .collect();
 
         assert_eq!(matched, BTreeSet::from([file_c]));
+    }
+
+    // --- File size ---------------------------------------------------------
+
+    #[test]
+    fn size_round_trips_through_version_and_file_info() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+        database
+            .record_version(file_id, "hash-1", "local", 42)
+            .unwrap();
+
+        // Latest version carries the size.
+        assert_eq!(database.latest_version(file_id).unwrap().unwrap().size, 42);
+        // FileInfo surfaces it (as u64).
+        assert_eq!(database.file_info_from_id(file_id).unwrap().size, 42);
+
+        // A new version records its own size; the latest reflects the newest.
+        database
+            .record_version(file_id, "hash-2", "local", 100)
+            .unwrap();
+        assert_eq!(database.file_info_from_id(file_id).unwrap().size, 100);
+    }
+
+    #[test]
+    fn zero_byte_size_is_a_real_value() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("empty.txt"))
+            .unwrap();
+        database
+            .record_version(file_id, "hash-0", "local", 0)
+            .unwrap();
+        assert_eq!(database.file_info_from_id(file_id).unwrap().size, 0);
+    }
+
+    #[test]
+    fn version_history_carries_per_version_size() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+        database.record_version(file_id, "h1", "local", 10).unwrap();
+        database.record_version(file_id, "h2", "local", 20).unwrap();
+
+        let history = database.version_history(file_id).unwrap();
+        assert_eq!(
+            history,
+            vec![(1, "h1".to_owned(), 10), (2, "h2".to_owned(), 20),]
+        );
+    }
+
+    // --- File deletion tombstones -----------------------------------------
+
+    #[test]
+    fn file_delete_soft_deletes_and_hides_from_reads() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+        database.record_version(file_id, "h1", "local", 1).unwrap();
+
+        // Delete with a timestamp newer than the version's observed_at.
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(file_id, deleted_at).unwrap());
+
+        // Hidden from user-facing reads...
+        assert!(database.get_all_files().unwrap().is_empty());
+        assert!(matches!(
+            database.file_info_from_id(file_id),
+            Err(DatabaseError::MissingFile)
+        ));
+        // ...but the row (and its history) still exists for reconciliation.
+        assert!(database.file_exists(file_id).unwrap());
+        assert_eq!(
+            database.file_deletion_state(file_id).unwrap(),
+            Some((true, deleted_at))
+        );
+    }
+
+    #[test]
+    fn file_delete_loses_to_newer_edit() {
+        // Restore-after-delete: an edit whose observed_at is newer than the
+        // delete keeps the file live (the delete is a no-op).
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+        // record_version stamps observed_at = now; a delete stamped in the
+        // past must lose.
+        database.record_version(file_id, "h1", "local", 1).unwrap();
+        let stale_delete_at = 1; // far in the past
+
+        assert!(!database.remove_file(file_id, stale_delete_at).unwrap());
+        // File stays visible.
+        assert_eq!(database.get_all_files().unwrap().len(), 1);
+        assert_eq!(
+            database.file_deletion_state(file_id).unwrap(),
+            Some((false, 0))
+        );
+    }
+
+    #[test]
+    fn restore_file_clears_tombstone() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+        database.record_version(file_id, "h1", "local", 1).unwrap();
+        assert!(
+            database
+                .remove_file(file_id, now_millis() + 10_000)
+                .unwrap()
+        );
+        assert!(database.get_all_files().unwrap().is_empty());
+
+        database.restore_file(file_id).unwrap();
+        assert_eq!(database.get_all_files().unwrap().len(), 1);
+        assert_eq!(
+            database.file_deletion_state(file_id).unwrap(),
+            Some((false, 0))
+        );
+    }
+
+    #[test]
+    fn deleted_file_appears_in_manifest_with_tombstone() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .unwrap();
+        database.record_version(file_id, "h1", "local", 7).unwrap();
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(file_id, deleted_at).unwrap());
+
+        let entries = database.manifest_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        let (id, history, _observed, _path, deleted, got_deleted_at) = &entries[0];
+        assert_eq!(*id, file_id);
+        assert!(*deleted);
+        assert_eq!(*got_deleted_at, deleted_at);
+        // History (with sizes) is retained so the file can be restored.
+        assert_eq!(history, &vec![(1, "h1".to_owned(), 7)]);
+    }
+
+    // --- Tag deletion tombstones ------------------------------------------
+
+    #[test]
+    fn tag_delete_soft_deletes_and_hides_from_reads() {
+        let database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "work", "red", 10).unwrap();
+
+        // Delete with a newer modified_at.
+        assert!(database.remove_tag(tag_id, 20).unwrap());
+
+        // Hidden from user-facing reads.
+        assert!(
+            database
+                .get_all_tags()
+                .unwrap()
+                .into_iter()
+                .next()
+                .is_none()
+        );
+        assert!(matches!(
+            database.tag_from_id(tag_id),
+            Err(DatabaseError::MissingTag)
+        ));
+        // But the tombstone is advertised in the manifest with a bumped
+        // modified_at.
+        let entries = database.tag_manifest_entries().unwrap();
+        let entry = entries.iter().find(|e| e.tag_id == tag_id).unwrap();
+        assert!(entry.deleted);
+        assert_eq!(entry.modified_at, 20);
+    }
+
+    #[test]
+    fn tag_delete_loses_to_newer_edit() {
+        let database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "work", "red", 100).unwrap();
+
+        // A delete older than the tag's modified_at is a no-op (LWW).
+        assert!(!database.remove_tag(tag_id, 50).unwrap());
+        assert!(database.tag_from_id(tag_id).is_ok());
+    }
+
+    #[test]
+    fn newer_add_revives_deleted_tag() {
+        // Restore: a rename/re-add newer than the delete clears the tombstone.
+        let database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "work", "red", 10).unwrap();
+        assert!(database.remove_tag(tag_id, 20).unwrap());
+        assert!(database.tag_from_id(tag_id).is_err());
+
+        // A newer add (upsert) revives it.
+        database.add_tag(tag_id, "work", "blue", 30).unwrap();
+        let tag = database.tag_from_id(tag_id).unwrap();
+        assert_eq!(tag.color, "blue");
     }
 }

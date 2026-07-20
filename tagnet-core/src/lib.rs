@@ -112,6 +112,9 @@ pub mod state {
             /// transfer (keyed by `file_id` + this hash). The hash is recorded
             /// in `file_versions` so the version chain is authoritative.
             content_hash: String,
+            /// The file's content size in bytes, read at hash time. Recorded
+            /// alongside `content_hash` in `file_versions`.
+            size: u64,
             // TODO: Bundle metadata with the tag.
             tags: Vec<TagId>,
         },
@@ -129,9 +132,17 @@ pub mod state {
             /// carries no bytes; the receiver pulls them over a separate
             /// transfer. See `FileMetadataAdded::content_hash`.
             content_hash: String,
+            /// The file's new content size in bytes, read at hash time.
+            size: u64,
         },
         FileDeleted {
             file_id: FileId,
+            /// The unix-millis wall-clock time the file was deleted, stamped on
+            /// the originating device and preserved across the wire. Drives
+            /// last-writer-wins against a file's latest version `observed_at`:
+            /// an edit made after the delete resurrects the file. Never restamp
+            /// it when applying a peer's delete.
+            deleted_at: i64,
         },
         // Tag-mutation variants each carry `modified_at`: the unix-millis
         // wall-clock time stamped on the *originating* device. It is preserved
@@ -165,6 +176,12 @@ pub mod state {
         },
         TagRemoved {
             tag_id: TagId,
+            /// The unix-millis delete time. A tag reuses its `modified_at` as
+            /// its single last-writer-wins clock, so the delete carries a
+            /// timestamp here (stored into `modified_at`) rather than a separate
+            /// `deleted_at`. A newer rename/recolor resurrects the tag. Never
+            /// restamp it when applying a peer's delete.
+            modified_at: i64,
         },
         FileTagged {
             file_id: FileId,
@@ -234,9 +251,18 @@ pub mod state {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ManifestEntry {
         pub file_id: FileId,
-        pub history: Vec<(i64, String)>,
+        /// Oldest-to-newest `(version_number, content_hash, size)` triples.
+        /// `size` is the version's content size in bytes.
+        pub history: Vec<(i64, String, i64)>,
         pub latest_observed_at: i64,
         pub logical_path: LogicalPath,
+        /// Soft-delete tombstone state. When `deleted` is true this entry
+        /// advertises a deletion: the receiver applies it (removing/hiding the
+        /// file) unless it holds a version whose `observed_at` beats
+        /// `deleted_at` (restore-after-delete, last-writer-wins).
+        pub deleted: bool,
+        /// The unix-millis time the file was deleted (0 when not deleted).
+        pub deleted_at: i64,
     }
 
     /// What a tag relationship attaches a tag to. Mirrors the daemon's
@@ -259,6 +285,12 @@ pub mod state {
     pub struct TagManifestEntry {
         pub tag_id: TagId,
         pub modified_at: i64,
+        /// Soft-delete tombstone state. When true, the tag is deleted; the
+        /// receiver applies the tombstone directly (no `TagRequest` follow-up)
+        /// when this entry's `modified_at` is newer than its own — a tag's
+        /// delete bumps `modified_at`, so the existing LWW comparison decides
+        /// delete-vs-edit.
+        pub deleted: bool,
     }
 
     /// A tag *relationship* (file-tagged or tag-tagged) as advertised in a tag
@@ -320,6 +352,9 @@ pub mod state {
             request_id: RequestId,
             file_id: FileId,
             content_hash: String,
+            /// The file's content size in bytes (from the answering node's
+            /// catalog). Lets the eventual pull cap its request window at EOF.
+            size: u64,
         },
         /// This subtree does not have the requested content (all children
         /// exhausted or timed out).
@@ -430,6 +465,8 @@ pub struct FileInfo {
     pub logical_path: LogicalPath,
     pub content_hash: String,
     pub version_number: i64,
+    /// The latest version's content size in bytes.
+    pub size: u64,
     /// Number of leading characters of `file_id` (in its canonical simple-hex
     /// form) needed to uniquely identify this file among all files known at the
     /// time the listing was produced — the "short id" length, à la `jj`/`git`.

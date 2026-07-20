@@ -24,8 +24,22 @@ pub struct Peer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncType {
-    Universal,
-    TagBased { tags: Vec<TagId> },
+    Universal {
+        /// When true, a `Change::FileDeleted` does **not** remove the file's
+        /// bytes from this directory: the physical copy is kept as a recovery
+        /// vault so an accidental delete can be undone. The file is still
+        /// removed from the catalog and from every other sync directory; only
+        /// this directory's on-disk copy survives.
+        ///
+        /// Universal-only (files here are stored under their `file_id`, so a
+        /// kept copy is unambiguous). Defaults to `false` so existing behaviour
+        /// — and configs that wrote `{"Universal": {}}` — are unchanged.
+        #[serde(default)]
+        keep_deleted_files: bool,
+    },
+    TagBased {
+        tags: Vec<TagId>,
+    },
 }
 
 impl SyncType {
@@ -43,7 +57,7 @@ impl SyncType {
     /// core newtypes expose no direct conversion in this direction.
     pub fn physical_for(&self, logical_path: &LogicalPath, file_id: FileId) -> PhysicalPath {
         match self {
-            SyncType::Universal => PhysicalPath::new(file_id.to_string()),
+            SyncType::Universal { .. } => PhysicalPath::new(file_id.to_string()),
             SyncType::TagBased { .. } => PhysicalPath::new(logical_path.as_str()),
         }
     }
@@ -178,7 +192,9 @@ impl Configuration {
             sync_directories: vec![
                 SyncDirectory {
                     path: "/tmp/tagnet-testcloud".into(),
-                    sync_type: SyncType::Universal,
+                    sync_type: SyncType::Universal {
+                        keep_deleted_files: false,
+                    },
                 },
                 SyncDirectory {
                     path: "/tmp/tagnet-testcloud-2".into(),
@@ -214,8 +230,13 @@ impl Configuration {
         for sync_directory in &self.sync_directories {
             match &sync_directory.sync_type {
                 // If any of the sync directories want to save all files, we don't need the list of
-                // tags.
-                SyncType::Universal => return SyncType::Universal,
+                // tags. (The recovery flag is a local storage concern; it plays
+                // no part in what we advertise to peers.)
+                SyncType::Universal { .. } => {
+                    return SyncType::Universal {
+                        keep_deleted_files: false,
+                    };
+                }
                 SyncType::TagBased { tags } => all_synced_tags.extend_from_slice(tags),
                 // SyncType::Upload || SyncType::Copy => {},
             }

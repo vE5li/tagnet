@@ -92,10 +92,7 @@ pub trait TransportBackend {
     ) -> impl Future<Output = Result<QueryResult, ApiError>> + Send;
 
     /// Get a single file's [`FileInfo`] by id (`NotFound` if unknown).
-    fn get_file(
-        &self,
-        file_id: FileId,
-    ) -> impl Future<Output = Result<FileInfo, ApiError>> + Send;
+    fn get_file(&self, file_id: FileId) -> impl Future<Output = Result<FileInfo, ApiError>> + Send;
 
     /// Get a single tag by id (`NotFound` if unknown).
     fn get_tag(&self, tag_id: TagId) -> impl Future<Output = Result<Tag, ApiError>> + Send;
@@ -390,9 +387,10 @@ impl TransportBackend for InProcessBackend {
         // local filesystem instead of the control socket.
         let source = crate::file_bytes::FileBytes::FileToCopy(path);
         let content_hash = source.hash().await.map_err(hash_error)?;
+        let size = source.byte_len().await.map_err(hash_error)?;
         let file_id = self
             .api
-            .upload_file(path_name, content_hash.clone(), tags)?;
+            .upload_file(path_name, content_hash.clone(), size, tags)?;
         self.api
             .register_provider(file_id, content_hash, std::sync::Arc::new(source))
             .await;
@@ -402,7 +400,8 @@ impl TransportBackend for InProcessBackend {
     async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
         let source = crate::file_bytes::FileBytes::FileToCopy(path);
         let content_hash = source.hash().await.map_err(hash_error)?;
-        self.api.edit_file(file_id, content_hash.clone())?;
+        let size = source.byte_len().await.map_err(hash_error)?;
+        self.api.edit_file(file_id, content_hash.clone(), size)?;
         self.api
             .register_provider(file_id, content_hash, std::sync::Arc::new(source))
             .await;

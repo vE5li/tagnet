@@ -221,13 +221,17 @@
         # on — an x86_64 emulator otherwise silently runs against a stale/absent
         # x86_64 .so while only arm64-v8a was (re)built, and frb then misreads
         # the mismatched wire format ("Bad state: ...").
+        #
+        # With more than one android device connected, set TAGNET_DEVICE to an
+        # id/name (see `flutter devices`) to pick one.
         pickAndroidDevice = ''
-          # `.[0] // empty` yields no output when there is no android device, so
-          # `read` sees EOF and leaves both vars empty (the `|| true` keeps
-          # `set -e` from aborting on read's EOF non-zero exit).
+          selector='.[0] // empty'
+          if [ -n "''${TAGNET_DEVICE:-}" ]; then
+            selector='map(select(.id == "'"$TAGNET_DEVICE"'" or .name == "'"$TAGNET_DEVICE"'"))[0] // empty'
+          fi
           read -r device platform < <(
             flutter devices --machine \
-              | jq -r 'map(select(.targetPlatform | startswith("android"))) | (.[0] // empty) | "\(.id) \(.targetPlatform)"'
+              | jq -r 'map(select(.targetPlatform | startswith("android"))) | '"$selector"' | "\(.id) \(.targetPlatform)"'
           ) || true
           if [ -z "$device" ]; then
             echo "No android device found. Connect a device (adb devices) and retry." >&2
@@ -245,10 +249,20 @@
           esac
         '';
 
+        # Copy the per-device runtime config selected by $TAGNET_CONFIG into
+        # the Android asset the Kotlin runtime reads at start-up. This is what
+        # puts one of the files under app/config/ inside the APK.
+        selectAndroidConfigBody = ''
+          mkdir -p app/android/app/src/main/assets
+          cp "app/config/''${TAGNET_CONFIG}.json" \
+             "app/android/app/src/main/assets/tagnet_config.json"
+        '';
+
         # Fast path: pick the device and launch, no native rebuild. Assumes the
         # .so for the device's ABI is already current (see launch-android).
         launchAndroidBody = ''
           ${pickAndroidDevice}
+          ${selectAndroidConfigBody}
           # Select the in-process-engine backend at build time.
           ( cd app && flutter run --release -d "$device" \
               --dart-define=TAGNET_BACKEND=android )
@@ -260,6 +274,7 @@
         # stale/absent x86_64 .so while only arm64-v8a was rebuilt.
         runAndroidLaunchBody = ''
           ${pickAndroidDevice}
+          ${selectAndroidConfigBody}
           abis="$device_abi"
           ${buildNativeForAbisBody}
           ( cd app && flutter run --release -d "$device" \
@@ -319,6 +334,12 @@
           # Full build-and-run: regenerate bindings, rebuild the native .so for
           # the connected device's ABI, then launch. The safe default; safe to
           # re-run.
+          #
+          # Requires TAGNET_CONFIG=<name> (see app/config/) so the APK bundles
+          # a per-device runtime config. With more than one android device
+          # connected also set TAGNET_DEVICE=<id|name> to pick which one to
+          # flash; see the run-android-phone / run-android-sylvie-phone
+          # convenience apps below for the two-phone workflow.
           run-android = ''
             ${codegenBody}
             ${runAndroidLaunchBody}

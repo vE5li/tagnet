@@ -864,7 +864,10 @@ async fn run_peer_session<S>(
         let our_sender = our_sender.clone();
         let receiver_done_tx = receiver_done_tx.clone();
         let transfer_temp_dir = transfer_temp_dir.clone();
-        move |file_id: FileId, content_hash: String, purpose: ReceiverPurpose| {
+        move |file_id: FileId,
+              content_hash: String,
+              expected_size: u64,
+              purpose: ReceiverPurpose| {
             let transfer_id = TransferId::new();
             let temp_path = transfer_temp_dir.join(transfer_id.to_string());
             let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
@@ -872,6 +875,7 @@ async fn run_peer_session<S>(
                 transfer_id,
                 file_id,
                 content_hash,
+                expected_size,
                 temp_path,
                 our_sender.clone(),
                 Frame::Sync,
@@ -1037,6 +1041,7 @@ async fn run_peer_session<S>(
                     bus::PeerCommand::StartReceive {
                         file_id,
                         content_hash,
+                        expected_size,
                         placement,
                     } => {
                         // `handle_changes` recorded a live change this peer
@@ -1051,7 +1056,8 @@ async fn run_peer_session<S>(
                             },
                             placement,
                         };
-                        let (transfer_id, inbound) = start_pull(file_id, content_hash, purpose);
+                        let (transfer_id, inbound) =
+                            start_pull(file_id, content_hash, expected_size, purpose);
                         transfers.insert(transfer_id, inbound);
                     }
                 }
@@ -1129,9 +1135,11 @@ async fn run_peer_session<S>(
                             request_id,
                             file_id,
                             content_hash,
+                            size,
                         } => {
                             // Relay: hold the received bytes so our parent can
-                            // pull them, then announce (content-less) upward.
+                            // pull them, then announce (content-less, but
+                            // carrying the size) upward.
                             pending_fetches
                                 .cache_relay_file(file_id, content_hash.clone(), content)
                                 .await;
@@ -1142,6 +1150,7 @@ async fn run_peer_session<S>(
                                     request_id,
                                     file_id,
                                     content_hash,
+                                    size,
                                 }));
                             }
                         }
@@ -1218,7 +1227,35 @@ async fn run_peer_session<S>(
                         let announced_file_ids: Vec<FileId> =
                             entries.iter().map(|entry| entry.file_id).collect();
 
-                        let wanted = reconcile_peer_manifest(peer_name, entries, &database);
+                        let (wanted, deletions) =
+                            reconcile_peer_manifest(peer_name, entries, &database);
+
+                        // Apply peer deletions that won last-writer-wins by
+                        // enqueuing them through the sole DB writer.
+                        for WantedDeletion {
+                            file_id,
+                            deleted_at,
+                        } in deletions
+                        {
+                            if let Err(error) =
+                                change_sender.send(DaemonMessage::Change(
+                                    Ingest::from_change(Change::FileDeleted {
+                                        file_id,
+                                        deleted_at,
+                                    }),
+                                    ChangeOrigin::Peer {
+                                        public_key: peer_public_key.to_owned(),
+                                    },
+                                ))
+                            {
+                                log::error!(
+                                    "Reconciliation: failed to enqueue delete for {} \
+                                     announced by {peer_name}: {error}",
+                                    file_id.to_string()
+                                );
+                            }
+                        }
+
                         // Files we are pulling as a result of catalog reconciliation
                         // (below); excluded from the placement sweep so we do not
                         // double-fetch them.
@@ -1233,6 +1270,7 @@ async fn run_peer_session<S>(
                         for WantedFile {
                             file_id,
                             content_hash,
+                            size,
                             placement,
                         } in wanted
                         {
@@ -1270,6 +1308,7 @@ async fn run_peer_session<S>(
                                 file_id,
                                 logical_path,
                                 content_hash: content_hash.clone(),
+                                size: size as u64,
                                 origin: ChangeOrigin::Peer {
                                     public_key: peer_public_key.to_owned(),
                                 },
@@ -1290,7 +1329,7 @@ async fn run_peer_session<S>(
                                 placement,
                             };
                             let (transfer_id, inbound) =
-                                start_pull(file_id, content_hash, purpose);
+                                start_pull(file_id, content_hash, size as u64, purpose);
                             transfers.insert(transfer_id, inbound);
                         }
 
@@ -1334,14 +1373,15 @@ async fn run_peer_session<S>(
                         expected_hash,
                     }) => {
                         // A peer is asking us (recursively) for a file's bytes.
-                        // Answer locally if we hold matching content; otherwise
-                        // relay to our other peers. We only need a boolean here:
-                        // the bytes themselves are pulled over a transfer later.
-                        let have_local =
+                        // Answer locally if we hold matching content (with its
+                        // size, so the puller can cap its window); otherwise
+                        // relay to our other peers. The bytes themselves are
+                        // pulled over a transfer later.
+                        let local_size =
                             local_hash_matches(&command_sender, file_id, &expected_hash).await;
                         log::debug!(
                             "FetchRequest from {peer_name} for {} (expected_hash {}): \
-                             have_local={have_local}",
+                             local_size={local_size:?}",
                             file_id.to_string(),
                             expected_hash,
                         );
@@ -1351,7 +1391,7 @@ async fn run_peer_session<S>(
                                 request_id,
                                 file_id,
                                 expected_hash,
-                                have_local,
+                                local_size,
                             )
                             .await;
                     }
@@ -1359,32 +1399,38 @@ async fn run_peer_session<S>(
                         request_id,
                         file_id,
                         content_hash,
+                        size,
                     }) => {
-                        // Content-less: a child announced it has the file. Pull
-                        // the bytes from that child over a transfer, then either
-                        // deliver locally (origin) or relay upward.
+                        // Content-less: a child announced it has the file (and
+                        // its size). Pull the bytes from that child over a
+                        // transfer, then either deliver locally (origin) or relay
+                        // upward.
                         let action = pending_fetches
                             .handle_incoming_found(
                                 peer_public_key,
                                 request_id,
                                 file_id,
                                 content_hash,
+                                size,
                             )
                             .await;
                         if let Some(fetch::FoundAction::Receive {
                             from_peer,
                             file_id,
                             expected_hash,
+                            expected_size,
                             then,
                         }) = action
                         {
                             // The child that answered is `from_peer`, which is
                             // this very connection (`peer_public_key`); pull over
-                            // our own link.
+                            // our own link. The size carried by `FetchFound` caps
+                            // the request window at EOF.
                             let _ = from_peer; // == peer_public_key; kept for clarity
                             let (transfer_id, inbound) = start_pull(
                                 file_id,
                                 expected_hash,
+                                expected_size,
                                 ReceiverPurpose::Fetch { then },
                             );
                             transfers.insert(transfer_id, inbound);
@@ -1649,11 +1695,15 @@ fn build_local_manifest(database: &FileDatabase) -> Result<Vec<ManifestEntry>, S
     Ok(rows
         .into_iter()
         .map(
-            |(file_id, history, latest_observed_at, logical_path)| ManifestEntry {
-                file_id,
-                history,
-                latest_observed_at,
-                logical_path,
+            |(file_id, history, latest_observed_at, logical_path, deleted, deleted_at)| {
+                ManifestEntry {
+                    file_id,
+                    history,
+                    latest_observed_at,
+                    logical_path,
+                    deleted,
+                    deleted_at,
+                }
             },
         )
         .collect())
@@ -1669,7 +1719,19 @@ fn build_local_manifest(database: &FileDatabase) -> Result<Vec<ManifestEntry>, S
 pub struct WantedFile {
     pub file_id: FileId,
     pub content_hash: String,
+    /// The peer's latest-version content size in bytes (from the manifest
+    /// history), recorded alongside the hash when we catalog the version.
+    pub size: i64,
     pub placement: bus::MaterializePlacement,
+}
+
+/// A file deletion learned from a peer's manifest that wins last-writer-wins
+/// against our local state (the peer's `deleted_at` is newer than our latest
+/// version `observed_at`). Applied by enqueuing a `Change::FileDeleted`.
+#[derive(Debug, Clone)]
+pub struct WantedDeletion {
+    pub file_id: FileId,
+    pub deleted_at: i64,
 }
 
 /// Compare the peer's manifest against our local `file_versions` table and
@@ -1705,14 +1767,45 @@ fn reconcile_peer_manifest(
     peer_name: &str,
     entries: Vec<ManifestEntry>,
     database: &FileDatabase,
-) -> Vec<WantedFile> {
+) -> (Vec<WantedFile>, Vec<WantedDeletion>) {
     log::info!(
         "Reconciling {} manifest entries from {peer_name}",
         entries.len()
     );
 
     let mut wanted = Vec::new();
+    let mut deletions = Vec::new();
     for entry in entries {
+        // Deletion tombstones take precedence over content reconciliation. If
+        // the peer advertises a delete, apply last-writer-wins against our
+        // latest local version: a delete newer than our latest edit wins (we
+        // apply it); an edit newer than the delete keeps the file (the normal
+        // content path below handles pulling/keeping bytes). This is the
+        // restore-after-delete rule.
+        if entry.deleted {
+            let ours_observed_at = database
+                .latest_version(entry.file_id)
+                .ok()
+                .flatten()
+                .map(|version| version.observed_at)
+                .unwrap_or(0);
+            if entry.deleted_at > ours_observed_at {
+                log::debug!(
+                    "Applying peer delete for {} from {peer_name} \
+                     (deleted_at={} > ours_observed_at={ours_observed_at})",
+                    entry.file_id.to_string(),
+                    entry.deleted_at,
+                );
+                deletions.push(WantedDeletion {
+                    file_id: entry.file_id,
+                    deleted_at: entry.deleted_at,
+                });
+            }
+            // Whether or not the delete won, do not also request bytes for a
+            // tombstoned entry.
+            continue;
+        }
+
         let decision = match decide_request(database, &entry) {
             Ok(decision) => decision,
             Err(error) => {
@@ -1723,8 +1816,11 @@ fn reconcile_peer_manifest(
                 continue;
             }
         };
-        // The hash we want is the peer's latest for this file.
-        let their_latest = entry.history.last().map(|(_, hash)| hash.clone());
+        // The hash and size we want are the peer's latest for this file.
+        let their_latest = entry
+            .history
+            .last()
+            .map(|(_, hash, size)| (hash.clone(), *size));
         // Placement depends on whether we already know the file locally: an
         // unknown file must be materialized as `Create` (using the manifest's
         // `logical_path`) so the sync-directory dispatch can place it.
@@ -1753,11 +1849,12 @@ fn reconcile_peer_manifest(
                     "Requesting {} from {peer_name}: {reason}",
                     entry.file_id.to_string()
                 );
-                if let Some(hash) = their_latest {
+                if let Some((hash, size)) = their_latest {
                     let placement = placement_for_request(&entry);
                     wanted.push(WantedFile {
                         file_id: entry.file_id,
                         content_hash: hash,
+                        size,
                         placement,
                     });
                 }
@@ -1780,11 +1877,12 @@ fn reconcile_peer_manifest(
                         "Our version wins; keeping"
                     },
                 );
-                if request && let Some(hash) = their_latest {
+                if request && let Some((hash, size)) = their_latest {
                     let placement = placement_for_request(&entry);
                     wanted.push(WantedFile {
                         file_id: entry.file_id,
                         content_hash: hash,
+                        size,
                         placement,
                     });
                 }
@@ -1792,7 +1890,7 @@ fn reconcile_peer_manifest(
         }
     }
 
-    wanted
+    (wanted, deletions)
 }
 
 enum ReconcileDecision {
@@ -1818,7 +1916,7 @@ fn decide_request(
     }
 
     let their_latest = match entry.history.last() {
-        Some((_, hash)) => hash.as_str(),
+        Some((_, hash, _)) => hash.as_str(),
         None => return Ok(ReconcileDecision::Nothing),
     };
     let our_latest = our_history
@@ -1831,11 +1929,14 @@ fn decide_request(
         return Ok(ReconcileDecision::Nothing);
     }
 
-    let our_hashes: HashSet<&str> = our_history.iter().map(|(_, hash)| hash.as_str()).collect();
+    let our_hashes: HashSet<&str> = our_history
+        .iter()
+        .map(|(_, hash, _)| hash.as_str())
+        .collect();
     let their_hashes: HashSet<&str> = entry
         .history
         .iter()
-        .map(|(_, hash)| hash.as_str())
+        .map(|(_, hash, _)| hash.as_str())
         .collect();
 
     let they_have_our_latest = their_hashes.contains(our_latest);
@@ -1924,6 +2025,7 @@ async fn request_pull_from_origin(
     change_origin: &ChangeOrigin,
     file_id: FileId,
     content_hash: String,
+    expected_size: u64,
     placement: bus::MaterializePlacement,
 ) {
     let ChangeOrigin::Peer { public_key } = change_origin else {
@@ -1942,6 +2044,7 @@ async fn request_pull_from_origin(
                 .send(bus::PeerCommand::StartReceive {
                     file_id,
                     content_hash,
+                    expected_size,
                     placement,
                 })
                 .is_err()
@@ -1967,11 +2070,15 @@ async fn request_pull_from_origin(
 /// `expected_hash`, without buffering the bytes. Used to decide whether we can
 /// answer a relayed `Sync::FetchRequest` (as a content-less `FetchFound`) or
 /// must forward it onward.
+/// If we hold `file_id` locally with content matching `expected_hash`, return
+/// `Some(size_in_bytes)`; otherwise `None`. The size is read from the bytes we
+/// would serve, so a `FetchFound` we send can carry it and the puller can cap
+/// its request window at EOF.
 async fn local_hash_matches(
     command_sender: &UnboundedSender<SyncDirectoryCommand>,
     file_id: FileId,
     expected_hash: &str,
-) -> bool {
+) -> Option<u64> {
     let (respond_to, response) = tokio::sync::oneshot::channel();
     if command_sender
         .send(SyncDirectoryCommand::ReadFile {
@@ -1980,29 +2087,40 @@ async fn local_hash_matches(
         })
         .is_err()
     {
-        return false;
+        return None;
     }
     match response.await {
-        Ok(Some((_physical_path, _content, content_hash))) => {
-            let matches = content_hash == expected_hash;
-            if !matches {
+        Ok(Some((_physical_path, content, content_hash))) => {
+            if content_hash != expected_hash {
                 log::debug!(
                     "local_hash_matches: {} held locally but hash {} != expected {}",
                     file_id.to_string(),
                     content_hash,
                     expected_hash,
                 );
+                return None;
             }
-            matches
+            match content.byte_len().await {
+                Ok(size) => Some(size),
+                Err(error) => {
+                    log::warn!(
+                        "local_hash_matches: {} matched but size read failed: {error}; \
+                         answering without a size hint",
+                        file_id.to_string()
+                    );
+                    // Treat as held-but-size-unknown: 0 disables the puller's cap.
+                    Some(0)
+                }
+            }
         }
         Ok(None) => {
             log::debug!(
                 "local_hash_matches: {} not held in any sync directory",
                 file_id.to_string()
             );
-            false
+            None
         }
-        Err(_) => false,
+        Err(_) => None,
     }
 }
 
@@ -2061,12 +2179,34 @@ fn reconcile_peer_tag_manifest(
                 continue;
             }
         };
-        // Request when we don't know the tag, or the peer's is strictly newer.
+        // Act when we don't know the tag, or the peer's is strictly newer.
         let need = match ours {
             None => true,
             Some(ours) => definition.modified_at > ours,
         };
-        if need {
+        if !need {
+            continue;
+        }
+
+        if definition.deleted {
+            // The peer's newer state is a tombstone. Apply it directly through
+            // the single DB writer (a tag delete bumps `modified_at`, so the
+            // same LWW comparison decides delete-vs-edit). No `TagRequest`: there
+            // is no definition to fetch for a deleted tag.
+            if let Err(error) = change_sender.send(DaemonMessage::Change(
+                Ingest::from_change(Change::TagRemoved {
+                    tag_id: definition.tag_id,
+                    modified_at: definition.modified_at,
+                }),
+                ChangeOrigin::Peer {
+                    public_key: peer_public_key.to_owned(),
+                },
+            )) {
+                log::error!("change_sender closed; cannot apply reconciled tag delete: {error}");
+                return;
+            }
+        } else {
+            // A live tag whose definition is newer than ours: request it.
             let frame = Frame::Sync(SyncMessage::TagRequest {
                 tag_id: definition.tag_id,
             });
@@ -2592,6 +2732,7 @@ async fn handle_changes(
                 logical_path,
                 content,
                 content_hash,
+                size,
                 tags,
             } => {
                 // Reconciliation and live edits can both deliver a `FileAdded`
@@ -2623,6 +2764,7 @@ async fn handle_changes(
                         file_id,
                         &content_hash,
                         version_origin(&change_origin),
+                        size as i64,
                     ) {
                         log::error!(
                             "Failed to record initial version for {}: {:?}",
@@ -2710,6 +2852,7 @@ async fn handle_changes(
                             file_id,
                             logical_path,
                             content_hash,
+                            size,
                             tags,
                         },
                     )
@@ -2752,9 +2895,19 @@ async fn handle_changes(
                         file_id,
                         &content_hash,
                         version_origin(&change_origin),
+                        size as i64,
                     ) {
                         log::error!(
                             "Failed to record version for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                    }
+                    // A new local version supersedes any tombstone (restore
+                    // after delete). No-op if not tombstoned.
+                    if let Err(error) = database.restore_file(file_id) {
+                        log::error!(
+                            "Failed to clear tombstone for {}: {:?}",
                             file_id.to_string(),
                             error
                         );
@@ -2784,6 +2937,7 @@ async fn handle_changes(
                         WireKind::Changed {
                             file_id,
                             content_hash,
+                            size,
                         },
                     )
                     .await;
@@ -2793,6 +2947,7 @@ async fn handle_changes(
                 file_id,
                 content,
                 content_hash,
+                size,
             } => {
                 let file_tags =
                     match database.tag_ids_for_file(file_id, database::SubtagRule::Exclude) {
@@ -2807,11 +2962,23 @@ async fn handle_changes(
                         }
                     };
 
-                if let Err(error) =
-                    database.record_version(file_id, &content_hash, version_origin(&change_origin))
-                {
+                if let Err(error) = database.record_version(
+                    file_id,
+                    &content_hash,
+                    version_origin(&change_origin),
+                    size as i64,
+                ) {
                     log::error!(
                         "Failed to record version for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                }
+                // A new local version supersedes any tombstone (restore after
+                // delete). No-op if not tombstoned.
+                if let Err(error) = database.restore_file(file_id) {
+                    log::error!(
+                        "Failed to clear tombstone for {}: {:?}",
                         file_id.to_string(),
                         error
                     );
@@ -2828,6 +2995,7 @@ async fn handle_changes(
                     WireKind::Changed {
                         file_id,
                         content_hash,
+                        size,
                     },
                 )
                 .await;
@@ -2874,11 +3042,13 @@ async fn handle_changes(
             file_id: FileId,
             logical_path: LogicalPath,
             content_hash: String,
+            size: u64,
             tags: Vec<TagId>,
         },
         Changed {
             file_id: FileId,
             content_hash: String,
+            size: u64,
         },
     }
 
@@ -2889,19 +3059,23 @@ async fn handle_changes(
                     file_id,
                     logical_path,
                     content_hash,
+                    size,
                     tags,
                 } => Change::FileMetadataAdded {
                     file_id,
                     logical_path,
                     content_hash,
+                    size,
                     tags,
                 },
                 WireKind::Changed {
                     file_id,
                     content_hash,
+                    size,
                 } => Change::FileMetadataChanged {
                     file_id,
                     content_hash,
+                    size,
                 },
             }
         }
@@ -3005,6 +3179,7 @@ async fn handle_changes(
                 file_id,
                 logical_path,
                 content_hash,
+                size,
                 origin,
             } => {
                 // A peer session's `Manifest` reconciliation decided to catalog
@@ -3012,23 +3187,38 @@ async fn handle_changes(
                 // write happens here. Insert the `files` row if new, then append
                 // the version (byte-independent catalog; the bytes are pulled
                 // separately on the session link).
-                if !database.file_exists(file_id).unwrap_or(false) {
-                    if let Err(error) = database.add_file(file_id, &logical_path) {
-                        log::error!(
-                            "CatalogFile: failed to add file {} ({}): {:?}; \
-                             skipping version record",
-                            file_id.to_string(),
-                            logical_path,
-                            error
-                        );
-                        continue;
-                    }
-                }
-                if let Err(error) =
-                    database.record_version(file_id, &content_hash, version_origin(&origin))
+                if !database.file_exists(file_id).unwrap_or(false)
+                    && let Err(error) = database.add_file(file_id, &logical_path)
                 {
                     log::error!(
+                        "CatalogFile: failed to add file {} ({}): {:?}; \
+                             skipping version record",
+                        file_id.to_string(),
+                        logical_path,
+                        error
+                    );
+                    continue;
+                }
+
+                if let Err(error) = database.record_version(
+                    file_id,
+                    &content_hash,
+                    version_origin(&origin),
+                    size as i64,
+                ) {
+                    log::error!(
                         "CatalogFile: failed to record version for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                }
+                // Cataloging a version means the peer holds content newer than
+                // (or equal to) any local tombstone — clear it so a
+                // previously-deleted file becomes live again (restore after
+                // delete). No-op when the file was not tombstoned.
+                if let Err(error) = database.restore_file(file_id) {
+                    log::error!(
+                        "CatalogFile: failed to clear tombstone for {}: {:?}",
                         file_id.to_string(),
                         error
                     );
@@ -3139,6 +3329,7 @@ async fn handle_changes(
                 file_id,
                 logical_path,
                 content_hash,
+                size,
                 tags,
             } => {
                 // A local client (CLI) uploaded/edited a file it serves on
@@ -3161,20 +3352,25 @@ async fn handle_changes(
                             file_id,
                             logical_path,
                             content_hash: content_hash.clone(),
+                            size,
                             tags,
                         }
                     }
                     None => Change::FileMetadataChanged {
                         file_id,
                         content_hash: content_hash.clone(),
+                        size,
                     },
                 };
                 let origin = ChangeOrigin::Local {
                     directory_path: std::path::PathBuf::new(),
                 };
-                if let Err(error) =
-                    database.record_version(file_id, &content_hash, version_origin(&origin))
-                {
+                if let Err(error) = database.record_version(
+                    file_id,
+                    &content_hash,
+                    version_origin(&origin),
+                    size as i64,
+                ) {
                     log::error!(
                         "AnnounceProvided: failed to record version for {}: {:?}",
                         file_id.to_string(),
@@ -3218,6 +3414,7 @@ async fn handle_changes(
                 file_id,
                 logical_path,
                 content_hash,
+                size,
                 tags,
             } => {
                 // Metadata-only announcement from a peer. `file_versions` is the
@@ -3272,11 +3469,23 @@ async fn handle_changes(
                 }
 
                 // Record the version into the catalog now, on announcement.
-                if let Err(error) =
-                    database.record_version(*file_id, content_hash, version_origin(&change_origin))
-                {
+                if let Err(error) = database.record_version(
+                    *file_id,
+                    content_hash,
+                    version_origin(&change_origin),
+                    *size as i64,
+                ) {
                     log::error!(
                         "FileMetadataAdded: failed to record version for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                }
+                // A newer version supersedes any local tombstone (restore after
+                // delete). No-op if not tombstoned.
+                if let Err(error) = database.restore_file(*file_id) {
+                    log::error!(
+                        "FileMetadataAdded: failed to clear tombstone for {}: {:?}",
                         file_id.to_string(),
                         error
                     );
@@ -3305,6 +3514,7 @@ async fn handle_changes(
                     &change_origin,
                     *file_id,
                     content_hash.clone(),
+                    *size,
                     bus::MaterializePlacement::Create {
                         logical_path: logical_path.clone(),
                         tags: tags.clone(),
@@ -3318,6 +3528,7 @@ async fn handle_changes(
             Change::FileMetadataChanged {
                 file_id,
                 content_hash,
+                size,
             } => {
                 // Skip only if this hash is already our latest catalog version.
                 // It is NOT enough for the hash to appear somewhere in history: a
@@ -3351,9 +3562,19 @@ async fn handle_changes(
                         *file_id,
                         content_hash,
                         version_origin(&change_origin),
+                        *size as i64,
                     ) {
                         log::error!(
                             "FileMetadataChanged: failed to record version for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                    }
+                    // A newer version supersedes any local tombstone (restore
+                    // after delete). No-op if not tombstoned.
+                    if let Err(error) = database.restore_file(*file_id) {
+                        log::error!(
+                            "FileMetadataChanged: failed to clear tombstone for {}: {:?}",
                             file_id.to_string(),
                             error
                         );
@@ -3376,6 +3597,7 @@ async fn handle_changes(
                         &change_origin,
                         *file_id,
                         content_hash.clone(),
+                        *size,
                         bus::MaterializePlacement::Change,
                     )
                     .await;
@@ -3453,21 +3675,18 @@ async fn handle_changes(
                 )
                 .await;
             }
-            Change::FileDeleted { file_id } => {
-                // NOTE: No row is appended to `file_versions` here. A
-                // "tombstone" version (e.g. a row with a sentinel hash, or a
-                // separate `is_deleted` flag) will be needed for cross-peer
-                // delete-vs-edit conflict resolution: a peer that was offline
-                // during the delete will reconnect and announce a regular
-                // version for this `file_id`, and we need a way to recognise
-                // that our delete supersedes it. The shape of that row
-                // (nullable hash? new column? separate table?) depends on the
-                // conflict-resolution scheme, so it is intentionally left to
-                // the session implementing peer sync. `Change::FileDeleted`
-                // also has no version metadata on the wire yet for the same
-                // reason.
+            Change::FileDeleted {
+                file_id,
+                deleted_at,
+            } => {
+                // Soft-delete: `remove_file` sets the tombstone
+                // (`deleted = 1`, `deleted_at`) instead of removing the row, and
+                // applies last-writer-wins — the delete is only applied if
+                // `deleted_at` is newer than the file's latest version
+                // `observed_at`. The `file_versions` history is kept so the
+                // tombstone reconciles offline-safely and can be restored by a
+                // newer edit (restore-after-delete).
                 //
-                // TODO: Don't unwrap.
                 // TODO: Should this be include? Currently this WILL NOT WORK since add file
                 // doesn't consider subtags. We would need to get a list of *all* tags (incuding
                 // subdags) when adding the file to make it work.
@@ -3485,13 +3704,26 @@ async fn handle_changes(
                         }
                     };
 
-                if let Err(error) = database.remove_file(*file_id) {
-                    log::error!(
-                        "Failed to remove file {}: {:?}; skipping",
-                        file_id.to_string(),
-                        error
-                    );
-                    continue;
+                match database.remove_file(*file_id, *deleted_at) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // A newer edit out-dated this delete (last-writer-wins):
+                        // the file stays live. Do not remove it from sync
+                        // directories or forward the delete.
+                        log::debug!(
+                            "Ignoring FileDeleted for {} (a newer version supersedes it)",
+                            file_id.to_string()
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Failed to remove file {}: {:?}; skipping",
+                            file_id.to_string(),
+                            error
+                        );
+                        continue;
+                    }
                 }
 
                 for sync_directory in &configuration.sync_directories {
@@ -3604,12 +3836,27 @@ async fn handle_changes(
                 // tag mutations and forward. Deliberately not forwarded until
                 // then, so we never propagate state we can't apply.
             }
-            Change::TagRemoved { tag_id } => {
-                // Tag removal is a hard delete for now; the tombstone-based
-                // deletion design (which will make removal reconcile
-                // offline-safely, like untag) is deferred. See roadmap.
-                if let Err(error) = database.remove_tag(*tag_id) {
-                    log::error!("Failed to remove tag {}: {:?}", tag_id.to_string(), error);
+            Change::TagRemoved {
+                tag_id,
+                modified_at,
+            } => {
+                // Soft-delete: set the tombstone (`deleted = 1`) and bump
+                // `modified_at` to the delete time. A tag reuses its
+                // `modified_at` as its last-writer-wins clock, so the delete is
+                // applied only if it is newer than the stored value (a newer
+                // rename/recolor resurrects the tag). Forwarded either way so
+                // the tombstone propagates; a stale delete is a DB no-op.
+                match database.remove_tag(*tag_id, *modified_at) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::debug!(
+                            "Ignoring TagRemoved for {} (a newer edit supersedes it)",
+                            tag_id.to_string()
+                        );
+                    }
+                    Err(error) => {
+                        log::error!("Failed to remove tag {}: {:?}", tag_id.to_string(), error);
+                    }
                 }
                 forward_to_peers(
                     &configuration,
@@ -3790,12 +4037,15 @@ mod reconcile_tests {
         let logical_path = LogicalPath::new("subdir/new.txt");
         let entry = ManifestEntry {
             file_id,
-            history: vec![(1, "aaaa".to_owned()), (2, "bbbb".to_owned())],
+            history: vec![(1, "aaaa".to_owned(), 1), (2, "bbbb".to_owned(), 1)],
             latest_observed_at: 100,
             logical_path: logical_path.clone(),
+            deleted: false,
+            deleted_at: 0,
         };
 
-        let wanted = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(deletions.is_empty());
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].file_id, file_id);
         assert_eq!(wanted[0].content_hash, "bbbb");
@@ -3819,16 +4069,21 @@ mod reconcile_tests {
         database
             .add_file(file_id, &LogicalPath::new("f.txt"))
             .unwrap();
-        database.record_version(file_id, "bbbb", "local").unwrap();
+        database
+            .record_version(file_id, "bbbb", "local", 1)
+            .unwrap();
 
         let entry = ManifestEntry {
             file_id,
-            history: vec![(1, "bbbb".to_owned())],
+            history: vec![(1, "bbbb".to_owned(), 1)],
             latest_observed_at: 100,
             logical_path: LogicalPath::new("f.txt"),
+            deleted: false,
+            deleted_at: 0,
         };
 
-        let wanted = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(deletions.is_empty());
         assert!(wanted.is_empty());
     }
 
@@ -3842,16 +4097,19 @@ mod reconcile_tests {
         database
             .add_file(file_id, &LogicalPath::new("f.txt"))
             .unwrap();
-        database.record_version(file_id, "v1", "local").unwrap();
+        database.record_version(file_id, "v1", "local", 1).unwrap();
 
         let entry = ManifestEntry {
             file_id,
-            history: vec![(1, "v1".to_owned()), (2, "v2".to_owned())],
+            history: vec![(1, "v1".to_owned(), 1), (2, "v2".to_owned(), 1)],
             latest_observed_at: 100,
             logical_path: LogicalPath::new("f.txt"),
+            deleted: false,
+            deleted_at: 0,
         };
 
-        let wanted = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(deletions.is_empty());
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].file_id, file_id);
         assert_eq!(wanted[0].content_hash, "v2");
@@ -3892,5 +4150,62 @@ mod reconcile_tests {
         assert!(effective.contains(&carried_only));
         assert!(effective.contains(&db_only));
         assert_eq!(effective.len(), 3, "shared tag must not be duplicated");
+    }
+
+    /// A peer's delete tombstone whose `deleted_at` is newer than our latest
+    /// version's `observed_at` wins: we schedule the deletion and do not pull
+    /// bytes for it.
+    #[test]
+    fn peer_delete_newer_than_our_edit_is_applied() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("f.txt"))
+            .unwrap();
+        // Our latest version's observed_at is "now". A delete stamped far in
+        // the future beats it.
+        database.record_version(file_id, "v1", "local", 1).unwrap();
+
+        let entry = ManifestEntry {
+            file_id,
+            history: vec![(1, "v1".to_owned(), 1)],
+            latest_observed_at: 0,
+            logical_path: LogicalPath::new("f.txt"),
+            deleted: true,
+            deleted_at: database::now_millis() + 10_000,
+        };
+
+        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(wanted.is_empty(), "a tombstoned file must not be pulled");
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(deletions[0].file_id, file_id);
+    }
+
+    /// A peer's delete tombstone older than our latest edit loses: the file is
+    /// kept (no deletion scheduled). This is the restore-after-delete rule.
+    #[test]
+    fn peer_delete_older_than_our_edit_is_ignored() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("f.txt"))
+            .unwrap();
+        // Our latest version's observed_at is "now"; a delete stamped in the
+        // past loses.
+        database.record_version(file_id, "v1", "local", 1).unwrap();
+
+        let entry = ManifestEntry {
+            file_id,
+            history: vec![(1, "v1".to_owned(), 1)],
+            latest_observed_at: 0,
+            logical_path: LogicalPath::new("f.txt"),
+            deleted: true,
+            deleted_at: 1,
+        };
+
+        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(deletions.is_empty(), "stale delete must not win");
+        // Equal latest hash means nothing to pull either.
+        assert!(wanted.is_empty());
     }
 }

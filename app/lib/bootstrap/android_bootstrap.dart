@@ -9,13 +9,22 @@
 
 import 'dart:async';
 
-import 'package:flutter/widgets.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter/services.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import '../rust/frb_generated.dart';
 import '../rust/api.dart' as tagnet;
 import 'bootstrap.dart';
+
+/// MethodChannel exposed by [MainActivity] returning the JSON config + paths
+/// the Kotlin side built. See TagnetConfig.kt for the single source of truth.
+///
+/// The Kotlin foreground service normally starts the runtime before this
+/// bootstrap runs; the values fetched here are the *same* values it passed to
+/// nativeStart, so TagnetApp.start attaches to the already-running instance
+/// (crate::service::start is idempotent). If the service is somehow slow, the
+/// Dart side starts it with identical inputs — no divergence possible.
+const _configChannel = MethodChannel('tagnet_app/config');
 
 class AndroidBootstrap extends TagnetBootstrap {
   StreamSubscription<List<SharedMediaFile>>? _shareSub;
@@ -25,76 +34,18 @@ class AndroidBootstrap extends TagnetBootstrap {
     // Loads libtagnet_bridge.so and wires up the generated bindings.
     await RustLib.init();
 
-    // App-private storage: inotify works here with no storage permission
-    // (plan section 8). getFilesDir() maps to getApplicationSupportDirectory.
-    // Identity + per-directory DBs live here (not meant to be user-browsable).
-    final dir = await getApplicationSupportDirectory();
-    final dataDir = dir.path;
-    final identityFile = '$dataDir/identity.key';
-
-    // Shared external storage. The engine's authoritative config is built by
-    // the Android foreground service (TagnetService.kt), which resolves the
-    // public Documents directory and points the sync dir at Documents/tagnet so
-    // it is browsable in the Files app. path_provider has no shared-Documents
-    // API, so we mirror that well-known location here for the (dev-only) case
-    // where the Dart side starts the engine. Writing here needs "All files
-    // access", which MainActivity gates the service start on. Falls back to
-    // app-specific external storage if the shared path can't be derived.
-    final externalDir = await getExternalStorageDirectory();
-    // getExternalStorageDirectory() -> /storage/emulated/0/Android/data/<pkg>/files
-    // The shared Documents dir is /storage/emulated/0/Documents.
-    final externalPath = externalDir?.path;
-    final syncRoot = externalPath != null && externalPath.contains('/Android/data/')
-        ? '${externalPath.split('/Android/data/').first}/Documents'
-        : dataDir;
-
-    // ---- HARDCODED POC CONFIG (edit this to connect to a peer) --------------
-    //
-    // This JSON is parsed by the Rust `Configuration` type
-    // (tagnet/src/configuration.rs). Shapes:
-    //
-    //   sync_directories[].sync_type:
-    //     "Universal"                       -> sync every file, or
-    //     { "TagBased": { "tags": [...] } } -> only files with those tag ids
-    //   listen_port: a port number to accept inbound peers, or null for
-    //     outbound-only (realistic on mobile behind carrier NAT).
-    //   peers[]:
-    //     address:    [ "<ip>", <port> ] to dial the peer, or null to let
-    //                 the peer dial us (only useful if listen_port is set).
-    //     name:       label for logs only.
-    //     public_key: the peer's base64 ed25519 public key. On the desktop
-    //                 peer this is printed by `tagnet keygen` / found in its
-    //                 config; identity is verified by this key, not the name.
-    //
-    // The Rust side generates THIS device's identity on first launch; its
-    // public key is logged to logcat (`adb logcat -s tagnet`) — hand that to
-    // the peer so it can add this phone to its own config.
-    // Browsable sync directory: Documents/phone, shown in the Files app.
-    // Created by the engine on startup (SyncDirectoryManager does
-    // create_dir_all). Kept in sync with TagnetService.kt.
-
-    final configJson = '''
-{
-  "sync_directories": [
-    {
-      "path": "$syncRoot/phone",
-      "sync_type": { "TagBased": { "tags": ["467f35d7ae6f4dffb72905ff2bc743c5", "6450a8fe6eb945cc8b40adf4b97408bd"] } }
-    },
-    {
-      "path": "$syncRoot/audiobooks",
-      "sync_type": { "TagBased": { "tags": ["b053c022c8a6432eb88acb0452abceb2"] } }
+    // Fetch the runtime startup inputs from Kotlin. Editing the peer config
+    // means editing TagnetConfig.kt — there is no JSON literal on the Dart
+    // side any more.
+    final inputs = await _configChannel.invokeMapMethod<String, String>(
+      'getStartupInputs',
+    );
+    if (inputs == null) {
+      throw StateError('tagnet_app/config channel returned no inputs');
     }
-  ],
-  "listen_port": null,
-  "peers": [
-    {
-      "address": ["192.168.188.10", 3468],
-      "name": "central",
-      "public_key": "AYWQNMCy5y20bjB1oxU79x5fUYQI4CGPbsqk7N+Qrgs="
-    }
-  ]
-}
-''';
+    final configJson = inputs['configJson']!;
+    final dataDir = inputs['dataDir']!;
+    final identityFile = inputs['identityFile']!;
 
     final app = tagnet.TagnetApp.start(
       configurationJson: configJson,

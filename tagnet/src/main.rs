@@ -42,6 +42,7 @@ struct FileRow {
     path: String,
     version: i64,
     content_hash: String,
+    size: u64,
     tags: Vec<String>,
 }
 
@@ -65,6 +66,7 @@ impl FileRow {
             path: file.logical_path.to_string(),
             version: file.version_number,
             content_hash: file.content_hash.clone(),
+            size: file.size,
             tags,
         }
     }
@@ -409,7 +411,7 @@ enum Commands {
     /// conjunctively. Each chunk may be prefixed:
     ///
     /// - `/t foo` — require the tag(s) matching `foo`
-    /// - `/l foo` — logical-path substring
+    /// - `/n foo` — logical-path substring
     /// - `!` — invert the following chunk (e.g. `! /t foo`)
     /// - no prefix — match `foo` as *either* a logical-path substring OR a tag
     ///
@@ -635,6 +637,8 @@ async fn run(
                 logical_path: tagnet_core::LogicalPath::new(path_name),
                 content_hash: String::new(),
                 version_number: 1,
+                // The size is computed daemon-side and is not known here.
+                size: 0,
                 // Only one id is known locally; highlight the whole id.
                 short_id_length: file_id.to_string().len(),
             };
@@ -683,7 +687,8 @@ async fn run(
             // how the search matched it.
             let file_tags =
                 tags_by_file(backend, &files, &mut name_cache, SubtagRule::Exclude).await?;
-            let tag_tags = tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
+            let tag_tags =
+                tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
             match output {
                 OutputMode::Human => {
@@ -812,7 +817,8 @@ async fn run(
             let mut name_cache = HashMap::new();
             // The Tags column shows each tag's own direct tags, regardless of
             // how the command matched them.
-            let tag_tags = tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
+            let tag_tags =
+                tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
             emit_tags(output, &tags, &tag_tags);
         }
@@ -920,7 +926,8 @@ async fn run(
             let mut name_cache = HashMap::new();
             // The Tags column shows each tag's own direct tags, regardless of
             // how the command matched them.
-            let tag_tags = tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
+            let tag_tags =
+                tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
             emit_tags(output, &tags, &tag_tags);
         }
@@ -1002,7 +1009,7 @@ async fn edit_fetched_file(
 ) -> Result<(), String> {
     open_in_editor(temp_path)?;
 
-    let edited_hash = tagnetd::control::hash_file(temp_path)
+    let (edited_hash, _edited_size) = tagnetd::control::hash_file(temp_path)
         .await
         .map_err(|error| error.to_string())?;
 

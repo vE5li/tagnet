@@ -142,6 +142,9 @@ pub enum ControlRequest {
     UploadFile {
         path_name: String,
         content_hash: String,
+        /// The file's content size in bytes, computed by the client alongside
+        /// `content_hash`.
+        size: u64,
         tags: Vec<TagId>,
     },
     /// Replace an existing file's content, provided on demand like
@@ -150,6 +153,8 @@ pub enum ControlRequest {
     EditFile {
         file_id: FileId,
         content_hash: String,
+        /// The file's new content size in bytes, computed by the client.
+        size: u64,
     },
     /// Fetch a file's content on demand (from a peer if not local). Answered
     /// with [`ControlResponse::FilePath`] or an error. `expected_hash` gates
@@ -527,10 +532,8 @@ async fn dispatch(
             Ok(tag_ids) => ControlResponse::TagIds(tag_ids),
             Err(error) => ControlResponse::Error(error),
         },
-        ControlRequest::RunQuery {
-            query,
-            subtag_rule,
-        } => match api.run_query(&query, subtag_rule) {
+        ControlRequest::RunQuery { query, subtag_rule } => match api.run_query(&query, subtag_rule)
+        {
             Ok(result) => ControlResponse::QueryResult(result),
             Err(error) => ControlResponse::Error(error),
         },
@@ -575,9 +578,10 @@ async fn dispatch(
         ControlRequest::UploadFile {
             path_name,
             content_hash,
+            size,
             tags,
         } => {
-            match api.upload_file(path_name, content_hash.clone(), tags) {
+            match api.upload_file(path_name, content_hash.clone(), size, tags) {
                 Ok(file_id) => {
                     // Register this connection as the temporary provider so
                     // peers can pull the bytes on demand.
@@ -596,7 +600,8 @@ async fn dispatch(
         ControlRequest::EditFile {
             file_id,
             content_hash,
-        } => match api.edit_file(file_id, content_hash.clone()) {
+            size,
+        } => match api.edit_file(file_id, content_hash.clone(), size) {
             Ok(()) => {
                 let source = std::sync::Arc::new(crate::transfer::ProviderSource::new(
                     provider_req_tx.clone(),
@@ -928,8 +933,9 @@ impl IpcClientBackend {
 }
 
 /// Stream `path` to compute its BLAKE3 hex digest without loading it into
-/// memory.
-pub async fn hash_file(path: &Path) -> Result<String, ApiError> {
+/// memory, returning `(content_hash, size_in_bytes)`. The size is the exact
+/// number of bytes streamed, captured at the same time as the hash.
+pub async fn hash_file(path: &Path) -> Result<(String, u64), ApiError> {
     use tokio::io::AsyncReadExt;
 
     let mut file = tokio::fs::File::open(path)
@@ -938,6 +944,7 @@ pub async fn hash_file(path: &Path) -> Result<String, ApiError> {
 
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 64 * 1024];
+    let mut size: u64 = 0;
 
     loop {
         let read = file
@@ -949,10 +956,11 @@ pub async fn hash_file(path: &Path) -> Result<String, ApiError> {
             break;
         }
 
+        size += read as u64;
         hasher.update(&buffer[..read]);
     }
 
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok((hasher.finalize().to_hex().to_string(), size))
 }
 
 /// Block until the daemon reports `file_id` has been handed off
@@ -1025,10 +1033,7 @@ impl TransportBackend for IpcClientBackend {
         subtag_rule: SubtagRule,
     ) -> Result<QueryResult, ApiError> {
         match self
-            .call(ControlRequest::RunQuery {
-                query,
-                subtag_rule,
-            })
+            .call(ControlRequest::RunQuery { query, subtag_rule })
             .await?
         {
             ControlResponse::QueryResult(result) => Ok(result),
@@ -1130,7 +1135,7 @@ impl TransportBackend for IpcClientBackend {
         path_name: String,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
-        let content_hash = hash_file(&path).await?;
+        let (content_hash, size) = hash_file(&path).await?;
         // Subscribe before sending so we cannot miss the release event.
         let mut events = self.inner.events.subscribe();
         *self.inner.provider_path.lock().await = Some(path);
@@ -1139,6 +1144,7 @@ impl TransportBackend for IpcClientBackend {
             .call(ControlRequest::UploadFile {
                 path_name,
                 content_hash,
+                size,
                 tags,
             })
             .await?
@@ -1155,7 +1161,7 @@ impl TransportBackend for IpcClientBackend {
     /// Edit (replace) a file's content, serving the new bytes as a temporary
     /// provider. Same handoff semantics as [`Self::upload_file`].
     async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
-        let content_hash = hash_file(&path).await?;
+        let (content_hash, size) = hash_file(&path).await?;
         let mut events = self.inner.events.subscribe();
         *self.inner.provider_path.lock().await = Some(path);
 
@@ -1163,6 +1169,7 @@ impl TransportBackend for IpcClientBackend {
             .call(ControlRequest::EditFile {
                 file_id,
                 content_hash,
+                size,
             })
             .await?
         {
@@ -1291,6 +1298,7 @@ mod tests {
                 request: ControlRequest::EditFile {
                     file_id,
                     content_hash: "deadbeef".to_owned(),
+                    size: 123,
                 },
             },
             ControlFrame::Request {
@@ -1298,6 +1306,7 @@ mod tests {
                 request: ControlRequest::UploadFile {
                     path_name: "notes.txt".to_owned(),
                     content_hash: "cafef00d".to_owned(),
+                    size: 456,
                     tags: vec![TagId::new()],
                 },
             },

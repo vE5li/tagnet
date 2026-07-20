@@ -8,6 +8,8 @@ import android.os.Environment
 import android.provider.Settings
 import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
 
@@ -18,6 +20,36 @@ class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         maybeStartRuntime()
+    }
+
+    /**
+     * Expose the Kotlin-side [TagnetConfig] to Dart via a MethodChannel.
+     *
+     * The Dart bootstrap (android_bootstrap.dart) calls
+     * `TagnetConfig.CHANNEL_NAME` / `getStartupInputs` to fetch the same config
+     * JSON, data dir, and identity-file path this activity's companion
+     * [TagnetService] uses for nativeStart. Keeping the literal on the Kotlin
+     * side means there is exactly one copy in the source tree.
+     */
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, TagnetConfig.CHANNEL_NAME)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    TagnetConfig.METHOD_GET_STARTUP_INPUTS -> {
+                        val inputs = TagnetConfig.build(this)
+                        result.success(
+                            mapOf(
+                                "configJson" to inputs.configJson,
+                                "dataDir" to inputs.dataDir,
+                                "identityFile" to inputs.identityFile,
+                            )
+                        )
+                    }
+                    else -> result.notImplemented()
+                }
+            }
     }
 
     // The user may grant "All files access" in Settings and return here; re-check
