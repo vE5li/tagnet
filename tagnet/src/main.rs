@@ -1,18 +1,19 @@
 //! Tagnet CLI client
 
-use std::{collections::HashMap, path::PathBuf, process::ExitCode};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Cell, ContentArrangement, Table};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use serde_json::json;
 use tagnet_core::{FileId, FileInfo, TagId};
-use tagnetd::{
-    control::IpcClientBackend,
-    database::{SubtagRule, Tag},
-    transport::TransportBackend,
-};
+use tagnetd::control::IpcClientBackend;
+use tagnetd::database::{SubtagRule, Tag};
+use tagnetd::transport::TransportBackend;
 
 /// How command results are rendered to stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +167,7 @@ fn file_table(files: &[FileInfo], tags_by_file: &HashMap<FileId, Vec<String>>) -
     table
         .load_preset(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["File id", "Path", "Version", "Tags"]);
+        .set_header(vec!["File id", "Path", "Version", "Size", "Tags"]);
 
     for file in files {
         let id = file.file_id.to_string();
@@ -179,6 +180,7 @@ fn file_table(files: &[FileInfo], tags_by_file: &HashMap<FileId, Vec<String>>) -
             Cell::new(highlight_id(&id, file.short_id_length)),
             Cell::new(&file.logical_path),
             Cell::new(format!("v{}", file.version_number)),
+            Cell::new(format!("{}b", file.size)),
             Cell::new(tags),
         ]);
     }
@@ -188,8 +190,8 @@ fn file_table(files: &[FileInfo], tags_by_file: &HashMap<FileId, Vec<String>>) -
 
 /// Emit a set of tags in the selected [`OutputMode`]: the shared [`tag_table`]
 /// (or `(no tags)`) for humans, or a JSON array of [`TagRow`]s for scripts.
-fn emit_tags(output: OutputMode, tags: &[Tag], tags_by_tag: &HashMap<TagId, Vec<String>>) {
-    match output {
+fn emit_tags(output_mode: OutputMode, tags: &[Tag], tags_by_tag: &HashMap<TagId, Vec<String>>) {
+    match output_mode {
         OutputMode::Human => {
             if tags.is_empty() {
                 println!("(no tags)");
@@ -208,10 +210,15 @@ fn emit_tags(output: OutputMode, tags: &[Tag], tags_by_tag: &HashMap<TagId, Vec<
     }
 }
 
-/// Emit a set of files in the selected [`OutputMode`]: the shared [`file_table`]
-/// (or `(no files)`) for humans, or a JSON array of [`FileRow`]s for scripts.
-fn emit_files(output: OutputMode, files: &[FileInfo], tags_by_file: &HashMap<FileId, Vec<String>>) {
-    match output {
+/// Emit a set of files in the selected [`OutputMode`]: the shared
+/// [`file_table`] (or `(no files)`) for humans, or a JSON array of [`FileRow`]s
+/// for scripts.
+fn emit_files(
+    output_mode: OutputMode,
+    files: &[FileInfo],
+    tags_by_file: &HashMap<FileId, Vec<String>>,
+) {
+    match output_mode {
         OutputMode::Human => {
             if files.is_empty() {
                 println!("(no files)");
@@ -235,8 +242,9 @@ fn emit_files(output: OutputMode, files: &[FileInfo], tags_by_file: &HashMap<Fil
     }
 }
 
-/// Resolve `tag_ids` to display names, one `get_tag` per *distinct* id, memoized
-/// in `cache` across calls so a tag seen on many files/tags is fetched once.
+/// Resolve `tag_ids` to display names, one `get_tag` per *distinct* id,
+/// memoized in `cache` across calls so a tag seen on many files/tags is fetched
+/// once.
 ///
 /// This replaces the old whole-store `list_tags` map: instead of fetching every
 /// tag up front (an O(all-tags) hazard), it looks up only the ids actually
@@ -266,10 +274,10 @@ async fn resolve_tag_names(
     Ok(names)
 }
 
-/// Materialize a set of tag ids into full [`Tag`] rows via `get_tag`, one lookup
-/// per id. Replaces the old "list every tag, then filter to these ids" pattern,
-/// which scanned the whole tag store to render a handful of rows. Ids that no
-/// longer resolve (deleted) are skipped.
+/// Materialize a set of tag ids into full [`Tag`] rows via `get_tag`, one
+/// lookup per id. Replaces the old "list every tag, then filter to these ids"
+/// pattern, which scanned the whole tag store to render a handful of rows. Ids
+/// that no longer resolve (deleted) are skipped.
 async fn tags_from_ids(
     backend: &IpcClientBackend,
     tag_ids: impl IntoIterator<Item = TagId>,
@@ -285,10 +293,11 @@ async fn tags_from_ids(
     Ok(tags)
 }
 
-/// Build the per-file tag-name lists shown in [`file_table`], one `tags_for_file`
-/// lookup per file. Names are resolved on demand via [`resolve_tag_names`],
-/// sharing `name_cache` so repeated tags cost one lookup. `rule` controls
-/// whether the tag hierarchy is walked (see `--include-subtags`).
+/// Build the per-file tag-name lists shown in [`file_table`], one
+/// `tags_for_file` lookup per file. Names are resolved on demand via
+/// [`resolve_tag_names`], sharing `name_cache` so repeated tags cost one
+/// lookup. `rule` controls whether the tag hierarchy is walked (see
+/// `--include-subtags`).
 async fn tags_by_file(
     backend: &IpcClientBackend,
     files: &[FileInfo],
@@ -411,7 +420,7 @@ enum Commands {
     /// conjunctively. Each chunk may be prefixed:
     ///
     /// - `/t foo` — require the tag(s) matching `foo`
-    /// - `/n foo` — logical-path substring
+    /// - `/l foo` — logical-path substring
     /// - `!` — invert the following chunk (e.g. `! /t foo`)
     /// - no prefix — match `foo` as *either* a logical-path substring OR a tag
     ///
@@ -423,8 +432,8 @@ enum Commands {
         /// The query terms; joined with spaces if given as multiple arguments.
         #[arg(trailing_var_arg = true, required = true)]
         query: Vec<String>,
-        /// Also match files carrying any subtag of a `$tag`/`!tag` term, walking
-        /// the hierarchy transitively.
+        /// Also match files carrying any subtag of a `$tag`/`!tag` term,
+        /// walking the hierarchy transitively.
         #[arg(long)]
         include_subtags: bool,
     },
@@ -452,7 +461,8 @@ enum Commands {
     },
     /// Delete a tag.
     DeleteTag {
-        /// The tag to delete (a full id or any unambiguous short-id prefix of it, as shown by `list-tags`).
+        /// The tag to delete (a full id or any unambiguous short-id prefix of
+        /// it, as shown by `list-tags`).
         tag_id: String,
     },
     /// Apply one or more tags to an existing file.
@@ -489,14 +499,16 @@ enum Commands {
     },
     /// Rename a tag.
     RenameTag {
-        /// The tag to rename (a full id or any unambiguous short-id prefix of it, as shown by `list-tags`).
+        /// The tag to rename (a full id or any unambiguous short-id prefix of
+        /// it, as shown by `list-tags`).
         tag_id: String,
         /// The tag's new name.
         name: String,
     },
     /// Change a tag's color.
     SetTagColor {
-        /// The tag to recolor (a full id or any unambiguous short-id prefix of it, as shown by `list-tags`).
+        /// The tag to recolor (a full id or any unambiguous short-id prefix of
+        /// it, as shown by `list-tags`).
         tag_id: String,
         /// The tag's new color.
         color: String,
@@ -547,7 +559,7 @@ enum Commands {
 async fn main() -> ExitCode {
     let arguments = Arguments::parse();
 
-    let output = if arguments.json {
+    let output_mode = if arguments.json {
         OutputMode::Json
     } else {
         OutputMode::Human
@@ -562,7 +574,7 @@ async fn main() -> ExitCode {
     let backend = match backend {
         Ok(backend) => backend,
         Err(error) => {
-            match output {
+            match output_mode {
                 OutputMode::Human => {
                     eprintln!("Failed to connect to the tagnet daemon control socket: {error}");
                     eprintln!("Is the daemon running? (tagnet run <config>)");
@@ -575,8 +587,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(error) = run(&backend, arguments.command, output).await {
-        if output == OutputMode::Json {
+    if let Err(error) = run(&backend, arguments.command, output_mode).await {
+        if output_mode == OutputMode::Json {
             print_json(&json!({ "error": error }));
         } else {
             eprintln!("Error: {error}");
@@ -591,7 +603,7 @@ async fn main() -> ExitCode {
 async fn run(
     backend: &IpcClientBackend,
     command: Commands,
-    output: OutputMode,
+    output_mode: OutputMode,
 ) -> Result<(), String> {
     match command {
         Commands::Upload { path, tags, keep } => {
@@ -646,7 +658,7 @@ async fn run(
             let tag_names = resolve_tag_names(backend, &resolved_tags, &mut name_cache).await?;
             let mut file_tags = HashMap::new();
             file_tags.insert(file_id, tag_names);
-            emit_files(output, std::slice::from_ref(&file), &file_tags);
+            emit_files(output_mode, std::slice::from_ref(&file), &file_tags);
         }
         Commands::CreateTag { name, color } => {
             let tag_id = backend
@@ -666,7 +678,7 @@ async fn run(
                 color,
                 metadata: None,
             };
-            emit_tags(output, std::slice::from_ref(&tag), &HashMap::new());
+            emit_tags(output_mode, std::slice::from_ref(&tag), &HashMap::new());
         }
         Commands::Search {
             query,
@@ -690,10 +702,10 @@ async fn run(
             let tag_tags =
                 tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
-            match output {
+            match output_mode {
                 OutputMode::Human => {
-                    emit_tags(output, &tags, &tag_tags);
-                    emit_files(output, &files, &file_tags);
+                    emit_tags(output_mode, &tags, &tag_tags);
+                    emit_files(output_mode, &files, &file_tags);
                 }
                 OutputMode::Json => {
                     let tag_rows: Vec<TagRow> = tags
@@ -717,11 +729,11 @@ async fn run(
         }
         Commands::Edit { id } => {
             let file_id = resolve_file_id(backend, &id).await?;
-            edit_file(backend, file_id, output).await?;
+            edit_file(backend, file_id, output_mode).await?;
         }
         Commands::Download { id } => {
             let file_id = resolve_file_id(backend, &id).await?;
-            download_file(backend, file_id, output).await?;
+            download_file(backend, file_id, output_mode).await?;
         }
         Commands::DeleteFile { id } => {
             let file_id = resolve_file_id(backend, &id).await?;
@@ -731,7 +743,7 @@ async fn run(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            match output {
+            match output_mode {
                 OutputMode::Human => println!("Deleted file {}", file_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "deleted": file_id })),
             }
@@ -744,7 +756,7 @@ async fn run(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            match output {
+            match output_mode {
                 OutputMode::Human => println!("Deleted tag {}", tag_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "deleted": tag_id })),
             }
@@ -761,7 +773,7 @@ async fn run(
                     .await
                     .map_err(|error| error.to_string())?;
 
-                if output == OutputMode::Human {
+                if output_mode == OutputMode::Human {
                     println!(
                         "Tagged file {} with tag {}",
                         file_id.to_string(),
@@ -772,7 +784,7 @@ async fn run(
                 applied.push(tag_id);
             }
 
-            if output == OutputMode::Json {
+            if output_mode == OutputMode::Json {
                 print_json(&json!({ "file": file_id, "tagged": applied }));
             }
         }
@@ -788,7 +800,7 @@ async fn run(
                     .await
                     .map_err(|error| error.to_string())?;
 
-                if output == OutputMode::Human {
+                if output_mode == OutputMode::Human {
                     println!(
                         "Removed tag {} from file {}",
                         tag_id.to_string(),
@@ -799,7 +811,7 @@ async fn run(
                 removed.push(tag_id);
             }
 
-            if output == OutputMode::Json {
+            if output_mode == OutputMode::Json {
                 print_json(&json!({ "file": file_id, "untagged": removed }));
             }
         }
@@ -820,7 +832,7 @@ async fn run(
             let tag_tags =
                 tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
-            emit_tags(output, &tags, &tag_tags);
+            emit_tags(output_mode, &tags, &tag_tags);
         }
         Commands::RenameTag { tag_id, name } => {
             let tag_id = resolve_tag_id(backend, &tag_id).await?;
@@ -830,7 +842,7 @@ async fn run(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            match output {
+            match output_mode {
                 OutputMode::Human => println!("Renamed tag {}", tag_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "id": tag_id, "name": name })),
             }
@@ -843,7 +855,7 @@ async fn run(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            match output {
+            match output_mode {
                 OutputMode::Human => println!("Recolored tag {}", tag_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "id": tag_id, "color": color })),
             }
@@ -856,7 +868,7 @@ async fn run(
                 .await
                 .map_err(|error| error.to_string())?;
 
-            match output {
+            match output_mode {
                 OutputMode::Human => println!("Moved file {}", file_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "id": file_id, "path": path })),
             }
@@ -873,7 +885,7 @@ async fn run(
                     .await
                     .map_err(|error| error.to_string())?;
 
-                if output == OutputMode::Human {
+                if output_mode == OutputMode::Human {
                     println!(
                         "Tagged tag {} with {}",
                         child_id.to_string(),
@@ -884,7 +896,7 @@ async fn run(
                 applied.push(parent_id);
             }
 
-            if output == OutputMode::Json {
+            if output_mode == OutputMode::Json {
                 print_json(&json!({ "tag": child_id, "tagged": applied }));
             }
         }
@@ -900,7 +912,7 @@ async fn run(
                     .await
                     .map_err(|error| error.to_string())?;
 
-                if output == OutputMode::Human {
+                if output_mode == OutputMode::Human {
                     println!(
                         "Removed tag {} from {}",
                         parent_id.to_string(),
@@ -911,7 +923,7 @@ async fn run(
                 removed.push(parent_id);
             }
 
-            if output == OutputMode::Json {
+            if output_mode == OutputMode::Json {
                 print_json(&json!({ "tag": child_id, "untagged": removed }));
             }
         }
@@ -929,7 +941,7 @@ async fn run(
             let tag_tags =
                 tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
-            emit_tags(output, &tags, &tag_tags);
+            emit_tags(output_mode, &tags, &tag_tags);
         }
     }
     Ok(())
@@ -947,7 +959,7 @@ async fn run(
 async fn edit_file(
     backend: &IpcClientBackend,
     file_id: FileId,
-    output: OutputMode,
+    output_mode: OutputMode,
 ) -> Result<(), String> {
     if let Some(path) = backend
         .local_path_for_file(file_id)
@@ -958,7 +970,7 @@ async fn edit_file(
 
         // The watcher propagates the on-disk save; report the same shape as the
         // fetch-and-write-back path below.
-        match output {
+        match output_mode {
             OutputMode::Human => {}
             OutputMode::Json => print_json(&json!({ "id": file_id, "edited": true })),
         }
@@ -986,7 +998,7 @@ async fn edit_file(
         .await
         .map_err(|error| error.to_string())?;
 
-    let result = edit_fetched_file(backend, file_id, &temp_path, &expected_hash, output).await;
+    let result = edit_fetched_file(backend, file_id, &temp_path, &expected_hash, output_mode).await;
 
     // Best-effort cleanup: `edit_file` streams the temp to the daemon but does
     // not consume it, and the no-change path never hands it off. Either way we
@@ -1005,7 +1017,7 @@ async fn edit_fetched_file(
     file_id: FileId,
     temp_path: &std::path::Path,
     expected_hash: &str,
-    output: OutputMode,
+    output_mode: OutputMode,
 ) -> Result<(), String> {
     open_in_editor(temp_path)?;
 
@@ -1014,7 +1026,7 @@ async fn edit_fetched_file(
         .map_err(|error| error.to_string())?;
 
     if edited_hash == expected_hash {
-        match output {
+        match output_mode {
             OutputMode::Human => println!("No changes"),
             OutputMode::Json => print_json(&json!({ "id": file_id, "edited": false })),
         }
@@ -1028,7 +1040,7 @@ async fn edit_fetched_file(
         .await
         .map_err(|error| error.to_string())?;
 
-    match output {
+    match output_mode {
         OutputMode::Human => println!("Edited file {}", file_id.to_string()),
         OutputMode::Json => print_json(&json!({ "id": file_id, "edited": true })),
     }
@@ -1045,7 +1057,7 @@ async fn edit_fetched_file(
 async fn download_file(
     backend: &IpcClientBackend,
     file_id: FileId,
-    output: OutputMode,
+    output_mode: OutputMode,
 ) -> Result<(), String> {
     // Pull the file's metadata once (a single by-id lookup): we need its content
     // hash to fetch (if it isn't local) and its logical path to pick a sensible
@@ -1103,15 +1115,12 @@ async fn download_file(
             let copied = std::fs::copy(&temp_path, &file_name);
             let _ = std::fs::remove_file(&temp_path);
             copied.map_err(|error| {
-                format!(
-                    "failed to move downloaded file into {file_name}: {rename_error}; \
-                     copy fallback also failed: {error}"
-                )
+                format!("failed to move downloaded file into {file_name}: {rename_error}; copy fallback also failed: {error}")
             })?;
         }
     }
 
-    match output {
+    match output_mode {
         OutputMode::Human => println!("Downloaded to {}", file_name),
         OutputMode::Json => print_json(&json!({ "id": file_id, "path": file_name })),
     }
@@ -1119,8 +1128,8 @@ async fn download_file(
     Ok(())
 }
 
-/// Open `path` in the user's `$EDITOR` (falling back to `vi`), blocking until it
-/// exits. A non-zero editor exit is treated as an abort.
+/// Open `path` in the user's `$EDITOR` (falling back to `vi`), blocking until
+/// it exits. A non-zero editor exit is treated as an abort.
 fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
     let status = std::process::Command::new(&editor)

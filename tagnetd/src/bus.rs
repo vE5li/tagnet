@@ -14,16 +14,14 @@
 //! clone/drain/shutdown wiring.
 //!
 //! The reply travels back out-of-band via the `oneshot` carried in the `Fetch`
-//! variant, mirroring the `SyncDirectoryCommand::ReadFile { respond_to }` idiom.
-//! This is what lets the control layer stay decoupled from the peer/sync
+//! variant, mirroring the `SyncDirectoryCommand::ReadFile { respond_to }`
+//! idiom. This is what lets the control layer stay decoupled from the peer/sync
 //! machinery: it only ever holds an [`Api`](crate::api::Api), which enqueues a
 //! `Fetch` and awaits the `oneshot`; the recursive fetch engine that talks to
 //! peers lives entirely in `handle_changes`/the peer sessions.
 
-use tagnet_core::{
-    FileId, LogicalPath, TagId,
-    state::{Change, ChangeOrigin},
-};
+use tagnet_core::state::{Change, ChangeOrigin};
+use tagnet_core::{FileId, LogicalPath, TagId};
 use tokio::sync::oneshot;
 
 use crate::file_bytes::FileBytes;
@@ -83,11 +81,11 @@ pub enum ContentChange {
 impl Ingest {
     /// Lift a wire [`Change`] onto the bus as [`Ingest::Meta`].
     ///
-    /// Since `Change` is metadata-only, a wire change never carries bytes, so it
-    /// is always `Meta`. Used by producers that only have a wire change: the UI
-    /// API's metadata mutations and inbound peer sessions. Local content
-    /// ingestion (API upload, directory manager) constructs [`Ingest::Content`]
-    /// directly with its [`FileBytes`].
+    /// Since `Change` is metadata-only, a wire change never carries bytes, so
+    /// it is always `Meta`. Used by producers that only have a wire change:
+    /// the UI API's metadata mutations and inbound peer sessions. Local
+    /// content ingestion (API upload, directory manager) constructs
+    /// [`Ingest::Content`] directly with its [`FileBytes`].
     pub fn from_change(change: Change) -> Self {
         Ingest::Meta(change)
     }
@@ -117,11 +115,12 @@ pub enum DaemonMessage {
     /// written into this device's matching sync directories.
     ///
     /// Both the file's logical identity and its **version** were recorded when
-    /// the announcement was handled (`FileMetadataAdded`/`Changed` or `Manifest`
-    /// reconcile), because `file_versions` is the byte-independent *catalog* of
-    /// versions we know exist — not a record of bytes we hold. `Materialize` is
-    /// therefore purely about placing the arrived bytes; it neither records a
-    /// version nor forwards the announcement (both already happened).
+    /// the announcement was handled (`FileMetadataAdded`/`Changed` or
+    /// `Manifest` reconcile), because `file_versions` is the
+    /// byte-independent *catalog* of versions we know exist — not a record
+    /// of bytes we hold. `Materialize` is therefore purely about placing
+    /// the arrived bytes; it neither records a version nor forwards the
+    /// announcement (both already happened).
     Materialize {
         file_id: FileId,
         content: FileBytes,
@@ -132,19 +131,20 @@ pub enum DaemonMessage {
         origin: ChangeOrigin,
         placement: MaterializePlacement,
     },
-    /// Re-evaluate `file_id`'s TagBased placement (and fetch its bytes on demand
-    /// if a sync directory now wants it but we do not hold them). Enqueued by a
-    /// peer session's connect-time reconciliation sweep so the fetch runs inside
-    /// `handle_changes` rather than blocking the session's frame loop (the fetch
-    /// needs that loop to relay `FetchRequest`/`FetchFound`). Fire-and-forget.
+    /// Re-evaluate `file_id`'s TagBased placement (and fetch its bytes on
+    /// demand if a sync directory now wants it but we do not hold them).
+    /// Enqueued by a peer session's connect-time reconciliation sweep so
+    /// the fetch runs inside `handle_changes` rather than blocking the
+    /// session's frame loop (the fetch needs that loop to relay
+    /// `FetchRequest`/`FetchFound`). Fire-and-forget.
     ReconcilePlacement { file_id: FileId },
     /// Record a file + version into the catalog (`files` + `file_versions`) on
-    /// behalf of a peer session's `Manifest` reconciliation. The session decides
-    /// *what* to catalog (its divergence/LWW logic stays there) but must not
-    /// write the main DB itself — `handle_changes` is the sole writer — so it
-    /// hands the write here. Fire-and-forget. Inserts the `files` row if absent
-    /// and appends the version; the byte pull happens separately on the session
-    /// link.
+    /// behalf of a peer session's `Manifest` reconciliation. The session
+    /// decides *what* to catalog (its divergence/LWW logic stays there) but
+    /// must not write the main DB itself — `handle_changes` is the sole
+    /// writer — so it hands the write here. Fire-and-forget. Inserts the
+    /// `files` row if absent and appends the version; the byte pull happens
+    /// separately on the session link.
     CatalogFile {
         file_id: FileId,
         /// The file's logical identity, used to insert the `files` row when the
@@ -159,12 +159,12 @@ pub enum DaemonMessage {
     /// A locally-provided upload/edit: the client (CLI) holds the bytes and
     /// serves them on demand (a temporary provider), so there is nothing to
     /// place in a local sync directory. `handle_changes` records the file (for
-    /// `FileMetadataAdded`) and version, then announces the metadata-only change
-    /// to peers, which pull the bytes from the registered provider.
+    /// `FileMetadataAdded`) and version, then announces the metadata-only
+    /// change to peers, which pull the bytes from the registered provider.
     AnnounceProvided {
         file_id: FileId,
-        /// `Some(logical_path)` for a new file (`FileMetadataAdded`); `None` for
-        /// an edit of an existing file (`FileMetadataChanged`).
+        /// `Some(logical_path)` for a new file (`FileMetadataAdded`); `None`
+        /// for an edit of an existing file (`FileMetadataChanged`).
         logical_path: Option<LogicalPath>,
         content_hash: String,
         /// Content size in bytes, read at hash time by the provider (CLI).
@@ -204,8 +204,8 @@ pub enum MaterializePlacement {
         tags: Vec<TagId>,
     },
     /// An updated file (`FileMetadataChanged`): overwrite it in each sync
-    /// directory that already holds it (tag-filtered by the file's current local
-    /// tags).
+    /// directory that already holds it (tag-filtered by the file's current
+    /// local tags).
     Change,
 }
 

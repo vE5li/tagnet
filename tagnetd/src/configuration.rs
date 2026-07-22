@@ -1,20 +1,20 @@
-use std::{
-    collections::HashMap,
-    io::Write,
-    net::IpAddr,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::collections::HashMap;
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use tagnet_core::{FileId, LogicalPath, PhysicalPath, TagId, state::Frame};
+use tagnet_core::state::Frame;
+use tagnet_core::{FileId, LogicalPath, PhysicalPath, TagId};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bus::PeerCommand;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
-    /// IP address and port of the peer. None to let the peer establish the connection.
+    /// IP address and port of the peer. None to let the peer establish the
+    /// connection.
     pub address: Option<(IpAddr, u16)>,
     /// Human-readable label for this peer, used only to make log messages
     /// readable. Peer identity is always established via `public_key`.
@@ -53,8 +53,8 @@ impl SyncType {
     ///   physical path equals the logical path.
     ///
     /// This is the only sanctioned way to turn a `LogicalPath` into a
-    /// `PhysicalPath`; keeping it here (rather than in `tagnet-core`) is why the
-    /// core newtypes expose no direct conversion in this direction.
+    /// `PhysicalPath`; keeping it here (rather than in `tagnet-core`) is why
+    /// the core newtypes expose no direct conversion in this direction.
     pub fn physical_for(&self, logical_path: &LogicalPath, file_id: FileId) -> PhysicalPath {
         match self {
             SyncType::Universal { .. } => PhysicalPath::new(file_id.to_string()),
@@ -81,16 +81,16 @@ pub struct SyncDirectory {
 ///
 /// Tags are otherwise only minted at runtime (UI/API `create_tag`, or
 /// reconciled from a peer), which forces an operator to create a tag elsewhere
-/// and copy its opaque id into the config by hand. Declaring the tag here — with
-/// its id chosen by the operator — makes a `TagBased` directory's `tags`
+/// and copy its opaque id into the config by hand. Declaring the tag here —
+/// with its id chosen by the operator — makes a `TagBased` directory's `tags`
 /// self-contained and lets the *same* tag converge across devices (they all
 /// declare the same id).
 ///
 /// Semantics are a last-writer-wins **floor**, not an override: on startup each
 /// declaration is replayed as a `Change::TagAdded` stamped with a very low
-/// `modified_at`, so it *creates* the tag when absent but never clobbers a newer
-/// rename/recolor made through the UI or reconciled from a peer. Config declares
-/// existence and initial values; it does not enforce them.
+/// `modified_at`, so it *creates* the tag when absent but never clobbers a
+/// newer rename/recolor made through the UI or reconciled from a peer. Config
+/// declares existence and initial values; it does not enforce them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagDeclaration {
     /// The tag's id, chosen by the operator (not minted). The same id must be
@@ -112,10 +112,11 @@ pub struct Configuration {
     /// Port to listen on. None for not listening.
     pub listen_port: Option<u16>,
     pub peers: Vec<Peer>,
-    /// Tags that must exist on startup, so a [`SyncType::TagBased`] directory can
-    /// reference them by id without the operator first creating them through the
-    /// UI. See [`TagDeclaration`] for the last-writer-wins-floor semantics.
-    /// Defaults to empty so pre-existing config files keep parsing.
+    /// Tags that must exist on startup, so a [`SyncType::TagBased`] directory
+    /// can reference them by id without the operator first creating them
+    /// through the UI. See [`TagDeclaration`] for the
+    /// last-writer-wins-floor semantics. Defaults to empty so pre-existing
+    /// config files keep parsing.
     #[serde(default)]
     pub tags: Vec<TagDeclaration>,
 }
@@ -179,30 +180,6 @@ impl Configuration {
                 source,
             })?;
         Self::from_str(&contents)
-    }
-
-    pub fn new_example() -> Self {
-        Configuration {
-            peers: vec![Peer {
-                address: Some(("192.168.188.10".parse().unwrap(), 2468)),
-                name: "test".to_owned(),
-                public_key: "public-key".to_owned(),
-            }],
-            listen_port: Some(3468),
-            sync_directories: vec![
-                SyncDirectory {
-                    path: "/tmp/tagnet-testcloud".into(),
-                    sync_type: SyncType::Universal {
-                        keep_deleted_files: false,
-                    },
-                },
-                SyncDirectory {
-                    path: "/tmp/tagnet-testcloud-2".into(),
-                    sync_type: SyncType::TagBased { tags: Vec::new() },
-                },
-            ],
-            tags: Vec::new(),
-        }
     }
 
     // TODO: Return a result
@@ -284,8 +261,9 @@ pub struct RuntimePeer {
     /// `Frame::Change`.
     pub outbound: Option<UnboundedSender<Frame>>,
     /// Command channel into this peer's live session, used by `handle_changes`
-    /// to trigger a byte pull for a change this peer just announced. `None` when
-    /// no session is established. Registered/cleared alongside `outbound`.
+    /// to trigger a byte pull for a change this peer just announced. `None`
+    /// when no session is established. Registered/cleared alongside
+    /// `outbound`.
     pub commands: Option<UnboundedSender<PeerCommand>>,
 }
 
@@ -325,8 +303,9 @@ impl RuntimeConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::str::FromStr;
+
+    use super::*;
 
     /// A config file predating the `tags` field still parses (the field
     /// defaults to empty).

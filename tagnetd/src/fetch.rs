@@ -22,25 +22,21 @@
 //! (which seeds *local-origin* requests coming off the ingest bus) and the peer
 //! session tasks (which seed *relayed* requests and deliver replies). This is
 //! the only cross-session coordination the feature introduces; the control
-//! layer never touches it — it only enqueues a `DaemonMessage::Fetch` and awaits
-//! the `oneshot`.
+//! layer never touches it — it only enqueues a `DaemonMessage::Fetch` and
+//! awaits the `oneshot`.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
-use tagnet_core::{
-    FileId, RequestId,
-    state::{Frame, Sync as SyncMessage},
-};
+use tagnet_core::state::{Frame, Sync as SyncMessage};
+use tagnet_core::{FileId, RequestId};
 use tokio::sync::{Mutex, RwLock, oneshot};
 
-use crate::{
-    bus::FetchError, configuration::RuntimeConfiguration, file_bytes::FileBytes,
-    transfer::ChunkSource,
-};
+use crate::bus::FetchError;
+use crate::configuration::RuntimeConfiguration;
+use crate::file_bytes::FileBytes;
+use crate::transfer::ChunkSource;
 
 /// How long any single hop waits for its children before concluding the subtree
 /// does not have the content. The originating CLI applies its own (larger)
@@ -76,8 +72,9 @@ struct PendingFetch {
 /// transfer frames are demuxed by the peer session), so it returns this action
 /// for the session to execute.
 pub enum FoundAction {
-    /// Open a receiver transfer against `from_peer` for `file_id`/`expected_hash`
-    /// and, once the bytes arrive (a hash-verified temp file), do `then`.
+    /// Open a receiver transfer against `from_peer` for
+    /// `file_id`/`expected_hash` and, once the bytes arrive (a
+    /// hash-verified temp file), do `then`.
     Receive {
         from_peer: String,
         file_id: FileId,
@@ -120,8 +117,8 @@ pub struct PendingFetches {
     runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
     /// Files a relay node has received for an in-flight fetch and is holding to
     /// serve upward. Keyed by `(file_id, content_hash)`. Populated when a relay
-    /// finishes receiving; consulted by the `TransferStart` sender path when the
-    /// file is not in any sync directory; evicted once served.
+    /// finishes receiving; consulted by the `TransferStart` sender path when
+    /// the file is not in any sync directory; evicted once served.
     fetch_cache: Arc<Mutex<HashMap<(FileId, String), FileBytes>>>,
     /// Content a local client (the CLI) is temporarily providing on demand,
     /// keyed by `(file_id, content_hash)`. A `TransferStart` the sync
@@ -151,9 +148,9 @@ impl PendingFetches {
         }
     }
 
-    /// Register a temporary chunk provider (the CLI) for `file_id`/`content_hash`.
-    /// A `TransferStart` for this file that no sync directory can serve will
-    /// stream chunks from `source`.
+    /// Register a temporary chunk provider (the CLI) for
+    /// `file_id`/`content_hash`. A `TransferStart` for this file that no
+    /// sync directory can serve will stream chunks from `source`.
     pub async fn register_provider(
         &self,
         file_id: FileId,
@@ -217,8 +214,9 @@ impl PendingFetches {
             .remove(&(file_id, content_hash.to_owned()))
     }
 
-    /// Snapshot every connected peer's outbound sender, optionally excluding one
-    /// public key (the peer a relayed request came from — never echo it back).
+    /// Snapshot every connected peer's outbound sender, optionally excluding
+    /// one public key (the peer a relayed request came from — never echo it
+    /// back).
     async fn connected_peers(&self, exclude: Option<&str>) -> Vec<PeerOutbound> {
         let runtime = self.runtime_configuration.read().await;
         runtime
@@ -319,8 +317,7 @@ impl PendingFetches {
     ) {
         if let Some(size) = local_size {
             log::debug!(
-                "handle_incoming_request: request {request_id} for {} from {}: \
-                 have it locally ({size} bytes); answering FetchFound",
+                "handle_incoming_request: request {request_id} for {} from {}: have it locally ({size} bytes); answering FetchFound",
                 file_id.to_string(),
                 from_public_key,
             );
@@ -339,8 +336,8 @@ impl PendingFetches {
         let peers = self.connected_peers(Some(from_public_key)).await;
         if peers.is_empty() {
             log::debug!(
-                "handle_incoming_request: request {request_id} for {} from {}: \
-                 not local and no other peers to relay to; answering FetchMissing",
+                "handle_incoming_request: request {request_id} for {} from {}: not local and no other peers to relay to; answering \
+                 FetchMissing",
                 file_id.to_string(),
                 from_public_key,
             );
@@ -352,8 +349,7 @@ impl PendingFetches {
 
         let children: HashSet<String> = peers.iter().map(|peer| peer.public_key.clone()).collect();
         log::debug!(
-            "handle_incoming_request: request {request_id} for {} from {}: \
-             not local; relaying to {} other peer(s): {:?}",
+            "handle_incoming_request: request {request_id} for {} from {}: not local; relaying to {} other peer(s): {:?}",
             file_id.to_string(),
             from_public_key,
             children.len(),
@@ -388,8 +384,8 @@ impl PendingFetches {
     /// First-wins: resolve and remove the pending entry. Returns a
     /// [`FoundAction`] telling the caller to open a receiver transfer against
     /// the child that answered (`from_public_key`) and, on completion, either
-    /// deliver the bytes locally or relay upward. Late duplicates (no entry) and
-    /// hash mismatches return `None`.
+    /// deliver the bytes locally or relay upward. Late duplicates (no entry)
+    /// and hash mismatches return `None`.
     pub async fn handle_incoming_found(
         &self,
         from_public_key: &str,
@@ -404,8 +400,7 @@ impl PendingFetches {
         };
         let Some(entry) = entry else {
             log::debug!(
-                "handle_incoming_found: FetchFound for {} from {} but no pending entry \
-                 (late duplicate or already resolved); ignoring",
+                "handle_incoming_found: FetchFound for {} from {} but no pending entry (late duplicate or already resolved); ignoring",
                 file_id.to_string(),
                 from_public_key,
             );
@@ -424,8 +419,7 @@ impl PendingFetches {
         }
 
         log::debug!(
-            "handle_incoming_found: request {request_id} for {} answered by {}; \
-             opening receiver transfer",
+            "handle_incoming_found: request {request_id} for {} answered by {}; opening receiver transfer",
             file_id.to_string(),
             from_public_key,
         );
@@ -460,8 +454,7 @@ impl PendingFetches {
                 Some(entry) => {
                     entry.children_outstanding.remove(from_public_key);
                     log::debug!(
-                        "handle_incoming_missing: {} reported missing for request {request_id}; \
-                         {} child(ren) still outstanding",
+                        "handle_incoming_missing: {} reported missing for request {request_id}; {} child(ren) still outstanding",
                         from_public_key,
                         entry.children_outstanding.len(),
                     );
@@ -473,8 +466,8 @@ impl PendingFetches {
                 }
                 None => {
                     log::debug!(
-                        "handle_incoming_missing: {} reported missing for request {request_id} \
-                         but no pending entry (already resolved); ignoring",
+                        "handle_incoming_missing: {} reported missing for request {request_id} but no pending entry (already resolved); \
+                         ignoring",
                         from_public_key,
                     );
                     None

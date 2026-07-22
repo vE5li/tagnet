@@ -1,9 +1,9 @@
 //! Daemon-internal representation of a file's content in transit.
 //!
 //! Historically file content was carried everywhere as an owned, fully-buffered
-//! `Vec<u8>` (see the wire types in `tagnet-core`). That does not scale to large
-//! files: every ingestion read the whole file into memory before it could be
-//! placed into a sync directory.
+//! `Vec<u8>` (see the wire types in `tagnet-core`). That does not scale to
+//! large files: every ingestion read the whole file into memory before it could
+//! be placed into a sync directory.
 //!
 //! [`FileBytes`] lets an internal producer describe *where* a file's content
 //! lives and *how* the consumer is allowed to obtain it, without eagerly
@@ -68,10 +68,10 @@ pub enum FileBytes {
 
 /// An error while reading, hashing, materializing, or buffering [`FileBytes`].
 ///
-/// A cross-filesystem (`EXDEV`) rename during `materialize_to` is *not* an error
-/// variant: it is handled transparently by a stream-copy-then-delete fallback
-/// (see [`FileBytes::materialize_to`]), so it surfaces only as an `Io` error if
-/// that fallback itself fails.
+/// A cross-filesystem (`EXDEV`) rename during `materialize_to` is *not* an
+/// error variant: it is handled transparently by a stream-copy-then-delete
+/// fallback (see [`FileBytes::materialize_to`]), so it surfaces only as an `Io`
+/// error if that fallback itself fails.
 #[derive(Debug)]
 pub enum FileBytesError {
     /// An I/O error occurred against `path` (or an in-memory buffer when
@@ -246,7 +246,8 @@ impl FileBytes {
     ///   consumer). If the rename crosses filesystems (`EXDEV`) — common,
     ///   because sync directories are user-configured paths that may live on a
     ///   different mount than the daemon's temp dir — it falls back to a
-    ///   stream-copy followed by removing the source, preserving move semantics.
+    ///   stream-copy followed by removing the source, preserving move
+    ///   semantics.
     ///
     /// The parent directory of `dest` must already exist.
     pub async fn materialize_to(self, dest: &Path) -> Result<(), FileBytesError> {

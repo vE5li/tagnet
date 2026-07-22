@@ -25,7 +25,8 @@
 
 use std::path::PathBuf;
 
-use tagnet_core::{FileId, TransferId, state::Sync as SyncMessage};
+use tagnet_core::state::Sync as SyncMessage;
+use tagnet_core::{FileId, TransferId};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -153,10 +154,12 @@ impl std::fmt::Display for TransferError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransferError::Aborted(reason) => write!(formatter, "transfer aborted: {reason}"),
-            TransferError::HashMismatch { expected, actual } => write!(
-                formatter,
-                "content hash mismatch: expected {expected}, got {actual}"
-            ),
+            TransferError::HashMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "content hash mismatch: expected {expected}, got {actual}"
+                )
+            }
             TransferError::Io(error) => write!(formatter, "transfer I/O error: {error}"),
             TransferError::ChannelClosed => write!(formatter, "transfer channel closed early"),
         }
@@ -306,8 +309,7 @@ async fn receive_inner(
                         // correctness.
                         if expected_size != 0 && write_offset != expected_size {
                             log::warn!(
-                                "transfer for {}: received {} bytes but expected size was {} \
-                                 (size hint stale?); verifying by hash",
+                                "transfer for {}: received {} bytes but expected size was {} (size hint stale?); verifying by hash",
                                 file_id.to_string(),
                                 write_offset,
                                 expected_size
@@ -547,6 +549,7 @@ where
             Ok(file_bytes) => ReceiveOutcome::Complete(file_bytes),
             Err(error) => ReceiveOutcome::Failed(error),
         };
+
         let _ = done.send(outcome);
     });
 
@@ -587,9 +590,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
 
     fn temp_path(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -7,13 +7,11 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use tagnetd::{
-    RunPaths, ShutdownSignal,
-    configuration::Configuration,
-    control::serve_control,
-    identity::Identity,
-    paths::{Paths, control_socket_path},
-};
+use tagnetd::ShutdownSignal;
+use tagnetd::configuration::Configuration;
+use tagnetd::control::serve_control;
+use tagnetd::identity::Identity;
+use tagnetd::paths::{Paths, control_socket_path};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -26,10 +24,6 @@ struct Arguments {
 enum Commands {
     /// Create this machine's long-lived identity key in `~/.tagnet`.
     Keygen,
-    /// Write an example configuration file, filling in this machine's public key.
-    Generate {
-        file_name: PathBuf,
-    },
     Run {
         configuration_file: PathBuf,
     },
@@ -46,6 +40,7 @@ fn paths_from_env() -> Paths {
         std::env::var("TAGNET_DATA_DIR").expect("TAGNET_DATA_DIR environment variable not set");
     let identity_file = std::env::var("TAGNET_PRIVATE_KEY_FILE")
         .expect("TAGNET_PRIVATE_KEY_FILE environment variable not set");
+
     Paths::new(data_dir, identity_file)
 }
 
@@ -62,8 +57,8 @@ async fn main() -> Result<(), std::io::Error> {
             let path = paths.identity_path();
             if path.exists() {
                 panic!(
-                    "An identity key already exists at {}. Refusing to overwrite it; \
-                     delete it manually if you really want to rotate this machine's identity.",
+                    "An identity key already exists at {}. Refusing to overwrite it; delete it manually if you really want to rotate this \
+                     machine's identity.",
                     path.display()
                 );
             }
@@ -80,28 +75,9 @@ async fn main() -> Result<(), std::io::Error> {
             log::info!("Generated identity key at {}", path.display());
             log::info!("Public key: {}", identity.public_key());
         }
-        // FIX: Remove, for development only.
-        Commands::Generate { file_name } => {
-            let paths = paths_from_env();
-            let path = paths.identity_path();
-            let _identity = Identity::load(path).unwrap_or_else(|error| {
-                panic!(
-                    "No usable identity key at {} ({error}). Run 'tagnet keygen' first.",
-                    path.display()
-                )
-            });
-
-            let configuration = Configuration::new_example();
-            configuration.write_to_file(file_name);
-        }
         Commands::Run { configuration_file } => {
             let paths = paths_from_env();
             let configuration = Configuration::new(configuration_file);
-
-            let run_paths = RunPaths {
-                data_dir: paths.data_dir().to_path_buf(),
-                identity_file: paths.identity_path().to_path_buf(),
-            };
 
             // Wire Ctrl-C to the library's cooperative shutdown so the daemon
             // (and systemd stop) exits cleanly instead of being killed.
@@ -124,8 +100,7 @@ async fn main() -> Result<(), std::io::Error> {
             // the desktop daemon owns the DB, and a separate UI process attaches
             // over this socket. It shares the runtime's shutdown signal so a
             // Ctrl-C / systemd stop tears both down together.
-            let (api, driver) = match tagnetd::run(configuration, run_paths, shutdown.clone()).await
-            {
+            let (api, driver) = match tagnetd::run(configuration, paths, shutdown.clone()).await {
                 Ok(pair) => pair,
                 Err(error) => {
                     log::error!("tagnet runtime failed to start: {error}");

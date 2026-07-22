@@ -9,8 +9,9 @@
 /// Initialise log routing appropriately for the current platform.
 ///
 /// Safe to call more than once; only the first call installs a logger. The
-/// frontend should call this once at startup (before [`crate::runtime::RuntimeHandle::start`])
-/// so early runtime logs are captured.
+/// frontend should call this once at startup (before
+/// [`crate::runtime::RuntimeHandle::start`]) so early runtime logs are
+/// captured.
 pub fn init() {
     #[cfg(target_os = "android")]
     {

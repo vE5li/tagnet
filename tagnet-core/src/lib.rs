@@ -1,7 +1,5 @@
-use rusqlite::{
-    ToSql,
-    types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
-};
+use rusqlite::ToSql;
+use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -76,21 +74,20 @@ pub mod state {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::{
-        FileId, LogicalPath, RequestId, TagId, TransferId,
-        tag::{MetadataFormat, MetadataValues},
-    };
+    use crate::tag::{MetadataFormat, MetadataValues};
+    use crate::{FileId, LogicalPath, RequestId, TagId, TransferId};
 
     pub enum ChangeOrigin {
         Local { directory_path: PathBuf },
         Peer { public_key: String },
     }
 
-    /// Anything a client can request the server to do. Add/edit/remove files and tags (including
-    /// tag metadata), tag files or tags.
+    /// Anything a client can request the server to do. Add/edit/remove files
+    /// and tags (including tag metadata), tag files or tags.
     ///
-    /// The Server is the only entity that has knowledge of the complete state. It doesn't try to
-    /// keep every client informed of the entire state, it only synchronizes the state that is:
+    /// The Server is the only entity that has knowledge of the complete state.
+    /// It doesn't try to keep every client informed of the entire state, it
+    /// only synchronizes the state that is:
     /// - Configured to be synced to the client
     /// - Allowed to be accessed by the user
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,10 +103,11 @@ pub mod state {
             /// database and each derive their own on-disk placement from it.
             logical_path: LogicalPath,
             // encoding: ,
-            /// BLAKE3 hex digest of the file's content. `FileMetadataAdded` is a
-            /// metadata-only announcement: it carries no bytes. A receiver that
-            /// does not already hold this hash pulls the bytes over a separate
-            /// transfer (keyed by `file_id` + this hash). The hash is recorded
+            /// BLAKE3 hex digest of the file's content. `FileMetadataAdded` is
+            /// a metadata-only announcement: it carries no bytes. A
+            /// receiver that does not already hold this hash pulls
+            /// the bytes over a separate transfer (keyed by
+            /// `file_id` + this hash). The hash is recorded
             /// in `file_versions` so the version chain is authoritative.
             content_hash: String,
             /// The file's content size in bytes, read at hash time. Recorded
@@ -120,8 +118,9 @@ pub mod state {
         },
         FileMoved {
             file_id: FileId,
-            /// The file's new logical identity. As with `FileMetadataAdded`, each
-            /// receiving sync directory derives its own physical placement.
+            /// The file's new logical identity. As with `FileMetadataAdded`,
+            /// each receiving sync directory derives its own
+            /// physical placement.
             logical_path: LogicalPath,
         },
         FileMetadataChanged {
@@ -178,9 +177,10 @@ pub mod state {
             tag_id: TagId,
             /// The unix-millis delete time. A tag reuses its `modified_at` as
             /// its single last-writer-wins clock, so the delete carries a
-            /// timestamp here (stored into `modified_at`) rather than a separate
-            /// `deleted_at`. A newer rename/recolor resurrects the tag. Never
-            /// restamp it when applying a peer's delete.
+            /// timestamp here (stored into `modified_at`) rather than a
+            /// separate `deleted_at`. A newer rename/recolor
+            /// resurrects the tag. Never restamp it when applying a
+            /// peer's delete.
             modified_at: i64,
         },
         FileTagged {
@@ -346,8 +346,8 @@ pub mod state {
         /// A peer holds bytes for `file_id` matching the request's
         /// `expected_hash`. Content-less control signal: it announces "I have
         /// it, the hash matches" and unwinds back toward the origin. The bytes
-        /// themselves are then pulled over a separate transfer (each hop opens a
-        /// transfer against the child that answered).
+        /// themselves are then pulled over a separate transfer (each hop opens
+        /// a transfer against the child that answered).
         FetchFound {
             request_id: RequestId,
             file_id: FileId,
@@ -373,13 +373,11 @@ pub mod state {
         //
         // Flow:
         // 1. Receiver → `TransferStart { transfer_id, file_id, content_hash }`.
-        // 2. Receiver → `TransferChunkRequest { transfer_id, offset }` for each
-        //    chunk it wants (it may keep a small window of these in flight).
-        // 3. Sender  → `TransferChunk { transfer_id, offset, bytes, last }` in
-        //    reply to each request; `last` marks the final chunk.
-        // 4. Either side → `TransferAbort { transfer_id, reason }` to cancel
-        //    (sender: file gone / read error; receiver: hash mismatch / timeout
-        //    / no longer wanted).
+        // 2. Receiver → `TransferChunkRequest { transfer_id, offset }` for each chunk it wants (it may keep a small window of these in
+        //    flight).
+        // 3. Sender  → `TransferChunk { transfer_id, offset, bytes, last }` in reply to each request; `last` marks the final chunk.
+        // 4. Either side → `TransferAbort { transfer_id, reason }` to cancel (sender: file gone / read error; receiver: hash mismatch /
+        //    timeout / no longer wanted).
         //
         // The receiver verifies the accumulated BLAKE3 against `content_hash`
         // when it sees `last`; a mismatch is an abort, never a commit.
@@ -423,8 +421,8 @@ pub mod state {
         ///    `RelationshipManifestEntry`).
         /// 2. For each *definition* whose `modified_at` is newer than ours (or
         ///    that we don't know), the receiver replies with `TagRequest`.
-        ///    Relationships carry their whole state in the manifest, so they are
-        ///    applied directly by last-writer-wins with no request needed.
+        ///    Relationships carry their whole state in the manifest, so they
+        ///    are applied directly by last-writer-wins with no request needed.
         /// 3. The peer answers each `TagRequest` with a `Change::TagAdded`
         ///    carrying the full current definition (name/color/metadata +
         ///    `modified_at`), re-using the live wire format. If the tag no
@@ -472,8 +470,8 @@ pub struct FileInfo {
     /// time the listing was produced — the "short id" length, à la `jj`/`git`.
     ///
     /// This is a display hint only: it is computed on read and is not stable
-    /// across concurrent inserts. Consumers highlight `file_id[..short_id_length]`
-    /// and dim the remainder.
+    /// across concurrent inserts. Consumers highlight
+    /// `file_id[..short_id_length]` and dim the remainder.
     pub short_id_length: usize,
 }
 
@@ -579,8 +577,8 @@ impl Default for RequestId {
 }
 
 /// A transient identifier for a single **file transfer over one peer link**
-/// (`Sync::Transfer*`). Like [`RequestId`] it is never persisted; it exists only
-/// to correlate the messages of one pull-driven transfer (start, chunk
+/// (`Sync::Transfer*`). Like [`RequestId`] it is never persisted; it exists
+/// only to correlate the messages of one pull-driven transfer (start, chunk
 /// requests, chunk replies, abort) on a single link.
 ///
 /// It is deliberately *per-hop*: in a relayed fetch each hop runs its own
@@ -615,11 +613,12 @@ impl Default for TransferId {
 /// directory stores the bytes on disk.
 ///
 /// Deliberately *not* interchangeable with [`PhysicalPath`]: the only way to
-/// obtain a `LogicalPath` from a `PhysicalPath` is [`PhysicalPath::into_logical`]
-/// (the ingestion boundary), and the only way to obtain a `PhysicalPath` from a
-/// `LogicalPath` is a `SyncType`-aware placement decision that lives in the
-/// `tagnet` crate (`physical_for`). Keeping them distinct makes the
-/// logical-vs-physical confusion a compile error rather than a convention.
+/// obtain a `LogicalPath` from a `PhysicalPath` is
+/// [`PhysicalPath::into_logical`] (the ingestion boundary), and the only way to
+/// obtain a `PhysicalPath` from a `LogicalPath` is a `SyncType`-aware placement
+/// decision that lives in the `tagnet` crate (`physical_for`). Keeping them
+/// distinct makes the logical-vs-physical confusion a compile error rather than
+/// a convention.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct LogicalPath(String);
@@ -629,7 +628,8 @@ pub struct LogicalPath(String);
 /// the logical path; for a `Universal` directory it is the file's `file_id`
 /// (files are stored under their id on disk). It also serves as the reverse
 /// index for filesystem events (path -> file_id), so it must always reflect the
-/// actual on-disk name. Stored in `SyncDirectoryDatabase` (`files.physical_path`).
+/// actual on-disk name. Stored in `SyncDirectoryDatabase`
+/// (`files.physical_path`).
 ///
 /// See [`LogicalPath`] for why the two are not interchangeable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]

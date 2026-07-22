@@ -1,19 +1,13 @@
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{
-    Connection, OptionalExtension, ToSql,
-    types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
-};
+use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
-use tagnet_core::{
-    FileId, FileInfo, LogicalPath, PhysicalPath, TagId,
-    state::{RelationshipKind, RelationshipManifestEntry, TagManifestEntry},
-    tag::MetadataFormat,
-};
+use tagnet_core::state::{RelationshipKind, RelationshipManifestEntry, TagManifestEntry};
+use tagnet_core::tag::MetadataFormat;
+use tagnet_core::{FileId, FileInfo, LogicalPath, PhysicalPath, TagId};
 
 /// A file's version history as `(version_number, content_hash, size)` triples
 /// ordered oldest-to-newest. `size` is the version's content size in bytes.
@@ -52,6 +46,12 @@ pub enum SubtagRule {
     Exclude,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeletedRule {
+    Include,
+    Exclude,
+}
+
 /// A single clause of a file search (see [`FileDatabase::file_ids_for_query`]).
 ///
 /// Terms are combined conjunctively: a file matches a query only if it matches
@@ -74,17 +74,23 @@ pub enum SubtagRule {
 /// resolved tag set so both sides of the disjunction can be evaluated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryTerm {
-    /// `/t foo` — must carry *at least one* tag in this set.
+    /// Must carry *at least one* tag in this set.
     HasTag(Vec<TagId>),
-    /// `! /t foo` — must carry *none* of the tags in this set.
+    /// Must carry *none* of the tags in this set.
     NotTag(Vec<TagId>),
-    /// `/n foo` — the logical path (file) or name (tag) must contain the
+    /// The logical path of the file or name of the tag must contain the
     /// substring (case-insensitive).
+    NameContains(String),
+    /// The logical path of the file or name of the tag must *not* contain the
+    /// substring (case-insensitive).
+    NotNameContains(String),
+    /// The logical path of the file must contain the substring
+    /// (case-insensitive).
     LogicalContains(String),
-    /// `! /n foo` — the logical path (file) or name (tag) must *not* contain
-    /// the substring (case-insensitive).
+    /// The logical path of the file must *not* contain the substring
+    /// (case-insensitive).
     NotLogicalContains(String),
-    /// Prefix-less `foo` — matches on *either* substring OR tag (union across
+    /// Matches on *either* substring OR tag (union across
     /// both axes). The [`String`] is the substring; the [`Vec<TagId>`] is the
     /// resolved tag set for the same token. An empty tag set here does **not**
     /// mean "matches nothing" — the substring side still stands.
@@ -163,9 +169,10 @@ pub enum DatabaseError {
 
 /// Current wall-clock time as unix milliseconds.
 ///
-/// Used to stamp `modified_at` on locally-originated tag mutations. Peer changes
-/// carry their own `modified_at` and must NOT be restamped with this (that would
-/// let a receiver's clock override the last-writer-wins comparison).
+/// Used to stamp `modified_at` on locally-originated tag mutations. Peer
+/// changes carry their own `modified_at` and must NOT be restamped with this
+/// (that would let a receiver's clock override the last-writer-wins
+/// comparison).
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -191,8 +198,8 @@ pub enum PrefixResolution {
     Ambiguous,
 }
 
-/// Resolve a short-id `prefix` against `column` of `table`, returning whether it
-/// identifies exactly one row.
+/// Resolve a short-id `prefix` against `column` of `table`, returning whether
+/// it identifies exactly one row.
 ///
 /// This is the generic counterpart to shortening: given the fewest leading hex
 /// characters a user typed, find the full id — or report that the prefix is
@@ -358,12 +365,12 @@ impl FileDatabase {
         // Append-only log of content hashes per file. The latest row per
         // `file_id` (highest `version_number`) is the current version.
         //
-        // - `version_number` is a per-file monotonic counter starting at 1. It
-        //   is what we order by; do not order by `observed_at`.
-        // - `observed_at` is unix-millis wall-clock at insert time, kept for
-        //   debugging / UI.
-        // - `origin` is `'local'` for now. When cross-peer conflict resolution
-        //   lands it will hold the originating peer's public key.
+        // - `version_number` is a per-file monotonic counter starting at 1. It is what
+        //   we order by; do not order by `observed_at`.
+        // - `observed_at` is unix-millis wall-clock at insert time, kept for debugging
+        //   / UI.
+        // - `origin` is `'local'` for now. When cross-peer conflict resolution lands it
+        //   will hold the originating peer's public key.
         //
         // Intentionally no `FOREIGN KEY` on `file_id`: a version may be
         // recorded by `SyncDirectoryManager` before the corresponding row in
@@ -414,10 +421,9 @@ impl FileDatabase {
         // column) — the `CREATE TABLE` definitions above deliberately have no
         // default so that omitting a value in normal operation is an error.
         //
-        // - `file_versions.size`: backfill to 1 byte; files get their true size
-        //   the next time they are modified.
-        // - `files.deleted` / `files.deleted_at`: backfill to 0 (live, no
-        //   delete time).
+        // - `file_versions.size`: backfill to 1 byte; files get their true size the
+        //   next time they are modified.
+        // - `files.deleted` / `files.deleted_at`: backfill to 0 (live, no delete time).
         // - `tags.deleted`: backfill to 0 (live).
         Self::add_column_if_missing(
             &connection,
@@ -451,7 +457,8 @@ impl FileDatabase {
     ///
     /// Run `alter_sql` (an `ALTER TABLE ... ADD COLUMN`) only if `table` does
     /// not already have `column`. Idempotent: safe to call on every startup.
-    /// Used solely by the temporary hardcoded migration in [`Self::initialize`].
+    /// Used solely by the temporary hardcoded migration in
+    /// [`Self::initialize`].
     fn add_column_if_missing(
         connection: &Connection,
         table: &str,
@@ -736,8 +743,8 @@ impl FileDatabase {
     /// soft-deleted (tombstoned) rows. Reconciliation deliberately advertises
     /// tombstones so that an "absent" relationship can win last-writer-wins
     /// against a peer's stale "present". Unlike tag definitions, a relationship
-    /// carries its whole state here, so the receiver applies it directly with no
-    /// follow-up request.
+    /// carries its whole state here, so the receiver applies it directly with
+    /// no follow-up request.
     pub fn relationship_manifest_entries(
         &self,
     ) -> Result<Vec<RelationshipManifestEntry>, DatabaseError> {
@@ -798,8 +805,8 @@ impl FileDatabase {
     }
 
     /// The full stored definition of a tag as `(name, color, modified_at)`, or
-    /// `None` if the tag is unknown. Used to answer a peer's `TagRequest` with a
-    /// `Change::TagAdded`.
+    /// `None` if the tag is unknown. Used to answer a peer's `TagRequest` with
+    /// a `Change::TagAdded`.
     pub fn tag_definition(
         &self,
         tag_id: TagId,
@@ -864,20 +871,21 @@ impl FileDatabase {
     ///
     /// The result is the fewest leading hex characters of `file_id` that no
     /// other file's id shares. The trick that makes this scale: an id only ever
-    /// needs to be distinguished from its two lexicographic *neighbours* (the id
-    /// immediately before and after it, sorted). If a prefix separates you from
-    /// both neighbours, it separates you from everyone. So this is two indexed
-    /// range lookups against the `files.id` primary-key index — O(log n) — not a
-    /// scan over all files.
+    /// needs to be distinguished from its two lexicographic *neighbours* (the
+    /// id immediately before and after it, sorted). If a prefix separates
+    /// you from both neighbours, it separates you from everyone. So this is
+    /// two indexed range lookups against the `files.id` primary-key index —
+    /// O(log n) — not a scan over all files.
     ///
     /// Ids are stored in canonical simple-hex form (see `FileId`'s `ToSql`), so
     /// lexicographic ordering on the stored strings is a clean hex ordering and
     /// prefixes never straddle a separator.
     ///
-    /// Note: the returned length reflects the database *at call time*. It is not
-    /// stored and not stable across concurrent inserts — a prefix that is unique
-    /// now may become ambiguous if a colliding file is added later. That is the
-    /// intended behaviour (resolution re-checks uniqueness on use).
+    /// Note: the returned length reflects the database *at call time*. It is
+    /// not stored and not stable across concurrent inserts — a prefix that
+    /// is unique now may become ambiguous if a colliding file is added
+    /// later. That is the intended behaviour (resolution re-checks
+    /// uniqueness on use).
     ///
     /// Returns the full id length if the file has no neighbours (e.g. it is the
     /// only file). Returns `MissingFile` if `file_id` is not in `files`.
@@ -956,9 +964,9 @@ impl FileDatabase {
 
     /// Compute the shortest unique prefix of `tag_id` among **all** tags — the
     /// "short id" shown in listings. The tag counterpart of
-    /// [`shorten_file_id`](Self::shorten_file_id); see it for the neighbour-based
-    /// reasoning and the caveats about the length not being stable across
-    /// concurrent inserts.
+    /// [`shorten_file_id`](Self::shorten_file_id); see it for the
+    /// neighbour-based reasoning and the caveats about the length not being
+    /// stable across concurrent inserts.
     ///
     /// Returns `MissingTag` if `tag_id` is not in `tags`.
     pub fn shorten_tag_id(&self, tag_id: TagId) -> Result<usize, DatabaseError> {
@@ -1034,8 +1042,8 @@ impl FileDatabase {
     }
 
     /// Clear a file's soft-delete tombstone (mark it live again). Used when a
-    /// version newer than a local delete arrives (the restore-after-delete case)
-    /// so the previously-tombstoned file becomes visible again.
+    /// version newer than a local delete arrives (the restore-after-delete
+    /// case) so the previously-tombstoned file becomes visible again.
     pub fn restore_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
         self.connection
             .execute(
@@ -1169,8 +1177,8 @@ impl FileDatabase {
     }
 
     /// Update a tag's name with a last-writer-wins guard: the update is applied
-    /// only if `modified_at` is newer than the stored value. See [`add_tag`] for
-    /// the `modified_at` contract.
+    /// only if `modified_at` is newer than the stored value. See [`add_tag`]
+    /// for the `modified_at` contract.
     pub fn update_tag_name(
         &self,
         tag_id: TagId,
@@ -1248,11 +1256,12 @@ impl FileDatabase {
 
     /// Tag a file with the provided tag.
     ///
-    /// `modified_at` is the last-writer-wins timestamp; see [`add_tag`]. This is
-    /// an upsert: if a (possibly tombstoned) row for this `(tag_id, file_id)`
-    /// relationship already exists, it is revived (`deleted = 0`) and stamped —
-    /// but only when `modified_at` is newer than the stored value. Re-tagging is
-    /// therefore idempotent and correctly loses to a newer untag.
+    /// `modified_at` is the last-writer-wins timestamp; see [`add_tag`]. This
+    /// is an upsert: if a (possibly tombstoned) row for this `(tag_id,
+    /// file_id)` relationship already exists, it is revived (`deleted = 0`)
+    /// and stamped — but only when `modified_at` is newer than the stored
+    /// value. Re-tagging is therefore idempotent and correctly loses to a
+    /// newer untag.
     pub fn tag_file(
         &self,
         tag_id: TagId,
@@ -1324,11 +1333,12 @@ impl FileDatabase {
         Ok(())
     }
 
-    /// Shared soft-delete for the two "remove relationship" paths. Marks the row
-    /// `deleted = 1` and stamps `modified_at`, gated by last-writer-wins so a
-    /// stale untag can't override a newer tag. If the relationship was never
-    /// recorded, this is a no-op (there is no row to tombstone; a peer that only
-    /// knows the untag can still learn "absent" once we've seen the tag).
+    /// Shared soft-delete for the two "remove relationship" paths. Marks the
+    /// row `deleted = 1` and stamps `modified_at`, gated by
+    /// last-writer-wins so a stale untag can't override a newer tag. If the
+    /// relationship was never recorded, this is a no-op (there is no row to
+    /// tombstone; a peer that only knows the untag can still learn "absent"
+    /// once we've seen the tag).
     ///
     /// NOTE: Offline untag propagation is only fully correct once the broader
     /// deletion/tombstone design lands — see roadmap. Today the tombstone is
@@ -1427,22 +1437,22 @@ impl FileDatabase {
     /// Search files by a conjunction of [`QueryTerm`]s.
     ///
     /// A file is returned only if it satisfies every term:
-    /// - [`QueryTerm::HasTag`]: it carries *at least one* tag in the set (subtag
-    ///   traversal governed by `subtag_rule`).
+    /// - [`QueryTerm::HasTag`]: it carries *at least one* tag in the set
+    ///   (subtag traversal governed by `subtag_rule`).
     /// - [`QueryTerm::NotTag`]: it carries *none* of the tags in the set (same
     ///   traversal).
     /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
     ///   its logical path contains / does not contain the substring, compared
     ///   case-insensitively.
-    /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: its logical
-    ///   path contains the substring **or** it carries any tag in the set —
-    ///   the "prefix-less" chunk semantics.
+    /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: its logical path
+    ///   contains the substring **or** it carries any tag in the set — the
+    ///   "prefix-less" chunk semantics.
     ///
     /// An empty term list matches every file; an empty tag set inside a term
-    /// matches no tag (so `HasTag([])` matches nothing and `NotTag([])` excludes
-    /// nothing). For [`QueryTerm::AnyMatch`] the substring side still stands
-    /// when the tag set is empty. Composes [`Self::file_ids_for_tag`] and
-    /// [`Self::get_all_files`]; no new SQL.
+    /// matches no tag (so `HasTag([])` matches nothing and `NotTag([])`
+    /// excludes nothing). For [`QueryTerm::AnyMatch`] the substring side
+    /// still stands when the tag set is empty. Composes
+    /// [`Self::file_ids_for_tag`] and [`Self::get_all_files`]; no new SQL.
     pub fn file_ids_for_query(
         &self,
         terms: &[QueryTerm],
@@ -1503,7 +1513,9 @@ impl FileDatabase {
         let has_text_term = terms.iter().any(|term| {
             matches!(
                 term,
-                QueryTerm::LogicalContains(_)
+                QueryTerm::NameContains(_)
+                    | QueryTerm::NotNameContains(_)
+                    | QueryTerm::LogicalContains(_)
                     | QueryTerm::NotLogicalContains(_)
                     | QueryTerm::AnyMatch(_, _)
                     | QueryTerm::NotAnyMatch(_, _),
@@ -1535,8 +1547,11 @@ impl FileDatabase {
                 };
                 for term in terms {
                     let ok = match term {
-                        QueryTerm::LogicalContains(needle) => path.contains(&needle.to_lowercase()),
-                        QueryTerm::NotLogicalContains(needle) => {
+                        QueryTerm::NameContains(needle) | QueryTerm::LogicalContains(needle) => {
+                            path.contains(&needle.to_lowercase())
+                        }
+                        QueryTerm::NotNameContains(needle)
+                        | QueryTerm::NotLogicalContains(needle) => {
                             !path.contains(&needle.to_lowercase())
                         }
                         _ => continue,
@@ -1561,14 +1576,16 @@ impl FileDatabase {
     /// Search *tags* by the same conjunction of [`QueryTerm`]s used for files,
     /// mirroring [`Self::file_ids_for_query`] onto the tag hierarchy:
     ///
-    /// - [`QueryTerm::HasTag`]: the tag must be a subtag of *at least one* tag in
-    ///   the set (subtag traversal governed by `subtag_rule`) — the tag analogue
-    ///   of "a file carries this tag".
-    /// - [`QueryTerm::NotTag`]: the tag must *not* be a subtag of any tag in the
-    ///   set.
-    /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
-    ///   the tag's name contains / does not contain the substring, compared
+    /// - [`QueryTerm::HasTag`]: the tag must be a subtag of *at least one* tag
+    ///   in the set (subtag traversal governed by `subtag_rule`) — the tag
+    ///   analogue of "a file carries this tag".
+    /// - [`QueryTerm::NotTag`]: the tag must *not* be a subtag of any tag in
+    ///   the set.
+    /// - [`QueryTerm::NameContains`] / [`QueryTerm::NotNameContains`]: the
+    ///   tag's name contains / does not contain the substring, compared
     ///   case-insensitively.
+    /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
+    ///   doesn't match.
     /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: the tag's name
     ///   contains the substring **or** the tag is a subtag of any tag in the
     ///   set — the tag analogue of the file-side `Any` semantics.
@@ -1615,17 +1632,24 @@ impl FileDatabase {
         };
 
         for term in terms {
-            if let QueryTerm::NotTag(tag_ids) = term {
-                let excluded = subtags_of_any(tag_ids)?;
-                candidates.retain(|tag_id| !excluded.contains(tag_id));
+            match term {
+                QueryTerm::LogicalContains(..) | QueryTerm::NotLogicalContains(..) => {
+                    candidates.clear();
+                    return Ok(candidates);
+                }
+                QueryTerm::NotTag(tag_ids) => {
+                    let excluded = subtags_of_any(tag_ids)?;
+                    candidates.retain(|tag_id| !excluded.contains(tag_id));
+                }
+                _ => {}
             }
         }
 
         let has_text_term = terms.iter().any(|term| {
             matches!(
                 term,
-                QueryTerm::LogicalContains(_)
-                    | QueryTerm::NotLogicalContains(_)
+                QueryTerm::NameContains(_)
+                    | QueryTerm::NotNameContains(_)
                     | QueryTerm::AnyMatch(_, _)
                     | QueryTerm::NotAnyMatch(_, _),
             )
@@ -1654,8 +1678,8 @@ impl FileDatabase {
                 };
                 for term in terms {
                     let ok = match term {
-                        QueryTerm::LogicalContains(needle) => name.contains(&needle.to_lowercase()),
-                        QueryTerm::NotLogicalContains(needle) => {
+                        QueryTerm::NameContains(needle) => name.contains(&needle.to_lowercase()),
+                        QueryTerm::NotNameContains(needle) => {
                             !name.contains(&needle.to_lowercase())
                         }
                         _ => continue,
@@ -1874,8 +1898,9 @@ impl FileDatabase {
     /// - its id starts with `token` interpreted as a hex id prefix (so a pasted
     ///   partial id still works).
     ///
-    /// Returns all matches (deduplicated); an empty result means nothing matched,
-    /// which callers treat as "matches no tag" rather than an error.
+    /// Returns all matches (deduplicated); an empty result means nothing
+    /// matched, which callers treat as "matches no tag" rather than an
+    /// error.
     pub fn tag_ids_matching_token(&self, token: &str) -> Result<Vec<TagId>, DatabaseError> {
         let mut ids: BTreeSet<TagId> = BTreeSet::new();
 
@@ -1916,7 +1941,8 @@ impl FileDatabase {
         Ok(ids.into_iter().collect())
     }
 
-    /// Get the id of a tag by the name. Excludes soft-deleted (tombstoned) tags.
+    /// Get the id of a tag by the name. Excludes soft-deleted (tombstoned)
+    /// tags.
     pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
         let mut statement = self
             .connection
@@ -1953,8 +1979,8 @@ impl FileDatabase {
         Ok(logical_path)
     }
 
-    /// Get the [`FileInfo`] for a single `file_id` — the single-file counterpart
-    /// of [`Self::get_all_files`].
+    /// Get the [`FileInfo`] for a single `file_id` — the single-file
+    /// counterpart of [`Self::get_all_files`].
     ///
     /// Joins the file to its latest version and computes the "short id" length
     /// with [`Self::shorten_file_id`] (an indexed neighbour lookup, not a full
@@ -2079,9 +2105,9 @@ pub struct SyncDirectoryFile {
     /// root. For a `TagBased` directory this equals the file's logical path;
     /// for a `Universal` directory it is the file's `file_id` (files are stored
     /// under their id on disk). This also serves as the reverse index for
-    /// filesystem events (path -> file_id), so it must always reflect the actual
-    /// on-disk name. It is NOT the value to advertise to peers or show to users;
-    /// for that use the logical path from `FileDatabase`
+    /// filesystem events (path -> file_id), so it must always reflect the
+    /// actual on-disk name. It is NOT the value to advertise to peers or
+    /// show to users; for that use the logical path from `FileDatabase`
     /// (`FileDatabase.files.logical_path`).
     pub physical_path: PhysicalPath,
 }
@@ -2157,10 +2183,11 @@ impl SyncDirectoryDatabase {
         Ok(())
     }
 
-    // pub fn remove_file_by_physical_path(&self, physical_path: impl AsRef<str>) -> Result<(), DatabaseError> {
-    //     self.connection
-    //         .execute("DELETE FROM files WHERE physical_path = ?1", [physical_path.as_ref()])
-    //         .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+    // pub fn remove_file_by_physical_path(&self, physical_path: impl AsRef<str>) ->
+    // Result<(), DatabaseError> {     self.connection
+    //         .execute("DELETE FROM files WHERE physical_path = ?1",
+    // [physical_path.as_ref()])         .map_err(|_|
+    // DatabaseError::FailedToExecuteCommand)?;
     //
     //     Ok(())
     // }

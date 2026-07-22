@@ -16,9 +16,10 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use tagnetd::paths::Paths;
 use tagnetd::transport::Backend;
 
-use crate::runtime::{BridgePaths, RuntimeHandle, StartError};
+use crate::runtime::{RuntimeHandle, StartError};
 
 /// What this process is attached to.
 ///
@@ -71,7 +72,7 @@ fn slot() -> &'static Mutex<Option<Runtime>> {
 ///
 /// Idempotent and safe to call from both the foreground service and the UI.
 /// Returns this device's public key on success.
-pub fn start(configuration_json: &str, paths: BridgePaths) -> Result<String, StartError> {
+pub fn start(configuration_json: &str, paths: Paths) -> Result<String, StartError> {
     crate::logging::init();
 
     let mut guard = slot()

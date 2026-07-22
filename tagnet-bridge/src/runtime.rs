@@ -18,19 +18,16 @@
 //!    joins the thread, so the service `onDestroy` tears everything down
 //!    cleanly.
 
-use std::{
-    path::PathBuf,
-    str::FromStr,
-    sync::mpsc,
-    thread::{self, JoinHandle},
-};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 
-use tagnetd::{
-    RunPaths, ShutdownSignal,
-    configuration::{Configuration, ConfigurationError},
-    identity::Identity,
-    transport::Backend,
-};
+use tagnetd::ShutdownSignal;
+use tagnetd::configuration::{Configuration, ConfigurationError};
+use tagnetd::identity::Identity;
+use tagnetd::paths::Paths;
+use tagnetd::transport::Backend;
 
 /// Why the native runtime could not be started.
 #[derive(Debug)]
@@ -81,29 +78,6 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
-/// The on-disk locations the frontend supplies.
-///
-/// Mirrors [`RunPaths`] but is defined here so the bridge's public surface
-/// does not force callers to name a `tagnet` internal type. On Android both
-/// paths live under app-private storage (`getFilesDir()`), so inotify works
-/// with no storage permission.
-#[derive(Debug, Clone)]
-pub struct BridgePaths {
-    /// Directory holding the databases (app-private on Android).
-    pub data_dir: PathBuf,
-    /// This device's long-lived identity key file.
-    pub identity_file: PathBuf,
-}
-
-impl From<BridgePaths> for RunPaths {
-    fn from(paths: BridgePaths) -> Self {
-        RunPaths {
-            data_dir: paths.data_dir,
-            identity_file: paths.identity_file,
-        }
-    }
-}
-
 /// A running tagnet core hosted on a dedicated thread.
 ///
 /// Holds the [`ShutdownSignal`] used to stop the engine, the join handle for
@@ -132,12 +106,11 @@ impl RuntimeHandle {
     /// generates the ed25519 identity on first launch"), so the frontend does
     /// not need a separate keygen step. An existing identity is never
     /// overwritten.
-    pub fn start(configuration_json: &str, paths: BridgePaths) -> Result<Self, StartError> {
+    pub fn start(configuration_json: &str, paths: Paths) -> Result<Self, StartError> {
         let configuration =
             Configuration::from_str(configuration_json).map_err(StartError::Configuration)?;
-        let run_paths: RunPaths = paths.into();
 
-        let public_key = bootstrap_on_disk_state(&run_paths)?;
+        let public_key = bootstrap_on_disk_state(&paths)?;
 
         let shutdown = ShutdownSignal::new();
 
@@ -149,7 +122,7 @@ impl RuntimeHandle {
         let thread = thread::Builder::new()
             .name("tagnet-runtime".to_owned())
             .spawn(move || {
-                run_thread(configuration, run_paths, thread_shutdown, ready_sender);
+                run_thread(configuration, paths, thread_shutdown, ready_sender);
             })
             .map_err(StartError::Runtime)?;
 
@@ -219,36 +192,39 @@ impl Drop for RuntimeHandle {
 /// generated + persisted only when no key file exists yet (an existing key is
 /// loaded rather than regenerated). On Android both paths live under
 /// app-private storage, so this needs no permissions.
-fn bootstrap_on_disk_state(paths: &RunPaths) -> Result<String, StartError> {
-    std::fs::create_dir_all(&paths.data_dir).map_err(|source| StartError::Bootstrap {
-        path: paths.data_dir.clone(),
+fn bootstrap_on_disk_state(paths: &Paths) -> Result<String, StartError> {
+    std::fs::create_dir_all(paths.data_dir()).map_err(|source| StartError::Bootstrap {
+        path: paths.data_dir().to_path_buf(),
         source,
     })?;
 
-    let identity = if paths.identity_file.exists() {
-        Identity::load(&paths.identity_file).map_err(|source| StartError::Bootstrap {
-            path: paths.identity_file.clone(),
+    let identity = if paths.identity_path().exists() {
+        Identity::load(paths.identity_path()).map_err(|source| StartError::Bootstrap {
+            path: paths.identity_path().to_path_buf(),
             source,
         })?
     } else {
-        if let Some(parent) = paths.identity_file.parent() {
+        if let Some(parent) = paths.identity_path().parent() {
             std::fs::create_dir_all(parent).map_err(|source| StartError::Bootstrap {
                 path: parent.to_path_buf(),
                 source,
             })?;
         }
+
         let identity = Identity::generate();
         identity
-            .save(&paths.identity_file)
+            .save(paths.identity_path())
             .map_err(|source| StartError::Bootstrap {
-                path: paths.identity_file.clone(),
+                path: paths.identity_path().to_path_buf(),
                 source,
             })?;
+
         log::info!(
             "generated device identity at {} (public key {})",
-            paths.identity_file.display(),
+            paths.identity_path().display(),
             identity.public_key()
         );
+
         identity
     };
 
@@ -263,7 +239,7 @@ fn bootstrap_on_disk_state(paths: &RunPaths) -> Result<String, StartError> {
 /// which is where the engine actually does its work until `shutdown` fires.
 fn run_thread(
     configuration: Configuration,
-    run_paths: RunPaths,
+    paths: Paths,
     shutdown: ShutdownSignal,
     ready_sender: mpsc::Sender<Result<Backend, StartError>>,
 ) {
@@ -280,7 +256,7 @@ fn run_thread(
     };
 
     runtime.block_on(async move {
-        let (api, driver) = match tagnetd::run(configuration, run_paths, shutdown).await {
+        let (api, driver) = match tagnetd::run(configuration, paths, shutdown).await {
             Ok(pair) => pair,
             Err(error) => {
                 let _ = ready_sender.send(Err(StartError::Run(error)));

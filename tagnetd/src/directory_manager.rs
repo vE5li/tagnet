@@ -1,24 +1,18 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use notify::{RecursiveMode, Watcher};
-use tagnet_core::{
-    FileId, LogicalPath, PhysicalPath, TagId,
-    state::{Change, ChangeOrigin},
-};
+use tagnet_core::state::{Change, ChangeOrigin};
+use tagnet_core::{FileId, LogicalPath, PhysicalPath, TagId};
 use walkdir::WalkDir;
 
-use crate::{
-    bus::{ContentChange, DaemonMessage, Ingest},
-    configuration::{Configuration, SyncType},
-    database::{DatabaseError, SyncDirectoryDatabase, SyncDirectoryFile},
-    file_bytes::FileBytes,
-    paths::Paths,
-    watcher::{DebouncedEventKind, WatchDispatcher},
-};
+use crate::bus::{ContentChange, DaemonMessage, Ingest};
+use crate::configuration::{Configuration, SyncType};
+use crate::database::{DatabaseError, SyncDirectoryDatabase, SyncDirectoryFile};
+use crate::file_bytes::FileBytes;
+use crate::paths::Paths;
+use crate::watcher::{DebouncedEventKind, WatchDispatcher};
 
 /// True when every tag a sync directory requires is present in `file_tags`,
 /// i.e. the file belongs in that TagBased directory. Mirrors the same-named
@@ -62,7 +56,8 @@ pub enum SyncDirectoryCommand {
     MoveFile {
         file_id: FileId,
         /// The new on-disk location within the target sync directory, already
-        /// resolved from the file's new logical path via `SyncType::physical_for`.
+        /// resolved from the file's new logical path via
+        /// `SyncType::physical_for`.
         physical_path: PhysicalPath,
         // Maybe a bit weird to have it like this? Not sure.
         // We currently need that to check which directory this event was meant for.
@@ -95,8 +90,9 @@ pub enum SyncDirectoryCommand {
     /// source the bytes from, placement cannot complete locally. In that case
     /// `respond_to` receives `true` ("deferred: needs bytes") and the caller is
     /// expected to fetch the bytes over the network (by the file's latest
-    /// catalog version hash) and re-drive placement via `Materialize`. Otherwise
-    /// (placement resolved, or nothing to place) it receives `false`.
+    /// catalog version hash) and re-drive placement via `Materialize`.
+    /// Otherwise (placement resolved, or nothing to place) it receives
+    /// `false`.
     ReconcileTagPlacement {
         file_id: FileId,
         /// The file's logical path, used to derive each TagBased directory's
@@ -105,23 +101,21 @@ pub enum SyncDirectoryCommand {
         /// The file's current tag set (from the main `FileDatabase`), against
         /// which each TagBased directory's tags are matched.
         file_tags: Vec<TagId>,
-        /// `true` if a TagBased directory should hold the file but no local copy
-        /// exists to source the bytes (the caller must fetch); `false` otherwise.
+        /// `true` if a TagBased directory should hold the file but no local
+        /// copy exists to source the bytes (the caller must fetch);
+        /// `false` otherwise.
         respond_to: tokio::sync::oneshot::Sender<bool>,
     },
     /// Read the bytes for `file_id` from whichever sync directory currently
     /// holds it and respond on `respond_to`. Used by peer connection tasks to
     /// serve a pull transfer (and to answer on-demand `FetchRequest`s).
     ///
-    /// The response is `Some((relative_path, content, content_hash))` if at
-    /// least one sync directory has the file, `None` otherwise. The hash is
-    /// recomputed from the bytes (cheap with BLAKE3) rather than trusting the
-    /// per-sync-directory DB.
     /// Resolve `file_id` to the **absolute** on-disk path where its bytes
-    /// currently live in the first sync directory that holds it, without reading
-    /// the content. Responds with `None` if no sync directory has the file.
-    /// Used by `tagnet edit` to open a locally-present file in place (so the
-    /// filesystem watcher picks up the save and propagates it).
+    /// currently live in the first sync directory that holds it, without
+    /// reading the content. Responds with `None` if no sync directory has
+    /// the file. Used by `tagnet edit` to open a locally-present file in
+    /// place (so the filesystem watcher picks up the save and propagates
+    /// it).
     LocalPath {
         file_id: FileId,
         respond_to: tokio::sync::oneshot::Sender<Option<PathBuf>>,
@@ -223,9 +217,9 @@ impl SyncDirectoryManager {
     }
 
     /// Record that the daemon itself just wrote `path`, so the resulting
-    /// watcher event(s) are recognized as self-caused and ignored. `content_hash`
-    /// is the hash of the bytes materialized there (or `None` for a removal or a
-    /// pure rename). See [`SelfWrite`].
+    /// watcher event(s) are recognized as self-caused and ignored.
+    /// `content_hash` is the hash of the bytes materialized there (or
+    /// `None` for a removal or a pure rename). See [`SelfWrite`].
     fn record_self_write(&self, path: PathBuf, content_hash: Option<String>) {
         self.self_writes
             .borrow_mut()
@@ -500,9 +494,10 @@ impl SyncDirectoryManager {
     /// The size is read here, at hash time, since the file is already being
     /// opened/streamed and its exact byte length is known.
     ///
-    /// `FileToCopy` is the safe default (the source is left in place). Producers
-    /// whose ingestion should *consume* the source (e.g. a Universal upload)
-    /// convert it to [`FileBytes::FileToMove`] via [`FileBytes::into_move`].
+    /// `FileToCopy` is the safe default (the source is left in place).
+    /// Producers whose ingestion should *consume* the source (e.g. a
+    /// Universal upload) convert it to [`FileBytes::FileToMove`] via
+    /// [`FileBytes::into_move`].
     async fn get_file_content(
         &self,
         path: impl AsRef<Path>,
@@ -609,8 +604,8 @@ impl SyncDirectoryManager {
                 panic!("Walkdir returned a path outside of the sync directory");
             };
 
-            // FIX: Maybe this should not use to_string_lossy but rather to utf8 since a valid uuid
-            // will always ve valid utf8?
+            // FIX: Maybe this should not use to_string_lossy but rather to utf8 since a
+            // valid uuid will always ve valid utf8?
             if let Some(file_id) = FileId::from_string(&relative_path.to_string_lossy()) {
                 match sync_directory.database.get_file(file_id) {
                     // File is already tracked.
@@ -814,8 +809,9 @@ impl SyncDirectoryManager {
         }
     }
 
-    /// Re-run tag-based placement for `file_id` against its current `file_tags`.
-    /// See [`SyncDirectoryCommand::ReconcileTagPlacement`] for the rationale.
+    /// Re-run tag-based placement for `file_id` against its current
+    /// `file_tags`. See [`SyncDirectoryCommand::ReconcileTagPlacement`] for
+    /// the rationale.
     ///
     /// For each TagBased directory: if it should hold the file (its tags are a
     /// subset of `file_tags`) but does not, create it there sourcing the bytes
@@ -862,8 +858,7 @@ impl SyncDirectoryManager {
 
                     let Some(source_path) = &source_path else {
                         log::debug!(
-                            "ReconcileTagPlacement: no source copy of {} yet; \
-                             deferring placement into {} (caller will fetch)",
+                            "ReconcileTagPlacement: no source copy of {} yet; deferring placement into {} (caller will fetch)",
                             file_id.to_string(),
                             sync_directory.path.to_string_lossy()
                         );
@@ -906,6 +901,7 @@ impl SyncDirectoryManager {
                         SyncDirectoryError::FailedAddingFile
                     })?;
 
+                    // TODO: Handle naming collisions. Should append some suffix perhaps (?)
                     sync_directory
                         .database
                         .add_file(file_id, &physical_path)
@@ -957,14 +953,17 @@ impl SyncDirectoryManager {
             let Ok(file) = sync_directory.database.get_file(file_id) else {
                 continue;
             };
+
             let path = match &sync_directory.sync_type {
                 SyncType::Universal { .. } => sync_directory.path.join(file_id.to_string()),
                 SyncType::TagBased { .. } => sync_directory.path.join(file.physical_path.as_str()),
             };
+
             if path.exists() {
                 return Some(path);
             }
         }
+
         None
     }
 
@@ -1215,8 +1214,8 @@ impl SyncDirectoryManager {
                     }
                 }
 
-                // If the removed file was in a directory that is now empty, we want to remove the
-                // directory as well.
+                // If the removed file was in a directory that is now empty, we want to remove
+                // the directory as well.
                 if let SyncType::TagBased { .. } = &sync_directory.sync_type
                     && let Some(directory) = PathBuf::from(file.physical_path.as_str()).parent()
                 {
@@ -1415,8 +1414,7 @@ impl SyncDirectoryManager {
                         // as a delete-here + add-there. For now, ignore rather
                         // than crash.
                         log::warn!(
-                            "Ignoring move of {} out to another location (cross-directory \
-                             moves not yet handled)",
+                            "Ignoring move of {} out to another location (cross-directory moves not yet handled)",
                             from.to_string_lossy()
                         );
                         return Ok(());
@@ -1593,12 +1591,13 @@ impl SyncDirectoryManager {
     /// `run_initial_sync` to decide whether an on-disk file changed while the
     /// daemon was offline; it is dropped once the initial sync finishes.
     /// Shutdown-safety invariant: this loop is cancelled abruptly on shutdown
-    /// (`handle_sync_directories` drops the manager when its `CancellationToken`
-    /// fires, which runs `WatchDispatcher::drop` to stop the watcher). Because
-    /// cancellation can only interrupt this future at an `.await` point, and the
-    /// only `.await`s in this loop are the two `recv()` calls in the `select!`
-    /// below, a shutdown can only ever land *between* whole events — never
-    /// midway through `handle_command`/`handle_event`. Those handlers are fully
+    /// (`handle_sync_directories` drops the manager when its
+    /// `CancellationToken` fires, which runs `WatchDispatcher::drop` to
+    /// stop the watcher). Because cancellation can only interrupt this
+    /// future at an `.await` point, and the only `.await`s in this loop are
+    /// the two `recv()` calls in the `select!` below, a shutdown can only
+    /// ever land *between* whole events — never midway through
+    /// `handle_command`/`handle_event`. Those handlers are fully
     /// synchronous today, so each one runs to completion atomically.
     ///
     /// DANGER: do not introduce an `.await` inside `handle_command`,
@@ -1644,10 +1643,10 @@ impl SyncDirectoryManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::configuration::{Configuration, SyncDirectory};
-
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A unique temp directory for a test, created eagerly.
     fn temp_dir(label: &str) -> PathBuf {
@@ -1686,7 +1685,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
         };
-        let paths = Paths::new(data_dir.to_path_buf(), data_dir.join("identity"));
+        let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         SyncDirectoryManager::new(configuration, &paths, change_sender, command_receiver).await
@@ -1813,8 +1812,8 @@ mod tests {
         );
     }
 
-    /// `ChangeFile` carrying a `FileToCopy` overwrites the existing bytes at the
-    /// file's on-disk location.
+    /// `ChangeFile` carrying a `FileToCopy` overwrites the existing bytes at
+    /// the file's on-disk location.
     #[tokio::test]
     async fn change_file_overwrites_destination() {
         let data_dir = temp_dir("change-data");
@@ -1845,11 +1844,12 @@ mod tests {
         assert!(source.exists(), "FileToCopy must leave the source in place");
     }
 
-    /// Regression: materializing a peer-received file into a Universal directory
-    /// arrives at the watcher as `Move { from: None, to }` (a rename in from the
-    /// daemon temp dir). It must NOT be re-ingested as a new upload — doing so
-    /// minted a duplicate file whose logical path was the real file's `file_id`
-    /// and looped. A move-in of an already-tracked path is ignored.
+    /// Regression: materializing a peer-received file into a Universal
+    /// directory arrives at the watcher as `Move { from: None, to }` (a
+    /// rename in from the daemon temp dir). It must NOT be re-ingested as a
+    /// new upload — doing so minted a duplicate file whose logical path was
+    /// the real file's `file_id` and looped. A move-in of an
+    /// already-tracked path is ignored.
     #[tokio::test]
     async fn move_in_of_tracked_file_is_not_reingested() {
         let data_dir = temp_dir("reingest-data");
@@ -1867,7 +1867,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
         };
-        let paths = Paths::new(data_dir.to_path_buf(), data_dir.join("identity"));
+        let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, mut change_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut manager =
@@ -1914,8 +1914,8 @@ mod tests {
         );
     }
 
-    /// Build a single-Universal-directory manager, returning the manager and its
-    /// change receiver so a test can assert on emitted changes.
+    /// Build a single-Universal-directory manager, returning the manager and
+    /// its change receiver so a test can assert on emitted changes.
     async fn universal_manager_with_receiver(
         data_dir: &Path,
         sync_dir: &Path,
@@ -1934,7 +1934,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
         };
-        let paths = Paths::new(data_dir.to_path_buf(), data_dir.join("identity"));
+        let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let manager =
@@ -1997,8 +1997,8 @@ mod tests {
     }
 
     /// A `Modify` whose on-disk content differs from what the daemon last wrote
-    /// is a genuine user edit and must be propagated — the self-write record for
-    /// a stale hash must not swallow it.
+    /// is a genuine user edit and must be propagated — the self-write record
+    /// for a stale hash must not swallow it.
     #[tokio::test]
     async fn user_edit_after_self_write_is_propagated() {
         let data_dir = temp_dir("useredit-data");
@@ -2100,7 +2100,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
         };
-        let paths = Paths::new(data_dir.to_path_buf(), data_dir.join("identity"));
+        let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         SyncDirectoryManager::new(configuration, &paths, change_sender, command_receiver).await
@@ -2166,12 +2166,12 @@ mod tests {
         );
     }
 
-    /// Regression for the tag-vs-content reconciliation race (STREAMING_FOLLOWUPS
-    /// §1.3): a peer transfer materialized a file before its tags were applied,
-    /// so it landed only in the Universal directory (which has no tag filter).
-    /// When the tags arrive, `ReconcileTagPlacement` must place the file into the
-    /// now-matching TagBased directory, sourcing the bytes from the Universal
-    /// copy.
+    /// Regression for the tag-vs-content reconciliation race
+    /// (STREAMING_FOLLOWUPS §1.3): a peer transfer materialized a file
+    /// before its tags were applied, so it landed only in the Universal
+    /// directory (which has no tag filter). When the tags arrive,
+    /// `ReconcileTagPlacement` must place the file into the now-matching
+    /// TagBased directory, sourcing the bytes from the Universal copy.
     #[tokio::test]
     async fn reconcile_places_file_into_newly_matching_tag_directory() {
         let data_dir = temp_dir("reconcile-add-data");

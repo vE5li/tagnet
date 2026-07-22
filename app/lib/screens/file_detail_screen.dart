@@ -336,6 +336,11 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
           dense: true,
         ),
         PropertyTile(
+          label: 'Size',
+          value: _formatSize(file.size.toInt()),
+          dense: true,
+        ),
+        PropertyTile(
           label: 'File id',
           value: file.fileId,
           monospace: true,
@@ -349,6 +354,22 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         ),
       ],
     );
+  }
+
+  /// Format a byte count as a human-readable size (binary units: KiB, MiB, …).
+  /// Bytes are shown as a plain count; larger sizes use one decimal place.
+  static String _formatSize(int bytes) {
+    if (bytes < 1024) {
+      return '$bytes B';
+    }
+    const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    var value = bytes / 1024;
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return '${value.toStringAsFixed(1)} ${units[unit]}';
   }
 
   /// The file's inline preview, or a placeholder if no local copy is present.

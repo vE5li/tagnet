@@ -3,17 +3,13 @@
 //! This is the thin layer `flutter_rust_bridge` generates Dart bindings for. It
 //! deliberately adds **no** business logic: it owns a [`RuntimeHandle`] and
 //! forwards every call to the section-6 [`Backend`], which forwards to the
-//! section-5 [`Api`](tagnetd::api::Api). The Dart UI holds one [`TagnetApp`] and
-//! never learns which transport backs it.
+//! section-5 [`Api`](tagnetd::api::Api). The Dart UI holds one [`TagnetApp`]
+//! and never learns which transport backs it.
 //!
 //! The `#[flutter_rust_bridge::frb]` annotations are applied only when the
 //! `flutter_rust_bridge` feature is enabled (via `cfg_attr`), so the crate
 //! still compiles — and `cargo check` still passes — without the generator's
 //! dependency present.
-
-use tokio::sync::Mutex;
-
-use tagnetd::transport::{Backend, EventStream, TransportBackend};
 
 // Re-exported (not just `use`d) so the types appearing in this module's
 // `#[frb]`-annotated signatures are reachable via `crate::api::*` — which is
@@ -21,12 +17,13 @@ use tagnetd::transport::{Backend, EventStream, TransportBackend};
 // `frb_generated.rs`. A plain private `use` would not be visible through that
 // glob and the generated code fails to compile.
 pub use tagnet_core::{FileId, FileInfo, TagId};
-pub use tagnetd::{
-    api::{ApiError, ApiEvent},
-    database::{SubtagRule, Tag},
-};
+pub use tagnetd::api::{ApiError, ApiEvent};
+pub use tagnetd::database::{SubtagRule, Tag};
+use tagnetd::paths::Paths;
+use tagnetd::transport::{Backend, EventStream, TransportBackend};
+use tokio::sync::Mutex;
 
-use crate::runtime::{BridgePaths, StartError};
+use crate::runtime::StartError;
 
 /// A file flattened into primitive fields for the Dart UI.
 ///
@@ -68,7 +65,8 @@ impl From<FileInfo> for FileEntry {
 /// `SubtagRule` is defined in `tagnetd` (a foreign crate), so frb cannot see
 /// its variants to generate an enum directly; the `frb(mirror(...))` attribute
 /// re-declares the same shape here and tells frb to treat the foreign type as
-/// this enum. The variants MUST stay in sync with `tagnetd::database::SubtagRule`.
+/// this enum. The variants MUST stay in sync with
+/// `tagnetd::database::SubtagRule`.
 ///
 /// Semantics (see `FileDatabase::file_ids_for_tag`):
 ///   * `Include` — recurse into subtags (files carrying this tag *or* any of
@@ -139,13 +137,7 @@ impl TagnetApp {
         data_dir: String,
         identity_file: String,
     ) -> Result<TagnetApp, StartError> {
-        crate::service::start(
-            &configuration_json,
-            BridgePaths {
-                data_dir: data_dir.into(),
-                identity_file: identity_file.into(),
-            },
-        )?;
+        crate::service::start(&configuration_json, Paths::new(data_dir, identity_file))?;
 
         Ok(TagnetApp { _private: () })
     }
@@ -318,8 +310,8 @@ impl TagnetApp {
         })
     }
 
-    /// Get a single file's flattened [`FileEntry`] by id string (a full or short
-    /// id prefix). Errors `NotFound` if unknown.
+    /// Get a single file's flattened [`FileEntry`] by id string (a full or
+    /// short id prefix). Errors `NotFound` if unknown.
     pub async fn get_file_entry(&self, file_id: String) -> Result<FileEntry, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
@@ -377,9 +369,10 @@ impl TagnetApp {
 
     /// Upload a file from a path on disk; returns the freshly-minted id.
     ///
-    /// The bytes are streamed (hashed and then served on demand), never buffered
-    /// whole. `path_name` is the file's logical identity; `path` is where the
-    /// bytes currently live (e.g. the shared-file path the platform hands us).
+    /// The bytes are streamed (hashed and then served on demand), never
+    /// buffered whole. `path_name` is the file's logical identity; `path`
+    /// is where the bytes currently live (e.g. the shared-file path the
+    /// platform hands us).
     pub async fn upload_file(
         &self,
         path: String,

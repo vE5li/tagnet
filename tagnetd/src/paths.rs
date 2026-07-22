@@ -47,14 +47,14 @@ impl Paths {
     }
 
     /// The main `FileDatabase` shared across the daemon.
-    pub fn main_db_path(&self) -> PathBuf {
+    pub(crate) fn main_db_path(&self) -> PathBuf {
         self.data_dir.join("main.db")
     }
 
     /// The per-sync-directory `SyncDirectoryDatabase`, named after the
     /// directory it tracks (e.g. a directory `testcloud` maps to
     /// `testcloud.db`).
-    pub fn sync_directory_db_path(&self, sync_directory: &Path) -> PathBuf {
+    pub(crate) fn sync_directory_db_path(&self, sync_directory: &Path) -> PathBuf {
         let name = sync_directory
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -66,23 +66,25 @@ impl Paths {
     /// (`fetch_file`).
     ///
     /// A completed fetch materializes its bytes here and hands the caller the
-    /// path with **move semantics**: the caller (the local CLI or the in-process
-    /// UI, both co-located with the daemon and sharing this filesystem) must
-    /// consume the file by renaming it into place or deleting it. If a caller
-    /// crashes before consuming, the file is orphaned; [`Self::clean_fetch_temp_dir`]
-    /// sweeps such leftovers on daemon start.
+    /// path with **move semantics**: the caller (the local CLI or the
+    /// in-process UI, both co-located with the daemon and sharing this
+    /// filesystem) must consume the file by renaming it into place or
+    /// deleting it. If a caller crashes before consuming, the file is
+    /// orphaned; [`Self::clean_fetch_temp_dir`] sweeps such leftovers on
+    /// daemon start.
     ///
-    /// It lives under `data_dir` (rather than the system temp dir) so the daemon
-    /// owns and can clean it, and so a fetch temp and a download destination
-    /// under the same data root tend to share a filesystem (cheap rename).
-    pub fn fetch_temp_dir(&self) -> PathBuf {
+    /// It lives under `data_dir` (rather than the system temp dir) so the
+    /// daemon owns and can clean it, and so a fetch temp and a download
+    /// destination under the same data root tend to share a filesystem
+    /// (cheap rename).
+    pub(crate) fn fetch_temp_dir(&self) -> PathBuf {
         self.data_dir.join("fetch-temp")
     }
 
     /// Remove any orphaned files left in the fetch-temp directory by callers
     /// that crashed before consuming their fetched file, then ensure the
     /// directory exists. Best-effort: called on daemon start.
-    pub async fn clean_fetch_temp_dir(&self) -> std::io::Result<()> {
+    pub(crate) async fn clean_fetch_temp_dir(&self) -> std::io::Result<()> {
         let dir = self.fetch_temp_dir();
         // Remove the whole directory (clearing any orphans) and recreate it.
         match tokio::fs::remove_dir_all(&dir).await {
@@ -114,7 +116,8 @@ impl Paths {
 /// here.
 ///
 /// Callers that genuinely need a different location (tests, a non-systemd
-/// launch) pass an explicit path to [`serve_control`](crate::control::serve_control)
+/// launch) pass an explicit path to
+/// [`serve_control`](crate::control::serve_control)
 /// / [`IpcClientBackend::connect`](crate::control::IpcClientBackend::connect)
 /// and the CLI `--socket` flag, rather than relying on discovery here.
 pub const CONTROL_SOCKET_PATH: &str = "/run/tagnet/tagnet.sock";

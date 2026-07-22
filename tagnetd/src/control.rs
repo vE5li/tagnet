@@ -34,40 +34,33 @@
 //! ## Two halves
 //!
 //! - [`serve_control`] is the **daemon side**: accepts connections, decodes
-//!   [`ControlRequest`]s, dispatches them to the in-process [`Api`], and streams
-//!   [`ApiEvent`]s back as [`ControlFrame::Event`].
+//!   [`ControlRequest`]s, dispatches them to the in-process [`Api`], and
+//!   streams [`ApiEvent`]s back as [`ControlFrame::Event`].
 //! - [`IpcClientBackend`] is the **client side** (portability plan section 6's
 //!   IPC-client backend): it connects to the socket, serialises API calls, and
 //!   returns results/events. It implements [`TransportBackend`], so the Dart UI
-//!   (via `flutter_rust_bridge`) and the `tagnet` CLI talk to it exactly as they
-//!   would the in-process backend.
+//!   (via `flutter_rust_bridge`) and the `tagnet` CLI talk to it exactly as
+//!   they would the in-process backend.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tagnet_core::{FileId, FileInfo, TagId};
-use tokio::{
-    net::{UnixListener, UnixStream},
-    sync::{Mutex, mpsc, oneshot},
-};
-use tokio_tungstenite::{
-    WebSocketStream, tungstenite::client::IntoClientRequest, tungstenite::protocol::Message,
-};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    api::{Api, ApiError, ApiEvent, QueryResult},
-    database::{SubtagRule, Tag},
-    transport::{EventStream, TransportBackend},
-};
+use crate::api::{Api, ApiError, ApiEvent, QueryResult};
+use crate::database::{SubtagRule, Tag};
+use crate::transport::{EventStream, TransportBackend};
 
 // --- Wire protocol (plan 5.3/5.4/5.5 over the control socket) ----------------
 
@@ -235,9 +228,10 @@ pub enum ControlResponse {
 
 /// Every control-socket message, in either direction.
 ///
-/// This is the control counterpart to the peer [`Frame`](tagnet_core::state::Frame):
-/// same WebSocket text framing, disjoint message set. `Request`/`Response`
-/// carry a correlation `id`; `Event` is unsolicited (pushed after `Subscribe`).
+/// This is the control counterpart to the peer
+/// [`Frame`](tagnet_core::state::Frame): same WebSocket text framing, disjoint
+/// message set. `Request`/`Response` carry a correlation `id`; `Event` is
+/// unsolicited (pushed after `Subscribe`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlFrame {
     /// Client -> daemon: an API call tagged with a per-connection request id.
@@ -505,8 +499,8 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
 /// read-only handle) and writes enqueue a `Change` and return immediately.
 /// `FetchFile` and `LocalPathForFile` are genuinely async (a channel round-trip
 /// into the daemon), so this function is `async`. Nothing holds a
-/// `&FileDatabase` across an `.await`. `Subscribe` mutates the caller's `events`
-/// slot.
+/// `&FileDatabase` across an `.await`. `Subscribe` mutates the caller's
+/// `events` slot.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     api: &Api,
@@ -706,13 +700,13 @@ async fn send_control(
 /// A thin embedded Rust client that connects to the daemon's control socket,
 /// serialises [`TransportBackend`] calls into [`ControlRequest`]s, and awaits
 /// the matching [`ControlResponse`]. It is the Linux-daemon counterpart to
-/// `InProcessBackend`; the Dart UI (and the `tagnet` CLI) never learn which they
-/// hold.
+/// `InProcessBackend`; the Dart UI (and the `tagnet` CLI) never learn which
+/// they hold.
 ///
-/// A single background reader task owns the socket's read half and demultiplexes
-/// inbound frames: [`ControlFrame::Response`]s are matched to waiters by `id`;
-/// [`ControlFrame::Event`]s are pushed onto a broadcast channel that
-/// [`subscribe`](TransportBackend::subscribe) taps.
+/// A single background reader task owns the socket's read half and
+/// demultiplexes inbound frames: [`ControlFrame::Response`]s are matched to
+/// waiters by `id`; [`ControlFrame::Event`]s are pushed onto a broadcast
+/// channel that [`subscribe`](TransportBackend::subscribe) taps.
 #[derive(Clone)]
 pub struct IpcClientBackend {
     inner: Arc<IpcClientInner>,

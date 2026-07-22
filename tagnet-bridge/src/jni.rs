@@ -11,13 +11,10 @@
 
 #![cfg(target_os = "android")]
 
-use jni::{
-    JNIEnv,
-    objects::{JClass, JString},
-    sys::jstring,
-};
-
-use crate::runtime::BridgePaths;
+use jni::JNIEnv;
+use jni::objects::{JClass, JString};
+use jni::sys::jstring;
+use tagnetd::paths::Paths;
 
 /// `TagnetService.nativeStart(dataDir, identityFile, configJson): String?`
 ///
@@ -44,13 +41,7 @@ pub extern "system" fn Java_com_example_tagnet_1app_TagnetService_nativeStart<'l
         None => return std::ptr::null_mut(),
     };
 
-    match crate::service::start(
-        &config_json,
-        BridgePaths {
-            data_dir: data_dir.into(),
-            identity_file: identity_file.into(),
-        },
-    ) {
+    match crate::service::start(&config_json, Paths::new(data_dir, identity_file)) {
         Ok(public_key) => match env.new_string(&public_key) {
             Ok(java_string) => java_string.into_raw(),
             Err(error) => {

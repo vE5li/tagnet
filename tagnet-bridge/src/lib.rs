@@ -7,16 +7,16 @@
 //!
 //! It adds no business logic. Its whole job is lifecycle + transport glue:
 //!
-//! - [`runtime`] — build the tokio runtime by hand on a dedicated thread
-//!   (never `#[tokio::main]`) and manage its start/stop lifecycle
+//! - [`runtime`] — build the tokio runtime by hand on a dedicated thread (never
+//!   `#[tokio::main]`) and manage its start/stop lifecycle
 //!   ([`RuntimeHandle`](runtime::RuntimeHandle)).
 //! - [`service`] — a process-global runtime owned by the Android foreground
 //!   service, so sync survives the UI closing.
 //! - [`logging`] — route the core's `log` output to logcat on Android.
 //! - [`api`] — the Dart-facing facade ([`TagnetApp`](api::TagnetApp)) that
 //!   `flutter_rust_bridge` generates bindings for.
-//! - `jni` (Android only) — entry points the Kotlin service calls to
-//!   start/stop the process-global runtime.
+//! - `jni` (Android only) — entry points the Kotlin service calls to start/stop
+//!   the process-global runtime.
 //!
 //! ## Generated bindings
 //!

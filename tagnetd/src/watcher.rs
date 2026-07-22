@@ -1,17 +1,11 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub use notify;
-use notify::{
-    Event, EventKind, RecommendedWatcher, Watcher,
-    event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
-};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::{Event, EventKind, RecommendedWatcher, Watcher};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DebouncedEventKind {
@@ -101,8 +95,8 @@ impl Debouncer {
 
         // println!("RAW: {:?}", event);
 
-        // NOTE: This code assumes that events will not be bundled. E.g. two create events being
-        // combined into a single event with multiple paths.
+        // NOTE: This code assumes that events will not be bundled. E.g. two create
+        // events being combined into a single event with multiple paths.
         match event.kind {
             EventKind::Create(create_kind) => {
                 // We don't track the creation/deletion of directories. Directories are only
@@ -206,9 +200,9 @@ impl Debouncer {
             }
 
             // Try to find the pattern that Vim/Neovim create when editing files.
-            // The editor will rename the original file with a suffix, create a new file with
-            // the new content, and delete the original file. For us, this should just be a
-            // `Modify`.
+            // The editor will rename the original file with a suffix, create a new file
+            // with the new content, and delete the original file. For us, this
+            // should just be a `Modify`.
             //
             // TODO: Maybe this matching here is too eager and might cause issues?
             if let DebouncedEventKind::Remove { file_name, .. } = &new_event
@@ -251,8 +245,9 @@ impl Debouncer {
             // Merge multiple moves.
             // This happens when renaming a file withing the synced directory.
             //
-            // NOTE: This code relies on the fact that the `Move` with `from` and `to` is emitted
-            // after the single `from` and `to` events. It also assumes that there are no events in-between and that `from` is sent before `to`.
+            // NOTE: This code relies on the fact that the `Move` with `from` and `to` is
+            // emitted after the single `from` and `to` events. It also assumes
+            // that there are no events in-between and that `from` is sent before `to`.
             if let DebouncedEventKind::Move { from, to } = &new_event
                 && let Some(from) = from
                 && let Some(to) = to

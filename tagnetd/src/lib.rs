@@ -13,44 +13,49 @@
 //! - a [`RunPaths`] describing where the data directory and identity key live,
 //! - a [`ShutdownSignal`] used to stop the runtime cleanly.
 
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
-
-use tagnet_core::{
-    FileId, LogicalPath, PhysicalPath, TagId, TransferId,
-    state::{
-        Change, ChangeOrigin, Frame, ManifestEntry, RelationshipManifestEntry, Sync as SyncMessage,
-        TagManifestEntry,
-    },
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use tagnet_core::state::{
+    Change, ChangeOrigin, Frame, ManifestEntry, RelationshipManifestEntry, Sync as SyncMessage,
+    TagManifestEntry,
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{
-        RwLock,
-        mpsc::{UnboundedReceiver, UnboundedSender},
-    },
-};
-use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Message};
+use tagnet_core::{FileId, LogicalPath, PhysicalPath, TagId, TransferId};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    bus::{ContentChange, DaemonMessage, Ingest},
-    configuration::{Configuration, Peer, RuntimeConfiguration, SyncType},
-    database::FileDatabase,
-    directory_manager::{SyncDirectoryCommand, SyncDirectoryManager},
-    fetch::PendingFetches,
-    file_bytes::FileBytes,
-    identity::{HandshakeMessage, Identity},
-    paths::Paths,
-    transfer::{ReceiveOutcome, TransferMessage, spawn_receiver, spawn_sender},
-};
+use crate::bus::{ContentChange, DaemonMessage, Ingest};
+use crate::configuration::{Configuration, Peer, RuntimeConfiguration, SyncType};
+use crate::database::FileDatabase;
+use crate::directory_manager::{SyncDirectoryCommand, SyncDirectoryManager};
+use crate::fetch::PendingFetches;
+use crate::file_bytes::FileBytes;
+use crate::identity::{HandshakeMessage, Identity};
+use crate::paths::Paths;
+use crate::transfer::{ReceiveOutcome, TransferMessage, spawn_receiver, spawn_sender};
+
+pub mod api;
+pub mod bus;
+pub mod configuration;
+pub mod control;
+pub mod database;
+pub mod directory_manager;
+pub mod fetch;
+pub mod file_bytes;
+pub mod identity;
+pub mod paths;
+pub mod transfer;
+pub mod transport;
+pub mod watcher;
 
 /// A resolved sync-directory destination for a content-bearing change, plus how
 /// that directory should be told to place the bytes. Produced by
@@ -108,39 +113,6 @@ impl ContentTarget {
                 sync_directory_path,
             },
         }
-    }
-}
-
-pub mod api;
-pub mod bus;
-pub mod configuration;
-pub mod control;
-pub mod database;
-pub mod directory_manager;
-pub mod fetch;
-pub mod file_bytes;
-pub mod identity;
-pub mod paths;
-pub mod transfer;
-pub mod transport;
-pub mod watcher;
-
-/// On-disk locations a caller must supply to [`run`].
-///
-/// `data_dir` holds the databases; `identity_file` is this machine's
-/// long-lived identity key. Kept as a small owned struct (rather than reading
-/// the environment inside the library) so every frontend can decide where
-/// these live: the desktop binary reads env vars, Android passes
-/// `getFilesDir()`.
-#[derive(Debug, Clone)]
-pub struct RunPaths {
-    pub data_dir: PathBuf,
-    pub identity_file: PathBuf,
-}
-
-impl From<RunPaths> for Paths {
-    fn from(run_paths: RunPaths) -> Self {
-        Paths::new(run_paths.data_dir, run_paths.identity_file)
     }
 }
 
@@ -234,6 +206,62 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// Enqueue a `Change::TagAdded` for every tag declared in the configuration, so
+/// their definitions are guaranteed to exist before any tagging/reconciliation
+/// runs. Called from [`run`] before `handle_changes` starts draining the bus.
+/// Best-effort per tag: an empty name is skipped (the DB rejects it anyway) and
+/// a closed channel is logged.
+///
+/// `modified_at` stamped on config-declared tag definitions. Deliberately the
+/// lowest possible value so a declaration acts as a last-writer-wins *floor*:
+/// `add_tag`'s guard (`excluded.modified_at > tags.modified_at`) means any real
+/// edit — always stamped with a positive wall-clock `now_millis()` — wins, and
+/// a re-declared tag on the next boot never clobbers a rename/recolor made in
+/// between. See [`TagDeclaration`](configuration::TagDeclaration).
+fn enqueue_declared_tags(
+    change_sender: &UnboundedSender<DaemonMessage>,
+    configuration: &Configuration,
+) {
+    const DECLARED_TAG_MODIFIED_AT: i64 = i64::MIN;
+
+    for tag in &configuration.tags {
+        if tag.name.trim().is_empty() {
+            log::warn!(
+                "Skipping config tag declaration {} with empty name",
+                tag.id.to_string()
+            );
+            continue;
+        }
+
+        // Normalize an empty color to the same default the API uses, so a
+        // declared tag renders consistently with a UI-created one.
+        let color = if tag.color.trim().is_empty() {
+            "#F44336".to_owned()
+        } else {
+            tag.color.clone()
+        };
+
+        let change = Change::TagAdded {
+            tag_id: tag.id,
+            tag_name: tag.name.clone(),
+            color,
+            metadata: None,
+            modified_at: DECLARED_TAG_MODIFIED_AT,
+        };
+        let change_origin = ChangeOrigin::Local {
+            directory_path: std::path::PathBuf::new(),
+        };
+
+        if let Err(error) = change_sender.send(DaemonMessage::change(change, change_origin)) {
+            log::error!(
+                "Failed to enqueue declared tag {} ({}): {error}",
+                tag.name,
+                tag.id.to_string()
+            );
+        }
+    }
+}
+
 /// Start the tagnet sync engine, returning a UI-facing [`Api`](api::Api)
 /// handle alongside the runtime driver future.
 ///
@@ -252,63 +280,9 @@ impl std::error::Error for RunError {}
 /// Every frontend (desktop binary, Android in-process backend, host harness)
 /// uses this: the ones that do not need the [`Api`](api::Api) simply await the
 /// driver and drop the handle.
-/// `modified_at` stamped on config-declared tag definitions. Deliberately the
-/// lowest possible value so a declaration acts as a last-writer-wins *floor*:
-/// `add_tag`'s guard (`excluded.modified_at > tags.modified_at`) means any real
-/// edit — always stamped with a positive wall-clock `now_millis()` — wins, and
-/// a re-declared tag on the next boot never clobbers a rename/recolor made in
-/// between. See [`TagDeclaration`](configuration::TagDeclaration).
-const DECLARED_TAG_MODIFIED_AT: i64 = i64::MIN;
-
-/// Enqueue a `Change::TagAdded` for every tag declared in the configuration, so
-/// their definitions are guaranteed to exist before any tagging/reconciliation
-/// runs. Called from [`run`] before `handle_changes` starts draining the bus.
-/// Best-effort per tag: an empty name is skipped (the DB rejects it anyway) and
-/// a closed channel is logged.
-fn enqueue_declared_tags(
-    change_sender: &UnboundedSender<DaemonMessage>,
-    configuration: &Configuration,
-) {
-    for tag in &configuration.tags {
-        if tag.name.trim().is_empty() {
-            log::warn!(
-                "Skipping config tag declaration {} with empty name",
-                tag.id.to_string()
-            );
-            continue;
-        }
-        // Normalize an empty color to the same default the API uses, so a
-        // declared tag renders consistently with a UI-created one.
-        let color = if tag.color.trim().is_empty() {
-            "#F44336".to_owned()
-        } else {
-            tag.color.clone()
-        };
-        let change = Change::TagAdded {
-            tag_id: tag.id,
-            tag_name: tag.name.clone(),
-            color,
-            metadata: None,
-            modified_at: DECLARED_TAG_MODIFIED_AT,
-        };
-        if let Err(error) = change_sender.send(DaemonMessage::change(
-            change,
-            ChangeOrigin::Local {
-                directory_path: std::path::PathBuf::new(),
-            },
-        )) {
-            log::error!(
-                "Failed to enqueue declared tag {} ({}): {error}",
-                tag.name,
-                tag.id.to_string()
-            );
-        }
-    }
-}
-
 pub async fn run(
     configuration: Configuration,
-    paths: RunPaths,
+    paths: Paths,
     shutdown: ShutdownSignal,
 ) -> Result<
     (
@@ -317,8 +291,6 @@ pub async fn run(
     ),
     RunError,
 > {
-    let paths: Paths = paths.into();
-
     let runtime_configuration = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
 
     // Shared table of in-flight on-demand fetches (`tagnet edit`). Seeded by
@@ -327,17 +299,12 @@ pub async fn run(
     // its engine operations are plain methods. Cheap to clone (Arcs).
     let pending_fetches = crate::fetch::PendingFetches::new(runtime_configuration.clone());
 
-    // Load this machine's identity keypair.
     let identity = Identity::load(paths.identity_path()).map_err(|source| RunError::Identity {
         path: paths.identity_path().to_path_buf(),
         source,
     })?;
-
     let identity = Arc::new(identity);
 
-    // The path to the main DB. Peer sessions each open their own read-only
-    // handle on it (SQLite serialises file-level access), so we keep the path
-    // around to hand to every spawned session.
     let main_db_path = paths.main_db_path();
 
     // Open the main DB. It will be owned by `handle_changes` (the only task
@@ -357,25 +324,15 @@ pub async fn run(
     // draining the bus, so they are the *first* changes it applies — before any
     // peer connects and before any `FileTagged`/reconciliation runs. That way a
     // `SyncType::TagBased` directory referencing a declared id always resolves.
-    //
-    // Each declaration is a last-writer-wins *floor* (see `TagDeclaration`): it
-    // is stamped with a very low `modified_at`, so `add_tag`'s LWW guard creates
-    // the tag when absent but never clobbers a newer UI/peer edit.
     enqueue_declared_tags(&change_sender, &configuration);
 
-    // Broadcast of applied changes for the UI-facing API event stream (plan
-    // section 5.5). `handle_changes` publishes every change it applies here;
+    // Broadcast of applied changes for the UI-facing API event stream.
+    // `handle_changes` publishes every change it applies here;
     // API subscribers receive them best-effort. Capacity bounds how far a slow
     // subscriber may lag before it observes `Lagged` (mapped to `Resynced` by
     // the transport). Sized generously; the UI is expected to keep up.
     let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(1024);
 
-    // The UI-facing API handle. Reads open their own read-only DB handle on
-    // `main_db_path`; writes go onto `change_sender`; events come from
-    // `event_sender`.
-    // Daemon-owned temp dir for on-demand fetch results. Clear any orphans a
-    // crashed caller left behind, then hand the location to the API so
-    // `fetch_file` can stage each result there.
     let fetch_temp_dir = paths.fetch_temp_dir();
     if let Err(error) = paths.clean_fetch_temp_dir().await {
         log::warn!(
@@ -384,6 +341,9 @@ pub async fn run(
         );
     }
 
+    // The UI-facing API handle. Reads open their own read-only DB handle on
+    // `main_db_path`; writes go onto `change_sender`; events come from
+    // `event_sender`.
     let api = api::Api::new(
         main_db_path.clone(),
         change_sender.clone(),
@@ -394,17 +354,18 @@ pub async fn run(
     );
 
     // The sync-directory manager is inherently single-threaded: it holds
-    // `RefCell`s (the debounce skip-queue and the rusqlite connections) that are
-    // `!Send`, and it now `.await`s file I/O (streaming materialization) while
-    // borrowing them. Rather than force `Send` on all of that, run it on a
-    // dedicated OS thread with a current-thread runtime + `LocalSet`. A oneshot
-    // lets the shutdown path below join it like the other tasks.
+    // `RefCell`s that are `!Send`, and it now `.await`s file I/O (streaming
+    // materialization) while borrowing them. Rather than force `Send` on all of
+    // that, run it on a dedicated OS thread with a current-thread runtime +
+    // `LocalSet`. A oneshot lets the shutdown path below join it like the other
+    // tasks.
     let (sync_directories_done_tx, sync_directories_handle) = tokio::sync::oneshot::channel();
     let sync_directories_thread = {
         let configuration = configuration.clone();
         let paths = paths.clone();
         let change_sender = change_sender.clone();
         let shutdown_child = shutdown.token().child_token();
+
         std::thread::Builder::new()
             .name("tagnet-sync-directories".to_owned())
             .spawn(move || {
@@ -412,6 +373,7 @@ pub async fn run(
                     .enable_all()
                     .build()
                     .expect("failed to build sync-directory runtime");
+
                 let local = tokio::task::LocalSet::new();
                 local.block_on(
                     &runtime,
@@ -424,6 +386,7 @@ pub async fn run(
                         shutdown_child,
                     ),
                 );
+
                 let _ = sync_directories_done_tx.send(());
             })
             .expect("failed to spawn sync-directory thread")
@@ -450,7 +413,6 @@ pub async fn run(
         command_sender: command_sender.clone(),
     };
 
-    // Spawn one outbound connection task per peer that has an address configured.
     let mut peer_handles = Vec::new();
     for peer in &configuration.peers {
         if peer.address.is_some() {
@@ -553,14 +515,14 @@ async fn handle_connection(
 ) {
     log::debug!("Incoming TCP connection from: {:?}", address);
 
-    let Ok(ws_stream) = tokio_tungstenite::accept_async(raw_stream).await else {
+    let Ok(websoccket_stream) = tokio_tungstenite::accept_async(raw_stream).await else {
         log::error!("Error during the websocket handshake occurred");
         return;
     };
 
     log::debug!("WebSocket connection established: {:?}", address);
 
-    let (mut outgoing, mut incoming) = ws_stream.split();
+    let (mut outgoing, mut incoming) = websoccket_stream.split();
 
     // Read the peer's handshake first (they initiated the TCP connection).
     let peer_public_key = match read_handshake(&mut incoming, &configuration, &identity).await {
@@ -576,6 +538,7 @@ async fn handle_connection(
             return;
         }
     };
+
     if let Err(error) = outgoing
         .send(Message::text(serde_json::to_string(&response).unwrap()))
         .await
@@ -604,10 +567,11 @@ async fn handle_connection(
 
 /// Maintain an outbound WebSocket connection to a single peer.
 ///
-/// On each successful connection, a fresh `(peer_tx, peer_rx)` channel is created.
-/// `peer_tx` is stored in `RuntimeConfiguration.peers[public_key].outbound` so that
-/// `forward_to_peers` can send `Change`s to this peer. When the connection drops,
-/// `outbound` is reset to `None` and the task sleeps before retrying.
+/// On each successful connection, a fresh `(peer_tx, peer_rx)` channel is
+/// created. `peer_tx` is stored in
+/// `RuntimeConfiguration.peers[public_key].outbound` so that `forward_to_peers`
+/// can send `Change`s to this peer. When the connection drops, `outbound` is
+/// reset to `None` and the task sleeps before retrying.
 async fn connect_to_peer(
     identity: Arc<Identity>,
     peer: Peer,
@@ -686,8 +650,7 @@ async fn connect_to_peer(
                 // Verify their public key matches what we expect.
                 if response.public_key != peer.public_key {
                     log::warn!(
-                        "Peer {} announced public_key {:?}, expected {:?}; \
-                         dropping connection",
+                        "Peer {} announced public_key {:?}, expected {:?}; dropping connection",
                         peer.name,
                         response.public_key,
                         peer.public_key
@@ -763,7 +726,6 @@ async fn read_handshake(
         }
     };
 
-    // Reject unknown public keys.
     if !configuration
         .peers
         .iter()
@@ -788,10 +750,10 @@ async fn read_handshake(
 
 /// Drive a fully-handshaken WebSocket connection until it closes.
 ///
-/// Shared between inbound (`handle_connection`) and outbound (`connect_to_peer`)
-/// paths because the post-handshake behaviour is identical: build and send our
-/// manifest, register an outbound channel, then loop over outbound `Frame`s
-/// and inbound WS frames.
+/// Shared between inbound (`handle_connection`) and outbound
+/// (`connect_to_peer`) paths because the post-handshake behaviour is identical:
+/// build and send our manifest, register an outbound channel, then loop over
+/// outbound `Frame`s and inbound WebSocket frames.
 ///
 /// Opens its own read-only handle on the main DB. The DB is shared with
 /// `handle_changes` and with other connection tasks; SQLite serialises these
@@ -813,16 +775,17 @@ async fn run_peer_session<S>(
         change_sender,
         command_sender,
     } = context;
+
     // FileDatabase wraps a rusqlite Connection which is Send but not Sync.
     // We must never hold `&FileDatabase` across an `.await` in this task,
     // otherwise tokio::spawn rejects the future as non-Send. All sync helpers
     // below take `&FileDatabase` synchronously and return owned data; this
     // function does the awaits separately.
     //
-    // The database path is supplied by the caller (originally derived from
-    // `Paths::main_db_path`). This connection is READ-ONLY: the session makes
-    // reconciliation decisions from it but routes every write through
-    // `change_sender` to `handle_changes`, the sole main-DB writer.
+    // The database path is supplied by the caller. This connection is
+    // READ-ONLY: the session makes reconciliation decisions from it but routes
+    // every write through `change_sender` to `handle_changes`, the sole
+    // main-database writer.
     let database = match FileDatabase::initialize(main_db_path) {
         Ok(database) => database,
         Err(error) => {
@@ -845,8 +808,10 @@ async fn run_peer_session<S>(
     // reports on `receiver_done`, which the select loop drains to materialize
     // the bytes and drop the demux entry.
     let mut transfers: HashMap<TransferId, UnboundedSender<TransferMessage>> = HashMap::new();
+
     let (receiver_done_tx, mut receiver_done_rx) =
         tokio::sync::mpsc::unbounded_channel::<(TransferId, ReceiverPurpose, ReceiveOutcome)>();
+
     // Temp directory for in-flight received files. Kept per-session under the
     // system temp dir; a completed transfer's temp file is then materialized
     // (moved) into the sync directories.
@@ -855,6 +820,7 @@ async fn run_peer_session<S>(
         std::process::id(),
         peer_public_key
     ));
+
     // Start a receiver pull for `file_id`/`content_hash` on this link, tagged
     // with `purpose` (what to do with the bytes once received). Spawns the
     // receiver endpoint and a bridge that forwards its outcome onto
@@ -864,6 +830,7 @@ async fn run_peer_session<S>(
         let our_sender = our_sender.clone();
         let receiver_done_tx = receiver_done_tx.clone();
         let transfer_temp_dir = transfer_temp_dir.clone();
+
         move |file_id: FileId,
               content_hash: String,
               expected_size: u64,
@@ -871,6 +838,7 @@ async fn run_peer_session<S>(
             let transfer_id = TransferId::new();
             let temp_path = transfer_temp_dir.join(transfer_id.to_string());
             let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
             let inbound = spawn_receiver(
                 transfer_id,
                 file_id,
@@ -881,20 +849,21 @@ async fn run_peer_session<S>(
                 Frame::Sync,
                 outcome_tx,
             );
+
             let done_tx = receiver_done_tx.clone();
             tokio::spawn(async move {
                 if let Ok(outcome) = outcome_rx.await {
                     let _ = done_tx.send((transfer_id, purpose, outcome));
                 }
             });
+
             (transfer_id, inbound)
         }
     };
 
     if let Err(error) = tokio::fs::create_dir_all(&transfer_temp_dir).await {
         log::warn!(
-            "Failed to create transfer temp dir for {peer_name}: {error}; \
-             transfers to this peer will fail"
+            "Failed to create transfer temp dir for {peer_name}: {error}; transfers to this peer will fail"
         );
     }
 
@@ -903,18 +872,19 @@ async fn run_peer_session<S>(
     //
     // The slot can hold one of three things:
     // - `None`: free, install our sender, we own it.
-    // - `Some(dead)`: a previous session's sender whose receiver has been
-    //   dropped (this happens because the cleanup at the end of a session
-    //   cannot detect "I am the dropped receiver"; `is_closed` returns false
-    //   while we still hold our own receiver). We replace it transparently.
-    // - `Some(live)`: a sibling session is actively running for this peer
-    //   (e.g. both sides dialed each other at the same time). Fall back to
-    //   inbound-only so we don't double-send.
+    // - `Some(dead)`: a previous session's sender whose receiver has been dropped
+    //   (this happens because the cleanup at the end of a session cannot detect "I
+    //   am the dropped receiver"; `is_closed` returns false while we still hold our
+    //   own receiver). We replace it transparently.
+    // - `Some(live)`: a sibling session is actively running for this peer (e.g.
+    //   both sides dialed each other at the same time). Fall back to inbound-only
+    //   so we don't double-send.
     // Command channel for `handle_changes` to trigger byte pulls on this link.
     let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel::<bus::PeerCommand>();
 
     let owns_outbound = {
         let mut runtime = runtime_configuration.write().await;
+
         match runtime.peers.get_mut(peer_public_key) {
             Some(runtime_peer) => {
                 let slot_is_dead = runtime_peer
@@ -922,22 +892,21 @@ async fn run_peer_session<S>(
                     .as_ref()
                     .map(|sender| sender.is_closed())
                     .unwrap_or(true);
+
                 if slot_is_dead {
                     runtime_peer.outbound = Some(peer_tx);
                     runtime_peer.commands = Some(command_tx);
                     true
                 } else {
                     log::debug!(
-                        "Peer {peer_name} already has an outbound sender; \
-                         inbound-only mode for this connection"
+                        "Peer {peer_name} already has an outbound sender; inbound-only mode for this connection"
                     );
                     false
                 }
             }
             None => {
                 log::error!(
-                    "Peer {peer_name} missing from RuntimeConfiguration; \
-                     dropping connection"
+                    "Peer {peer_name} missing from RuntimeConfiguration; dropping connection"
                 );
                 return;
             }
@@ -947,14 +916,14 @@ async fn run_peer_session<S>(
     // Announce our *tag* manifest first thing post-handshake, before the file
     // manifest. Ordering is deliberate and matters for placement efficiency:
     //
-    // - Frames travel over one ordered link, so the peer handles our
-    //   `TagManifest` before our `Manifest`.
+    // - Frames travel over one ordered link, so the peer handles our `TagManifest`
+    //   before our `Manifest`.
     // - Handling `TagManifest` enqueues the `FileTagged`/`FileUntagged`
     //   relationships onto the change bus; handling `Manifest` starts file pull
     //   *transfers* whose `Materialize` is only enqueued once the bytes finish
     //   arriving (many round-trips later).
-    // - `handle_changes` is a single FIFO consumer, so relationships enqueued
-    //   first are applied before any later `Materialize`.
+    // - `handle_changes` is a single FIFO consumer, so relationships enqueued first
+    //   are applied before any later `Materialize`.
     //
     // Net effect: when a peer brings both new tags and new files, the tags are
     // in place by the time files materialize, so each file lands in its
@@ -1758,11 +1727,10 @@ pub struct WantedDeletion {
 ///   side will request from us when they process our manifest; we do nothing.
 /// - **Our latest hash appears in their history**: we are behind — request the
 ///   newer bytes (`Change` placement, we already hold the file row).
-/// - **Divergent**: neither side's latest appears in the other's history.
-///   Newer `latest_observed_at` wins. If theirs wins, request. If ours wins,
-///   do nothing (their side will accept ours via the symmetric path).
-///   Divergence is logged at `error!` level with a TODO for a future
-///   deadletter store.
+/// - **Divergent**: neither side's latest appears in the other's history. Newer
+///   `latest_observed_at` wins. If theirs wins, request. If ours wins, do
+///   nothing (their side will accept ours via the symmetric path). Divergence
+///   is logged at `error!` level with a TODO for a future deadletter store.
 fn reconcile_peer_manifest(
     peer_name: &str,
     entries: Vec<ManifestEntry>,
@@ -1791,8 +1759,7 @@ fn reconcile_peer_manifest(
                 .unwrap_or(0);
             if entry.deleted_at > ours_observed_at {
                 log::debug!(
-                    "Applying peer delete for {} from {peer_name} \
-                     (deleted_at={} > ours_observed_at={ours_observed_at})",
+                    "Applying peer delete for {} from {peer_name} (deleted_at={} > ours_observed_at={ours_observed_at})",
                     entry.file_id.to_string(),
                     entry.deleted_at,
                 );
@@ -1866,9 +1833,7 @@ fn reconcile_peer_manifest(
                 // TODO: When a deadletter / conflict store exists, preserve
                 // the losing version there instead of just logging.
                 log::error!(
-                    "Divergent history for {} between us and {peer_name} \
-                     (our latest observed_at={ours_observed_at}, theirs={}). \
-                     {}.",
+                    "Divergent history for {} between us and {peer_name} (our latest observed_at={ours_observed_at}, theirs={}). {}.",
                     entry.file_id.to_string(),
                     entry.latest_observed_at,
                     if request {
@@ -2050,16 +2015,14 @@ async fn request_pull_from_origin(
                 .is_err()
             {
                 log::warn!(
-                    "Peer {public_key} command channel closed; cannot pull {}; \
-                     reconciliation will retry on reconnect",
+                    "Peer {public_key} command channel closed; cannot pull {}; reconciliation will retry on reconnect",
                     file_id.to_string()
                 );
             }
         }
         None => {
             log::debug!(
-                "Announcing peer {public_key} has no live session; deferring pull of {} \
-                 to reconciliation",
+                "Announcing peer {public_key} has no live session; deferring pull of {} to reconciliation",
                 file_id.to_string()
             );
         }
@@ -2104,8 +2067,7 @@ async fn local_hash_matches(
                 Ok(size) => Some(size),
                 Err(error) => {
                     log::warn!(
-                        "local_hash_matches: {} matched but size read failed: {error}; \
-                         answering without a size hint",
+                        "local_hash_matches: {} matched but size read failed: {error}; answering without a size hint",
                         file_id.to_string()
                     );
                     // Treat as held-but-size-unknown: 0 disables the puller's cap.
@@ -2257,8 +2219,9 @@ fn reconcile_peer_tag_manifest(
 }
 
 /// Translate a reconciled relationship manifest entry into the equivalent
-/// relationship `Change`, carrying the entry's `modified_at` so last-writer-wins
-/// is preserved. Returns `None` if `target_id` doesn't parse as the id kind.
+/// relationship `Change`, carrying the entry's `modified_at` so
+/// last-writer-wins is preserved. Returns `None` if `target_id` doesn't parse
+/// as the id kind.
 fn relationship_to_change(entry: &RelationshipManifestEntry) -> Option<Change> {
     use tagnet_core::state::RelationshipKind;
     let change = match (entry.kind, entry.deleted) {
@@ -2327,6 +2290,7 @@ async fn handle_sync_directories(
 ) {
     let mut manager =
         SyncDirectoryManager::new(configuration, &paths, change_sender, command_receiver).await;
+
     tokio::select! {
         _ = shutdown.cancelled() => {
             log::info!("Shutdown requested; stopping sync directory manager");
@@ -2483,8 +2447,7 @@ async fn fetch_and_place_deferred(
         Ok(false) => return,
         Err(_) => {
             log::warn!(
-                "reconcile_tag_placement: manager dropped responder for {}; \
-                 cannot tell if a fetch is needed",
+                "reconcile_tag_placement: manager dropped responder for {}; cannot tell if a fetch is needed",
                 file_id.to_string()
             );
             return;
@@ -2499,8 +2462,7 @@ async fn fetch_and_place_deferred(
         // No version has ever been recorded. Nothing to fetch by; a future
         // announcement / materialize will place it. Soft deferral.
         log::debug!(
-            "reconcile_tag_placement: no recorded version for {}; \
-             leaving placement for a future announcement",
+            "reconcile_tag_placement: no recorded version for {}; leaving placement for a future announcement",
             file_id.to_string()
         );
         return;
@@ -2533,8 +2495,7 @@ async fn fetch_and_place_deferred(
             // No peer had the bytes (or it timed out). Soft deferral: a later
             // reconnect / announcement retries placement.
             log::debug!(
-                "reconcile_tag_placement: fetch of {} failed ({error:?}); \
-                 placement deferred until a peer can serve it",
+                "reconcile_tag_placement: fetch of {} failed ({error:?}); placement deferred until a peer can serve it",
                 file_id.to_string()
             );
             return;
@@ -2568,8 +2529,7 @@ async fn fetch_and_place_deferred(
         },
     }) {
         log::error!(
-            "reconcile_tag_placement: change channel closed; cannot materialize \
-             fetched bytes for {}: {error}",
+            "reconcile_tag_placement: change channel closed; cannot materialize fetched bytes for {}: {error}",
             file_id.to_string()
         );
     }
@@ -2870,8 +2830,7 @@ async fn handle_changes(
                         .latest_version(file_id)
                         .unwrap_or_else(|error| {
                             log::error!(
-                                "latest_version failed for known file {}: {:?}; \
-                                 treating as no-op",
+                                "latest_version failed for known file {}: {:?}; treating as no-op",
                                 file_id.to_string(),
                                 error
                             );
@@ -3191,8 +3150,7 @@ async fn handle_changes(
                     && let Err(error) = database.add_file(file_id, &logical_path)
                 {
                     log::error!(
-                        "CatalogFile: failed to add file {} ({}): {:?}; \
-                             skipping version record",
+                        "CatalogFile: failed to add file {} ({}): {:?}; skipping version record",
                         file_id.to_string(),
                         logical_path,
                         error
@@ -3267,8 +3225,7 @@ async fn handle_changes(
                             .map(|iter| iter.into_iter().collect::<Vec<TagId>>())
                             .unwrap_or_else(|error| {
                                 log::error!(
-                                    "Materialize: failed to read tags for {}: {:?}; \
-                                     using carried tags only",
+                                    "Materialize: failed to read tags for {}: {:?}; using carried tags only",
                                     file_id.to_string(),
                                     error
                                 );
@@ -3958,8 +3915,9 @@ async fn handle_changes(
                     );
                 }
 
-                // NOTE: Currently this is correct, but if we change the subtag rules on the sync
-                // directories we will have to update the sync directories here too.
+                // NOTE: Currently this is correct, but if we change the subtag rules on the
+                // sync directories we will have to update the sync directories
+                // here too.
 
                 forward_to_peers(
                     &configuration,
@@ -3992,8 +3950,9 @@ async fn handle_changes(
                     );
                 }
 
-                // NOTE: Currently this is correct, but if we change the subtag rules on the sync
-                // directories we will have to update the sync directories here too.
+                // NOTE: Currently this is correct, but if we change the subtag rules on the
+                // sync directories we will have to update the sync directories
+                // here too.
 
                 forward_to_peers(
                     &configuration,
@@ -4017,8 +3976,9 @@ async fn handle_changes(
 
 #[cfg(test)]
 mod reconcile_tests {
-    use super::*;
     use tagnet_core::state::ManifestEntry;
+
+    use super::*;
 
     fn memory_db() -> FileDatabase {
         FileDatabase::initialize(":memory:").expect("open in-memory db")
@@ -4122,8 +4082,9 @@ mod reconcile_tests {
 
     /// A reconcile pull carries empty tags, but by the time it materializes the
     /// file's tags are in the DB (applied from the TagManifest). The effective
-    /// placement tags must include the DB tags so the file lands in its matching
-    /// TagBased directories on the first materialize (the first-connect fix).
+    /// placement tags must include the DB tags so the file lands in its
+    /// matching TagBased directories on the first materialize (the
+    /// first-connect fix).
     #[test]
     fn effective_tags_include_db_tags_when_carried_is_empty() {
         let db_a = TagId::new();

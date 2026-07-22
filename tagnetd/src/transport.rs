@@ -38,14 +38,12 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use tagnet_core::{FileId, TagId, state::Change};
+use tagnet_core::state::Change;
+use tagnet_core::{FileId, FileInfo, TagId};
 use tokio::sync::broadcast;
 
-use crate::{
-    api::{Api, ApiError, ApiEvent, QueryResult},
-    database::{SubtagRule, Tag},
-};
-use tagnet_core::FileInfo;
+use crate::api::{Api, ApiError, ApiEvent, QueryResult};
+use crate::database::{SubtagRule, Tag};
 
 /// The transport-agnostic UI-facing API (portability plan section 6).
 ///
@@ -141,9 +139,9 @@ pub trait TransportBackend {
     ///
     /// The bytes are never buffered whole: the backend hashes `path` by
     /// streaming it and then serves the content chunk-by-chunk on demand (the
-    /// IPC backend over the control socket; the in-process backend straight from
-    /// disk). `path_name` is the file's logical identity; `path` is where the
-    /// bytes currently live.
+    /// IPC backend over the control socket; the in-process backend straight
+    /// from disk). `path_name` is the file's logical identity; `path` is
+    /// where the bytes currently live.
     fn upload_file(
         &self,
         path: PathBuf,
@@ -248,8 +246,8 @@ impl EventStream {
     ///
     /// Returns:
     /// - `Some(ApiEvent::Changed(_))` for each applied change,
-    /// - `Some(ApiEvent::Resynced)` when the subscriber lagged past the
-    ///   channel capacity (plan 5.5: the UI should re-fetch state), and
+    /// - `Some(ApiEvent::Resynced)` when the subscriber lagged past the channel
+    ///   capacity (plan 5.5: the UI should re-fetch state), and
     /// - `None` once the stream is permanently closed (runtime shut down).
     pub async fn recv(&mut self) -> Option<ApiEvent> {
         match self {
@@ -303,8 +301,8 @@ impl InProcessBackend {
     }
 }
 
-/// Map a [`FileBytes::hash`](crate::file_bytes::FileBytes::hash) failure (an I/O
-/// error reading the local upload source) into an [`ApiError`].
+/// Map a [`FileBytes::hash`](crate::file_bytes::FileBytes::hash) failure (an
+/// I/O error reading the local upload source) into an [`ApiError`].
 fn hash_error(error: crate::file_bytes::FileBytesError) -> ApiError {
     ApiError::Transport(format!("hashing upload source: {error}"))
 }

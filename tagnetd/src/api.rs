@@ -23,21 +23,19 @@
 //! wrap this same [`Api`] handle; the Dart UI never knows which.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-
-use tagnet_core::{
-    FileId, FileInfo, LogicalPath, TagId,
-    state::{Change, ChangeOrigin},
-};
-use tokio::sync::{broadcast, mpsc::UnboundedSender, oneshot};
+use tagnet_core::state::{Change, ChangeOrigin};
+use tagnet_core::{FileId, FileInfo, LogicalPath, TagId};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{broadcast, oneshot};
 
 use crate::bus::{DaemonMessage, FetchError, Ingest};
 use crate::database::{DatabaseError, FileDatabase, QueryTerm, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
 use crate::transfer::ChunkSource;
-use std::sync::Arc;
 
 /// Errors surfaced to the UI (plan 5.5).
 ///
@@ -172,6 +170,11 @@ pub struct Api {
 }
 
 impl Api {
+    /// The overall deadline a caller waits for an on-demand fetch to complete.
+    /// Must exceed [`crate::fetch::HOP_TIMEOUT`] so intermediate hops can time
+    /// out and report before this outer deadline fires.
+    const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Build an API handle from the runtime's shared pieces.
     ///
     /// - `main_db_path`: the main DB path; each read opens its own read-only
@@ -273,8 +276,8 @@ impl Api {
     ///
     /// - `/t foo` — require the tag(s) resolved from `foo`. A file matches if
     ///   it carries any such tag; a tag matches if it is a subtag of any.
-    /// - `/n foo` — case-insensitive substring against the file's logical
-    ///   path (or the tag's name on the tag side).
+    /// - `/l foo` — case-insensitive substring against the file's logical path
+    ///   (or the tag's name on the tag side).
     /// - `/p foo` — reserved for physical-path search; currently a no-op.
     /// - `foo` (no prefix) — matches on *either* side: logical/name substring
     ///   OR tag membership. This is the "just find anything that looks like
@@ -327,8 +330,8 @@ impl Api {
 
     /// Get a single file's [`FileInfo`] by id, or [`ApiError::NotFound`] if no
     /// such file exists. The by-id read that replaces scanning a full listing
-    /// (used by `tagnet edit`/`download` to find one file's metadata). Backed by
-    /// `FileDatabase::file_info_from_id`.
+    /// (used by `tagnet edit`/`download` to find one file's metadata). Backed
+    /// by `FileDatabase::file_info_from_id`.
     pub fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
         let database = self.open_read()?;
         Ok(database.file_info_from_id(file_id)?)
@@ -352,8 +355,8 @@ impl Api {
     /// Both stages are forgiving:
     /// - the lexer silently drops malformed chunks (see its module docs);
     /// - this resolver silently drops any [`ChunkKind::Physical`] chunk, since
-    ///   physical-path search is not wired up yet — the grammar accepts `/p`
-    ///   so users see consistent parsing, but the filter is a no-op.
+    ///   physical-path search is not wired up yet — the grammar accepts `/p` so
+    ///   users see consistent parsing, but the filter is a no-op.
     ///
     /// The only remaining fallible step is `tag_ids_matching_token`, which can
     /// surface a real database error; that is propagated as-is.
@@ -369,6 +372,8 @@ impl Api {
                 (ChunkKind::Tag, true) => {
                     QueryTerm::NotTag(database.tag_ids_matching_token(&chunk.text)?)
                 }
+                (ChunkKind::Name, false) => QueryTerm::NameContains(chunk.text),
+                (ChunkKind::Name, true) => QueryTerm::NotNameContains(chunk.text),
                 (ChunkKind::Logical, false) => QueryTerm::LogicalContains(chunk.text),
                 (ChunkKind::Logical, true) => QueryTerm::NotLogicalContains(chunk.text),
                 (ChunkKind::Any, false) => QueryTerm::AnyMatch(
@@ -535,10 +540,10 @@ impl Api {
             .await;
     }
 
-    /// Replace the content of an existing file, provided on demand by the client
-    /// (see [`Self::upload_file`]). Records the new version and announces a
-    /// metadata-only `FileMetadataChanged` to peers, which pull from the
-    /// provider.
+    /// Replace the content of an existing file, provided on demand by the
+    /// client (see [`Self::upload_file`]). Records the new version and
+    /// announces a metadata-only `FileMetadataChanged` to peers, which pull
+    /// from the provider.
     pub fn edit_file(
         &self,
         file_id: FileId,
@@ -565,8 +570,9 @@ impl Api {
         })
     }
 
-    /// Move (rename) a file to a new logical path. Enqueues `Change::FileMoved`;
-    /// each receiving sync directory derives its own physical placement.
+    /// Move (rename) a file to a new logical path. Enqueues
+    /// `Change::FileMoved`; each receiving sync directory derives its own
+    /// physical placement.
     pub fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
         if logical_path.trim().is_empty() {
             return Err(ApiError::InvalidArgument("path is empty".to_owned()));
@@ -577,26 +583,23 @@ impl Api {
         })
     }
 
-    /// The overall deadline a caller waits for an on-demand fetch to complete.
-    /// Must exceed [`crate::fetch::HOP_TIMEOUT`] so intermediate hops can time
-    /// out and report before this outer deadline fires.
-    const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
     /// Fetch a file's content on demand, from a peer if not present locally,
     /// and return the path to a **daemon-owned temp file** holding it.
     ///
-    /// Enqueues a [`DaemonMessage::Fetch`] onto the ingest bus; `handle_changes`
-    /// checks the local sync directories first (hash-gated) and, failing that,
-    /// floods a recursive `Sync::FetchRequest` across the live peer tree. Awaits
-    /// the reply with an overall timeout. `expected_hash` gates which content is
-    /// accepted; the caller obtains it from the file's known metadata
+    /// Enqueues a [`DaemonMessage::Fetch`] onto the ingest bus;
+    /// `handle_changes` checks the local sync directories first
+    /// (hash-gated) and, failing that, floods a recursive
+    /// `Sync::FetchRequest` across the live peer tree. Awaits
+    /// the reply with an overall timeout. `expected_hash` gates which content
+    /// is accepted; the caller obtains it from the file's known metadata
     /// (`FileInfo::content_hash`).
     ///
-    /// The returned path lives under [`crate::paths::Paths::fetch_temp_dir`] and
-    /// is handed to the caller with **move semantics**: the caller must consume
-    /// it (rename into place or delete). The whole file is never buffered into
-    /// memory — a peer transfer already lands as a temp file on disk, and a
-    /// locally-held copy is streamed into the fetch temp dir.
+    /// The returned path lives under [`crate::paths::Paths::fetch_temp_dir`]
+    /// and is handed to the caller with **move semantics**: the caller must
+    /// consume it (rename into place or delete). The whole file is never
+    /// buffered into memory — a peer transfer already lands as a temp file
+    /// on disk, and a locally-held copy is streamed into the fetch temp
+    /// dir.
     pub async fn fetch_file(
         &self,
         file_id: FileId,
@@ -723,9 +726,9 @@ impl Api {
 /// 1. An optional `!` (negation) — must be a standalone whitespace-delimited
 ///    token; `!foo` is **not** a negation, it's a literal chunk whose text
 ///    starts with `!`.
-/// 2. An optional *kind prefix* — one of `/t`, `/n`, `/p`, again standalone:
+/// 2. An optional *kind prefix* — one of `/t`, `/l`, `/p`, again standalone:
 ///    - `/t` — tag chunk: match tags whose name/id resolves from the payload.
-///    - `/n` — logical-path chunk: substring match on the file's logical path.
+///    - `/l` — logical-path chunk: substring match on the file's logical path.
 ///    - `/p` — physical-path chunk (reserved; not wired up yet).
 ///
 ///    Unknown `/x` tokens are **not** prefixes: they become literal chunks
@@ -747,7 +750,7 @@ impl Api {
 /// next whitespace boundary:
 ///
 /// - a `!` or kind prefix followed by nothing (`!`, `/t`, `! /t` at EOF);
-/// - conflicting kind prefixes (`/t /n foo` drops the `/t /n` chunk and
+/// - conflicting kind prefixes (`/t /l foo` drops the `/t /l` chunk and
 ///   continues from `foo`);
 /// - a duplicate `!` (`! ! foo` drops that chunk);
 /// - an unterminated quoted string (`"foo` at EOF is dropped entirely).
@@ -758,14 +761,15 @@ pub(crate) mod chunk {
     /// What kind of filter a chunk expresses.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ChunkKind {
-        /// No prefix — match names *and* tags (union).
+        /// Match names *and* tags (union).
         Any,
-        /// `/t` — the payload names a tag.
+        /// The payload names a tag.
         Tag,
-        /// `/n` — the payload is a logical-path substring.
+        /// The payload is a logical-path substring or tag name.
+        Name,
+        /// The payload is a logical-path substring.
         Logical,
-        /// `/p` — the payload is a physical-path substring. Reserved; the
-        /// resolver does not yet accept this variant.
+        /// The payload is a physical-path substring.
         Physical,
     }
 
@@ -811,7 +815,7 @@ pub(crate) mod chunk {
         let mut negated = false;
         let mut kind: Option<ChunkKind> = None;
 
-        // Consume prefix tokens (`!`, `/t`, `/n`, `/p`) until we hit something
+        // Consume prefix tokens until we hit something
         // that isn't a prefix — that becomes the payload. On any grammar error
         // we drop the current chunk and resume at the *next* whitespace
         // boundary (the token that caused the error is itself skipped).
@@ -826,13 +830,14 @@ pub(crate) mod chunk {
                     }
                     negated = true;
                 }
-                "/t" | "/n" | "/p" => {
+                "/t" | "/n" | "/l" | "/p" => {
                     if kind.is_some() {
                         return (None, &rest[token_end..]);
                     }
                     kind = Some(match token {
                         "/t" => ChunkKind::Tag,
-                        "/n" => ChunkKind::Logical,
+                        "/n" => ChunkKind::Name,
+                        "/l" => ChunkKind::Logical,
                         "/p" => ChunkKind::Physical,
                         _ => unreachable!(),
                     });
@@ -909,6 +914,7 @@ pub(crate) mod chunk {
                 negated: false,
             }
         }
+
         fn tag(text: &str) -> Chunk {
             Chunk {
                 kind: ChunkKind::Tag,
@@ -916,6 +922,7 @@ pub(crate) mod chunk {
                 negated: false,
             }
         }
+
         fn logical(text: &str) -> Chunk {
             Chunk {
                 kind: ChunkKind::Logical,
@@ -923,9 +930,10 @@ pub(crate) mod chunk {
                 negated: false,
             }
         }
-        fn negate(mut c: Chunk) -> Chunk {
-            c.negated = true;
-            c
+
+        fn negate(mut chunk: Chunk) -> Chunk {
+            chunk.negated = true;
+            chunk
         }
 
         #[test]
@@ -963,7 +971,7 @@ pub(crate) mod chunk {
         #[test]
         fn kind_prefixes_apply_to_the_next_chunk() {
             assert_eq!(lex_query("/t foo"), vec![tag("foo")]);
-            assert_eq!(lex_query("/n foo"), vec![logical("foo")]);
+            assert_eq!(lex_query("/l foo"), vec![logical("foo")]);
         }
 
         #[test]
@@ -1003,7 +1011,7 @@ pub(crate) mod chunk {
         #[test]
         fn mixed_query_parses_end_to_end() {
             // A realistic mix: bare word, tag, quoted logical path, negated tag.
-            let got = lex_query(r#"foo /t bar /n "my file.txt" ! /t old"#);
+            let got = lex_query(r#"foo /t bar /l "my file.txt" ! /t old"#);
             assert_eq!(
                 got,
                 vec![
@@ -1045,9 +1053,9 @@ pub(crate) mod chunk {
 
         #[test]
         fn conflicting_kind_prefixes_drop_that_chunk_only() {
-            // `/t /n` conflicts — that chunk-in-progress is discarded at the
+            // `/t /l` conflicts — that chunk-in-progress is discarded at the
             // conflict point, so lexing resumes with `foo bar` intact.
-            assert_eq!(lex_query("/t /n foo bar"), vec![any("foo"), any("bar")],);
+            assert_eq!(lex_query("/t /l foo bar"), vec![any("foo"), any("bar")],);
         }
 
         #[test]
@@ -1063,7 +1071,7 @@ pub(crate) mod chunk {
         fn errors_between_valid_chunks_do_not_bleed() {
             // Interleave several error shapes with valid chunks to prove each
             // recovery is local.
-            let got = lex_query(r#"a /t /n b ! ! c "unterminated"#);
+            let got = lex_query(r#"a /t /l b ! ! c "unterminated"#);
             assert_eq!(got, vec![any("a"), any("b"), any("c")]);
         }
     }
